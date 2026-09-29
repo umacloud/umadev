@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 
 pub mod child_env;
+pub mod console_output;
 pub mod git;
 pub mod path_lookup;
 
@@ -2118,6 +2119,46 @@ fn windows_system_directory() -> Option<std::path::PathBuf> {
         }
         buffer.resize(length.saturating_add(1), 0);
     }
+}
+
+/// The reparse tag of an open file, or `None` when it is no reparse point.
+///
+/// Windows marks symlinks, junctions and cloud-file placeholders alike with
+/// `FILE_ATTRIBUTE_REPARSE_POINT`; only the tag tells a link to another path
+/// apart from a file whose own content a filter driver serves.
+///
+/// # Errors
+///
+/// Returns the OS error when the handle cannot be queried.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn file_reparse_tag(file: &std::fs::File) -> std::io::Result<Option<u32>> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO,
+    };
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    let size = u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>())
+        .map_err(std::io::Error::other)?;
+    // SAFETY: `file` keeps its handle open for the call, and `info` is a
+    // writable FILE_ATTRIBUTE_TAG_INFO of exactly `size` bytes.
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if queried == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0).then_some(info.ReparseTag))
 }
 
 #[cfg(test)]

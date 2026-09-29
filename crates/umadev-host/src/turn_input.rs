@@ -225,7 +225,7 @@ fn read_attachment(
 ) -> Result<PreparedAttachment, SessionError> {
     let before = fs::symlink_metadata(path)
         .map_err(|_| invalid(index, kind, "attachment is unavailable"))?;
-    if !metadata_is_regular_no_reparse(&before) {
+    if !metadata_is_regular_file(&before) {
         return Err(invalid(index, kind, "attachment must be a regular file"));
     }
     if before.len() > MAX_ATTACHMENT_BYTES {
@@ -237,26 +237,11 @@ fn read_attachment(
     }
     let canonical = fs::canonicalize(path)
         .map_err(|_| invalid(index, kind, "attachment path could not be resolved"))?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|_| invalid(index, kind, "attachment could not be opened"))?;
+    let mut file = open_attachment(path).map_err(|reason| invalid(index, kind, reason))?;
     let opened = file
         .metadata()
         .map_err(|_| invalid(index, kind, "attachment metadata is unavailable"))?;
-    if !metadata_is_regular_no_reparse(&opened) || !same_file_identity(&before, &opened) {
+    if !metadata_is_regular_file(&opened) || !same_file_identity(&before, &opened) {
         return Err(invalid(index, kind, "attachment changed during validation"));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
@@ -276,7 +261,7 @@ fn read_attachment(
     let after = fs::symlink_metadata(path)
         .map_err(|_| invalid(index, kind, "attachment changed during validation"))?;
     if after_path != canonical
-        || !metadata_is_regular_no_reparse(&after)
+        || !metadata_is_regular_file(&after)
         || !same_file_identity(&opened, &after)
     {
         return Err(invalid(index, kind, "attachment changed during validation"));
@@ -290,19 +275,73 @@ fn read_attachment(
     })
 }
 
-fn metadata_is_regular_no_reparse(metadata: &fs::Metadata) -> bool {
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
+/// A regular file, not a link to one. On Windows `is_symlink` reports a
+/// name-surrogate reparse point (symlink, junction); any other reparse point,
+/// such as a OneDrive placeholder, is the file itself.
+fn metadata_is_regular_file(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+}
+
+/// Open an attachment without following a link to another file.
+#[cfg(unix)]
+fn open_attachment(path: &Path) -> Result<fs::File, &'static str> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| "attachment could not be opened")
+}
+
+/// Open an attachment without following a link to another file.
+///
+/// The path is opened as itself first, so a reparse point is inspected rather
+/// than followed, and a name surrogate is refused. Any other reparse point is
+/// a file whose content a filter driver serves: OneDrive's Known Folder Move
+/// keeps Desktop, Documents and Pictures as Cloud Files placeholders, even
+/// once downloaded. Such a file is opened again normally, so the placeholder
+/// can hydrate; the identity checks around this open still bind the handle to
+/// the file validated before it.
+#[cfg(windows)]
+fn open_attachment(path: &Path) -> Result<fs::File, &'static str> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| "attachment could not be opened")?;
+    match umadev_process::file_reparse_tag(&file) {
+        Ok(None) => Ok(file),
+        Ok(Some(tag)) if !reparse_tag_blocks_attachment(tag) => {
+            drop(file);
+            OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|_| "attachment could not be opened")
         }
+        Ok(Some(_)) => Err("attachment must be a regular file"),
+        Err(_) => Err("attachment metadata is unavailable"),
     }
-    true
+}
+
+/// Open an attachment without following a link to another file.
+#[cfg(not(any(unix, windows)))]
+fn open_attachment(path: &Path) -> Result<fs::File, &'static str> {
+    OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|_| "attachment could not be opened")
+}
+
+/// Whether a Windows reparse point with this tag must not be read as an
+/// attachment. A name surrogate (symlink, junction, WSL symlink) redirects to
+/// another path; any other tag (a Cloud Files placeholder, a deduplicated or
+/// compressed file) marks a file that serves its own content.
+#[cfg(any(windows, test))]
+const fn reparse_tag_blocks_attachment(tag: u32) -> bool {
+    const NAME_SURROGATE: u32 = 0x2000_0000;
+    tag & NAME_SURROGATE != 0
 }
 
 #[cfg(unix)]
@@ -573,6 +612,28 @@ mod tests {
         .unwrap_err();
         assert!(size_error.to_string().contains("8 MiB"));
         assert!(checked_total(MAX_TOTAL_ATTACHMENT_BYTES, 1, 3).is_err());
+    }
+
+    #[test]
+    fn only_name_surrogate_reparse_points_block_an_attachment() {
+        // OneDrive (Cloud Files) placeholders, deduplicated and compressed
+        // (WOF) files are the file itself, even while not yet downloaded.
+        for own_content in [
+            0x9000_001A,
+            0x9000_601A,
+            0x9000_F01A,
+            0x8000_0013,
+            0x8000_0017,
+        ] {
+            assert!(
+                !reparse_tag_blocks_attachment(own_content),
+                "{own_content:#x}"
+            );
+        }
+        // A symlink, a junction and a WSL symlink point at another path.
+        for link in [0xA000_000C, 0xA000_0003, 0xA000_001D] {
+            assert!(reparse_tag_blocks_attachment(link), "{link:#x}");
+        }
     }
 
     #[test]

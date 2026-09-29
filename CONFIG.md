@@ -44,7 +44,7 @@ budget (3600s).** Same variable, different clocks.
 | --- | --- | --- |
 | `UMADEV_PHASE_BUDGET_SECS` | Per-phase wall-clock ceiling in the legacy fixed pipeline. | `900` (15 min) |
 | `UMADEV_DOCS_BUDGET_SECS` | Docs/planning-phase ceiling (tighter than a build phase). Falls back to `UMADEV_PHASE_BUDGET_SECS`, then the default. | `480` (8 min) |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | Global override applied to **every** verify step's budget (build/test/lint). When unset, each step uses its own per-step default. | per-step |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | Global override applied to **every** verify step's budget (install/lint/test/build), lowering as well as raising it. When unset (or `0`), each step uses its own per-step default: 120 s, 600 s for install/test/build. | per-step |
 
 > All budgets are graceful ceilings: they stop scheduling new work and finalize on
 > what exists; they do not hard-kill an in-flight write.
@@ -75,7 +75,7 @@ binary).
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `UMADEV_EMBED_MODEL_DIR` | Directory holding the local embedding model (`config.json`, `tokenizer.json`, `model.safetensors`). The npm launcher sets this automatically; a `cargo install` user can point it at a hand-placed model to enable offline hybrid search. Absent → keyword-only (BM25). | npm-managed / `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | Directory holding the local embedding model (`config.json`, `tokenizer.json`, `model.safetensors`). The npm launcher sets this automatically; a `cargo install` user can point it at a hand-placed model to enable offline hybrid search. When you set it to a directory, the npm launcher uses that directory and never downloads the model. Absent → keyword-only (BM25). | npm-managed / `~/.umadev/embed-model` |
 | `UMADEV_KNOWLEDGE_DIR` | Directory of the bundled curated knowledge corpus. The npm launcher sets this; the project's own `knowledge/` still wins. | npm-managed |
 | `UMADEV_ALLOW_CLOUD_EMBED` | Opt in to sending text to a cloud embedding API (requires an OpenAI-compatible key). Default is **local-only**; leaving it is a loud, intentional act. | off (local-only) |
 
@@ -103,7 +103,7 @@ binary).
 | --- | --- | --- |
 | `UMADEV_CONTINUOUS` | Long-session ("continuous") driver. On by default; set an off value (or `UMADEV_LEGACY_RUN`) to opt out to the single-shot driver. | on |
 | `UMADEV_LEGACY_PIPELINE` | Route `/run` through the legacy fixed 9-phase pipeline instead of the default director-driven agentic path. Enable with `1`/`true`/`on`. Also selects the `UMADEV_RUN_BUDGET_SECS` "whole-run soft budget" semantics above. | off (director path) |
-| `UMADEV_STRICT_COVERAGE` | Treat coverage as a strict gate. Enable with `1`. | off |
+| `UMADEV_STRICT_COVERAGE` | Treat PRD requirement coverage as a blocking gate: an `FR-` id that no plan step, task list or architecture doc cites blocks delivery (the legacy pipeline pauses at `spec`). Off, untraced requirements are only reported in a note. Enable with `1`, or with `[pipeline] strict_coverage = true` in `.umadevrc`. | off |
 
 ---
 
@@ -125,6 +125,7 @@ npm/pnpm/yarn/bun installs.
 | --- | --- | --- |
 | `UMADEV_REGISTRY_URL` | Registry queried by `umadev update`'s "already latest?" check. Also honors npm's own `npm_config_registry`. | `https://registry.npmjs.org` |
 | `UMADEV_MODEL_BASE_URL` | HTTPS base URL for the one-time embedding-model download (an admin-controlled mirror). Redirects are then confined to that mirror's own origin. | the versioned official GitHub Release |
+| `UMADEV_NO_MODEL_DOWNLOAD` | Set to `1` (or `true`/`yes`/`on`) to never download the embedding model; retrieval then uses BM25. Without it, a download that fails, times out or is skipped with Ctrl+C is not retried for 24 hours (the marker is `~/.umadev/embed-model/.umadev-model-download-failed`; delete it to retry sooner), and upgrading UmaDev retries at once. | off |
 
 ---
 

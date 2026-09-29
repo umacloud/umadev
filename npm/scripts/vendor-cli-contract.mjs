@@ -126,6 +126,10 @@ const claudeStream = run("claude", [
   "plan",
   "--allowedTools",
   "Read,Grep,Glob",
+  // Hidden from `--help`, so it is proven by acceptance here: without it
+  // Claude denies every permission ask itself and none reaches UmaDev.
+  "--permission-prompt-tool",
+  "stdio",
   "--max-turns",
   "1",
   "--setting-sources",

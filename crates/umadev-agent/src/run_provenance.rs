@@ -24,7 +24,9 @@ use crate::checkpoint::store_trust::{
 pub(crate) const PLAN: &str = "plan.json";
 pub(crate) const WORKFLOW_STATE: &str = "workflow-state.json";
 pub(crate) const REVIEW_CHECKPOINT: &str = "director-operational-review.json";
-const RUN_FILES: [&str; 3] = [PLAN, WORKFLOW_STATE, REVIEW_CHECKPOINT];
+/// The route the saved plan was planned under; a resume keeps it.
+pub(crate) const RUN_ROUTE: &str = "director-route.json";
+const RUN_FILES: [&str; 4] = [PLAN, WORKFLOW_STATE, REVIEW_CHECKPOINT, RUN_ROUTE];
 
 const STAMP_DIR: &str = "run-state";
 const NAME_DOMAIN: &[u8] = b"umadev.run-state-owner.v1";
@@ -162,6 +164,18 @@ mod tests {
         assert!(is_own(tmp.path()));
         write(tmp.path(), PLAN, r#"{"steps":[2]}"#);
         assert!(!is_own(tmp.path()));
+    }
+
+    #[test]
+    fn a_shipped_route_file_is_not_this_installations_either() {
+        // The saved route decides which floors a resumed run is held to, so a
+        // repository cannot ship one that is resumed without being adopted.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = r#"{"class":"build","kind":"light","depth":"fast"}"#;
+        write(tmp.path(), RUN_ROUTE, body);
+        assert!(!is_own(tmp.path()));
+        record(tmp.path(), RUN_ROUTE, body.as_bytes());
+        assert!(is_own(tmp.path()));
     }
 
     #[test]

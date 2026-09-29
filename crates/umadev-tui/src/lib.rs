@@ -38,6 +38,7 @@ mod base_session_config;
 mod clipboard;
 mod clipboard_image;
 pub mod config;
+mod config_notice;
 #[cfg(test)]
 mod cross_platform_terminal_tests;
 mod director_run;
@@ -46,6 +47,7 @@ mod host_git;
 pub mod input;
 mod interaction_bridge;
 pub mod link;
+mod live_input_lane;
 mod local_command;
 mod preview;
 mod prompt_queue_ui;
@@ -150,7 +152,7 @@ use crate::resident_turn_support::{
 use crate::resident_turn_support::{first_chat_directive, scoped_chat_directive};
 use crate::route_decision::RouteDecision;
 use crate::run_options::{
-    current_run_options, persisted_run_mode, resume_run_options,
+    current_run_options, resume_run_mode, resume_run_options,
     settle_operational_review_before_fresh_block, start_failed_note,
 };
 use crate::session_slot::{
@@ -216,9 +218,8 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     // once per session, never on the ordinary text-paste path.
     clipboard_image::cleanup_old(&opts.project_root);
     let config_path = config::default_path();
-    // Run the once-per-upgrade config migration runner at startup (fail-soft):
-    // repairs config drift across releases, then persists the bumped version.
-    let (cfg, retired_backend) = config::load_and_migrate_for_startup(&config_path);
+    // Load and migrate the user config once (fail-soft; unreadable is reported).
+    let (cfg, notice) = config::load_and_migrate_for_startup(&config_path);
     let startup_slug = umadev_agent::SpecManifest::read_from(&opts.project_root)
         .and_then(|manifest| manifest.slug)
         .filter(|slug| !slug.trim().is_empty())
@@ -232,7 +233,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     let _preview_guard = PreviewServerGuard {
         handle: std::sync::Arc::clone(&app.preview_server),
     };
-    app.show_retired_backend_migration(retired_backend.as_deref());
+    config_notice::show(&mut app, notice);
     // WORKSPACE INTEGRITY, said to the person it concerns. The startup heal already ran
     // (in `main`, before the terminal was taken over) — it may have put the user's source
     // tree back after a run was killed mid-rewind, or found a rewind it could NOT undo.
@@ -591,6 +592,7 @@ pub fn cold_judge_surface(
     })
 }
 
+#[derive(Clone)]
 enum LiveInputRequest {
     Steer { turn: SubmittedTurn },
     PromptQueue { request: PromptQueueRequest },
@@ -614,6 +616,8 @@ struct LiveInputHub {
 struct LiveInputHubState {
     next_generation: u64,
     endpoint: Option<LiveInputEndpoint>,
+    /// Accepted input an ended turn never delivered; the loop restores it.
+    returned: Vec<LiveInputRequest>,
 }
 
 struct LiveInputEndpoint {
@@ -650,13 +654,15 @@ enum PromptQueueDispatch {
 struct LiveInputRegistration {
     hub: LiveInputHub,
     generation: u64,
+    receiver: tokio::sync::mpsc::Receiver<LiveInputRequest>,
+    /// The request the turn is delivering right now (see `live_input_lane`).
+    in_flight: Option<LiveInputRequest>,
 }
 
 impl Drop for LiveInputRegistration {
     fn drop(&mut self) {
-        let mut state = self
-            .hub
-            .state
+        let hub = Arc::clone(&self.hub.state);
+        let mut state = hub
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state
@@ -666,6 +672,7 @@ impl Drop for LiveInputRegistration {
         {
             state.endpoint = None;
         }
+        self.hand_back(&mut state);
     }
 }
 
@@ -691,14 +698,7 @@ impl LiveInputHub {
             })
     }
 
-    fn register(
-        &self,
-        backend: &str,
-        capabilities: SessionCapabilities,
-    ) -> (
-        tokio::sync::mpsc::Receiver<LiveInputRequest>,
-        LiveInputRegistration,
-    ) {
+    fn register(&self, backend: &str, capabilities: SessionCapabilities) -> LiveInputRegistration {
         let (sender, receiver) = tokio::sync::mpsc::channel(LIVE_INPUT_CHANNEL_CAP);
         let mut state = self
             .state
@@ -712,13 +712,12 @@ impl LiveInputHub {
             capabilities,
             sender,
         });
-        (
+        LiveInputRegistration {
+            hub: self.clone(),
+            generation,
             receiver,
-            LiveInputRegistration {
-                hub: self.clone(),
-                generation,
-            },
-        )
+            in_flight: None,
+        }
     }
 
     fn dispatch(&self, turn: SubmittedTurn) -> LiveInputDispatch {
@@ -5470,8 +5469,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             }
         }
         let capabilities = session.capabilities();
-        let (mut live_input_rx, _live_input_registration) =
-            live_input_hub.register(&backend, capabilities);
+        let mut live_input = live_input_hub.register(&backend, capabilities);
         match session.send_input(first_input).await {
             Ok(report) => sink.emit(EngineEvent::TransientStatus(Some(delivery_report_status(
                 &report,
@@ -5506,7 +5504,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 Ok(Some(event))
             } else {
                 tokio::select! {
-                    request = live_input_rx.recv() => {
+                    request = live_input.recv() => {
                         if let Some(request) = request {
                             match request {
                                 LiveInputRequest::Steer { turn } => {
@@ -5569,6 +5567,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                                 },
                             }
                         }
+                        live_input.settle();
                         continue;
                     }
                     event = next_chat_event_idle(
@@ -8514,6 +8513,10 @@ fn prepare_cancel_request(
     if app.cancelling || cancel_drain_active {
         return false;
     }
+    // A local task never touched the base: stop only it, keeping the session.
+    if app.stop_local_task() {
+        return false;
+    }
     // Clear BOTH interactive holders symmetrically before the host-git early
     // return — the approval holder was cleared here but the host-input picker
     // was not, so a cancel during a host-git op could strand a live picker on
@@ -8793,16 +8796,21 @@ fn route_replay_key(
     Some(key)
 }
 
+/// Apply a key the tick flushed out of [`MouseSeqFilter`] (a lone Esc the legacy
+/// reader held back) like a live key: a pending approval or base question takes
+/// it first, and a cancel runs the same prepared cancel and idle-session reset.
 #[allow(clippy::too_many_arguments)]
 fn handle_tick_flush_key(
     app: &mut App,
     terminal: &mut Term,
     key: KeyEvent,
+    needs_redraw: &mut bool,
     draw_now: &mut bool,
     run_task: &mut Option<tokio::task::JoinHandle<()>>,
     cancel_drain: &mut Option<tokio::task::JoinHandle<()>>,
     cancel_drain_timed_out: &mut bool,
     cancel_deadline: &mut Option<tokio::time::Instant>,
+    continuous_run_active: &mut bool,
     session_holder: &SessionHolder,
     chat_session_holder: &ChatSessionHolder,
     pending_ask_holder: &PendingAskHolder,
@@ -8812,13 +8820,24 @@ fn handle_tick_flush_key(
     live_input_hub: &LiveInputHub,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    engine_rx: &mut umadev_agent::ChannelReceiver,
+    route_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
 ) {
-    if auth_ui::handle_loop_key(app, chat_session_holder, terminal, key) {
-        *draw_now = true;
+    let Some(key) = route_replay_key(
+        app,
+        terminal,
+        chat_session_holder,
+        host_input_holder,
+        approval_holder,
+        sink,
+        key,
+        needs_redraw,
+        draw_now,
+    ) else {
         return;
-    }
-    if app.apply_key_with_mods(key.code, key.modifiers) != Action::Cancel
-        || !prepare_cancel_request(
+    };
+    if app.apply_key_with_mods(key.code, key.modifiers) == Action::Cancel
+        && prepare_cancel_request(
             app,
             cancel_drain.is_some(),
             approval_holder,
@@ -8828,24 +8847,15 @@ fn handle_tick_flush_key(
             chat_session_holder,
         )
     {
-        return;
-    }
-    let host_git = app.host_git_in_flight;
-    if let Some(handle) = run_task.take() {
-        begin_cancel_drain(
+        handle_prepared_cancel(
             app,
-            handle,
-            host_git,
+            run_task,
             cancel_drain,
             cancel_drain_timed_out,
             cancel_deadline,
-        );
-    } else if host_git {
-        app.record_host_git_cancelled();
-        *run_task = resident_host_git::drain_after_settle(
-            app,
-            chat_session_holder,
+            continuous_run_active,
             session_holder,
+            chat_session_holder,
             pending_ask_holder,
             approval_holder,
             host_input_holder,
@@ -8853,19 +8863,8 @@ fn handle_tick_flush_key(
             live_input_hub,
             sink,
             route_tx,
-        );
-    } else {
-        *run_task = settle_cancel_and_drain_next(
-            app,
-            chat_session_holder,
-            session_holder,
-            pending_ask_holder,
-            approval_holder,
-            host_input_holder,
-            steer_holder,
-            live_input_hub,
-            sink,
-            route_tx,
+            engine_rx,
+            route_rx,
         );
     }
 }
@@ -9043,7 +9042,7 @@ fn detach_parked_chat_session(chat_session_holder: &ChatSessionHolder) {
 }
 
 fn spawn_gate_continuation(
-    app: &App,
+    app: &mut App,
     opts: &LaunchOptions,
     sink: &Arc<ChannelSink>,
     session_holder: &SessionHolder,
@@ -9169,7 +9168,7 @@ fn start_requested_run(
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
         mode: if resume {
-            persisted_run_mode(&opts.project_root, app.effective_trust_mode())
+            resume_run_mode(app, &opts.project_root)
         } else {
             app.effective_trust_mode()
         },
@@ -9277,7 +9276,7 @@ fn start_revision(
         backend: app.backend.clone().unwrap_or_default(),
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
-        mode: persisted_run_mode(&opts.project_root, app.effective_trust_mode()),
+        mode: resume_run_mode(app, &opts.project_root),
         strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
     let gate = app.active_gate.take();
@@ -9301,51 +9300,6 @@ fn start_revision(
         _ => Block::Initial,
     };
     spawn_block(run_opts, app.brain_spec(), sink.clone(), block, true)
-}
-
-fn spawn_deploy_task(
-    command: String,
-    root: PathBuf,
-    sink: Arc<ChannelSink>,
-    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-            "deploy.running",
-            &[&command],
-        )));
-        let login_hint = umadev_i18n::tl("deploy.login_hint");
-        let proof = umadev_agent::run_deploy(&root, Some(&command)).await;
-        let succeeded = matches!(&proof.status, umadev_agent::DeployStatus::Deployed);
-        match &proof.status {
-            umadev_agent::DeployStatus::Deployed => {
-                let address = proof
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| umadev_i18n::tl("deploy.done_no_url").into());
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "deploy.done",
-                    &[&address],
-                )));
-            }
-            umadev_agent::DeployStatus::NotDeployed(reason) => {
-                let exit = proof
-                    .exit_code
-                    .map_or_else(|| "-".to_string(), |code| code.to_string());
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "deploy.failed",
-                    &[&exit, reason, login_hint],
-                )));
-            }
-        }
-        if let Ok(path) = umadev_agent::write_deploy_proof(&root, &proof) {
-            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "deploy.proof_written",
-                &[&path.display().to_string()],
-            )));
-        }
-        let _ = route_tx.send(RouteDecision::DeployDone { succeeded });
-    })
 }
 
 /// M1 — await an aborting task `handle`, bounded by an ABSOLUTE `deadline`.
@@ -9411,9 +9365,9 @@ async fn restart_resident_chat_session(
     // between open and park will then fail its generation check even if it lands
     // after this close and after the replacement preload starts.
     chat_session_holder.invalidate();
-    if let Some(stale) = chat_session_holder.lock().await.take() {
-        detach_resident_close(stale);
-    }
+    // Never wait on the slot: a turn opening its session holds it for seconds,
+    // and the new generation makes that turn close its session, not park it.
+    detach_parked_chat_session(chat_session_holder);
     *pending_ask_holder.lock().await = None;
     spawn_chat_session_preload(
         app.backend.as_deref(),
@@ -10461,7 +10415,7 @@ async fn event_loop(
                     ));
                 }
                 Action::RunLocalShell(command) => {
-                    if run_task.is_some() || app.thinking || app.cancelling {
+                    if local_command::slot_busy(run_task.as_ref(), app) {
                         app.push_workspace_notice(umadev_i18n::t(
                             app.lang,
                             "chat.busy_cancel_first",
@@ -10469,16 +10423,10 @@ async fn event_loop(
                         continue;
                     }
                     let request = LocalCommandRequest::shell(&app.project_root, &command);
-                    app.begin_local_command(&request);
-                    let lang = app.lang;
-                    let route_tx = route_tx.clone();
-                    run_task = Some(tokio::spawn(async move {
-                        let result = local_command::run(request, lang).await;
-                        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
-                    }));
+                    run_task = Some(local_command::spawn(app, request, &route_tx));
                 }
                 Action::RunUmaDevCommand { args, presentation } => {
-                    if run_task.is_some() || app.thinking || app.cancelling {
+                    if local_command::slot_busy(run_task.as_ref(), app) {
                         app.push_workspace_notice(umadev_i18n::t(
                             app.lang,
                             "chat.busy_cancel_first",
@@ -10488,13 +10436,7 @@ async fn event_loop(
                     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
                     let request =
                         LocalCommandRequest::umadev(&app.project_root, &borrowed, presentation);
-                    app.begin_local_command(&request);
-                    let lang = app.lang;
-                    let route_tx = route_tx.clone();
-                    run_task = Some(tokio::spawn(async move {
-                        let result = local_command::run(request, lang).await;
-                        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
-                    }));
+                    run_task = Some(local_command::spawn(app, request, &route_tx));
                 }
                 Action::SetThinking(enabled) => {
                     spawn_thinking_change(
@@ -10631,8 +10573,8 @@ async fn event_loop(
                     );
                 }
                 Action::RunDeploy { command } => {
-                    app.begin_deploy();
-                    run_task = Some(spawn_deploy_task(
+                    run_task = Some(local_command::spawn_deploy(
+                        app,
                         command,
                         opts.project_root.clone(),
                         sink.clone(),
@@ -11691,11 +11633,13 @@ async fn event_loop(
                         app,
                         terminal,
                         replay_key,
+                        &mut needs_redraw,
                         &mut draw_now,
                         &mut run_task,
                         &mut cancel_drain,
                         &mut cancel_drain_timed_out,
                         &mut cancel_deadline,
+                        &mut continuous_run_active,
                         &session_holder,
                         &chat_session_holder,
                         &pending_ask_holder,
@@ -11705,6 +11649,8 @@ async fn event_loop(
                         &live_input_hub,
                         &sink,
                         &route_tx,
+                        &mut engine_rx,
+                        &mut route_rx,
                     );
                 }
             }

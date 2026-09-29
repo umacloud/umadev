@@ -129,7 +129,8 @@ pub struct VerifyStep {
 /// - Node → install → lint (if script exists) → typecheck (if tsc) →
 ///   test (if script exists) → build (if script exists)
 /// - Rust → fmt-check → clippy → test → build
-/// - Python → install → ruff check → mypy (if configured) → pytest
+/// - Python → install (`poetry install` / `uv sync` / `pip install`, by how the
+///   project is declared) → ruff check → mypy (if configured) → pytest
 /// - Go → vet → test → build
 /// - Deno → lint → test → check
 #[must_use]
@@ -176,8 +177,10 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
                 };
                 steps.push(s("typecheck", tsc, &["--noEmit"], true));
             }
-            // Test: only if a test script exists.
-            if has_node_script(workspace, "test") {
+            // Test: only if a test script exists. `npm init`'s placeholder is not a
+            // test suite: it runs nothing and always exits 1 (a visible skip, see
+            // `skipped_checks`).
+            if has_node_script(workspace, "test") && !node_test_script_is_placeholder(workspace) {
                 steps.push(slow("test", pm, &["run", "test"], false));
             }
             // Build: only if a build script exists.
@@ -197,24 +200,7 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
             slow("test", "cargo", &["test", "--quiet"], false),
             slow("build", "cargo", &["build", "--release", "--quiet"], false),
         ]),
-        ProjectKind::Python => {
-            let mut steps = Vec::new();
-            // Install: prefer uv (fast), fall back to pip.
-            if which("uv") {
-                steps.push(slow("install", "uv", &["sync"], false));
-            } else {
-                steps.push(slow("install", "pip", &["install", "-e", "."], true));
-            }
-            steps.push(s("lint", "ruff", &["check"], true));
-            if workspace_file(workspace, "mypy.ini")
-                || (workspace_file(workspace, "pyproject.toml")
-                    && file_contains(workspace, "pyproject.toml", "[tool.mypy]"))
-            {
-                steps.push(s("typecheck", "mypy", &["."], true));
-            }
-            steps.push(slow("test", "pytest", &[], true));
-            Some(steps)
-        }
+        ProjectKind::Python => Some(python_steps(workspace, &which)),
         ProjectKind::Go => Some(vec![
             s("vet", "go", &["vet", "./..."], true),
             slow("test", "go", &["test", "./..."], false),
@@ -227,6 +213,176 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
         ]),
         ProjectKind::None => None,
     }
+}
+
+/// Where a Python project's dependencies are installed, and so how its tools run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonEnv {
+    /// A virtualenv uv manages (`uv sync`, or `uv pip install` into `.venv`): tools
+    /// run through `uv run --no-sync`, which puts that virtualenv first on PATH.
+    Uv,
+    /// Poetry's virtualenv: tools run through `poetry run`.
+    Poetry,
+    /// Whatever `pip` on PATH installs into: tools run from PATH.
+    Pip,
+}
+
+/// The install step for a Python project, chosen by how the project is declared,
+/// and the environment its tools then run in:
+/// - `[tool.poetry]` with Poetry on PATH → `poetry install`;
+/// - a PEP 621 `[project]` table with uv on PATH → `uv sync`;
+/// - any other installable project (`[project]`, `[tool.poetry]`, `setup.py`,
+///   `setup.cfg`) → `pip install -e .`;
+/// - only `requirements.txt` → `uv pip install -r requirements.txt` into the
+///   virtualenv uv would use, else `pip install -r requirements.txt`;
+/// - nothing to install (a `pyproject.toml` that only configures tools) → none.
+///
+/// `uv sync` fails on a requirements-only project ("No `pyproject.toml` found")
+/// and on a Poetry-format one ("No `project` table found"), and `pip install -e .`
+/// fails on a requirements-only one, so any other choice failed every verify of a
+/// healthy project.
+fn python_install(
+    workspace: &Path,
+    available: &dyn Fn(&str) -> bool,
+) -> (PythonEnv, Option<VerifyStep>) {
+    let install = |program: &str, args: &[&str], skippable: bool| {
+        Some(VerifyStep {
+            name: "install",
+            program: program.to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            skippable,
+            timeout_secs: SLOW_STEP_TIMEOUT_SECS,
+        })
+    };
+    let project = pyproject_declares(workspace, "project");
+    let poetry = pyproject_declares(workspace, "tool.poetry");
+    if poetry && available("poetry") {
+        (PythonEnv::Poetry, install("poetry", &["install"], false))
+    } else if project && available("uv") {
+        (PythonEnv::Uv, install("uv", &["sync"], false))
+    } else if project
+        || poetry
+        || workspace_file(workspace, "setup.py")
+        || workspace_file(workspace, "setup.cfg")
+    {
+        (
+            PythonEnv::Pip,
+            install("pip", &["install", "-e", "."], true),
+        )
+    } else if workspace_file(workspace, "requirements.txt") {
+        if available("uv") && python_venv_present(workspace) {
+            let args = ["pip", "install", "-r", "requirements.txt"];
+            (PythonEnv::Uv, install("uv", &args, false))
+        } else {
+            let args = ["install", "-r", "requirements.txt"];
+            (PythonEnv::Pip, install("pip", &args, true))
+        }
+    } else {
+        (PythonEnv::Pip, None)
+    }
+}
+
+/// The Python verify sequence: install, then `ruff check`, `mypy .` (when
+/// configured) and `pytest`, each run inside the environment the install filled.
+fn python_steps(workspace: &Path, available: &dyn Fn(&str) -> bool) -> Vec<VerifyStep> {
+    let (env, install) = python_install(workspace, available);
+    let tool = |name: &'static str, tool: &str, args: &[&str], timeout_secs: u64| {
+        let (program, mut argv) = python_tool(workspace, env, tool, available);
+        argv.extend(args.iter().map(|a| (*a).to_string()));
+        VerifyStep {
+            name,
+            program,
+            args: argv,
+            skippable: true,
+            timeout_secs,
+        }
+    };
+    let mut steps: Vec<VerifyStep> = install.into_iter().collect();
+    steps.push(tool("lint", "ruff", &["check"], 0));
+    if workspace_file(workspace, "mypy.ini")
+        || (workspace_file(workspace, "pyproject.toml")
+            && file_contains(workspace, "pyproject.toml", "[tool.mypy]"))
+    {
+        steps.push(tool("typecheck", "mypy", &["."], 0));
+    }
+    steps.push(tool("test", "pytest", &[], SLOW_STEP_TIMEOUT_SECS));
+    steps
+}
+
+/// How to run the Python tool `tool` (`ruff`, `mypy`, `pytest`) as
+/// `(program, leading arguments)`. Inside a uv or Poetry virtualenv it runs
+/// through that manager — a global pytest cannot import what `uv sync` installed
+/// into `.venv` — as long as the tool is there to run (the project declares it,
+/// or it is on PATH). Otherwise it is looked up on PATH and, being skippable,
+/// recorded as skipped when absent.
+fn python_tool(
+    workspace: &Path,
+    env: PythonEnv,
+    tool: &str,
+    available: &dyn Fn(&str) -> bool,
+) -> (String, Vec<String>) {
+    let runner: &[&str] = match env {
+        PythonEnv::Uv => &["uv", "run", "--no-sync"],
+        PythonEnv::Poetry => &["poetry", "run"],
+        PythonEnv::Pip => &[],
+    };
+    match runner.split_first() {
+        Some((program, runner_args))
+            if available(tool) || python_project_declares(workspace, tool) =>
+        {
+            let mut argv: Vec<String> = runner_args.iter().map(|a| (*a).to_string()).collect();
+            argv.push(tool.to_string());
+            ((*program).to_string(), argv)
+        }
+        _ => (tool.to_string(), Vec::new()),
+    }
+}
+
+/// Whether `pyproject.toml` declares the table `table` (`project`, `tool.poetry`)
+/// or one of its sub-tables.
+fn pyproject_declares(workspace: &Path, table: &str) -> bool {
+    let header = format!("[{table}]");
+    let sub_table = format!("[{table}.");
+    crate::bounded_fs::read_utf8_beneath(
+        workspace,
+        &workspace.join("pyproject.toml"),
+        MAX_VERIFY_CONFIG_BYTES,
+    )
+    .is_ok_and(|content| {
+        content
+            .lines()
+            .map(str::trim)
+            .any(|line| line == header || line.starts_with(&sub_table))
+    })
+}
+
+/// Whether the project lists the Python tool `tool` among its dependencies or
+/// configures it (in `pyproject.toml` or a requirements file).
+fn python_project_declares(workspace: &Path, tool: &str) -> bool {
+    [
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "dev-requirements.txt",
+    ]
+    .iter()
+    .any(|file| file_contains(workspace, file, tool))
+}
+
+/// Whether uv has a virtualenv to install a requirements file into: an activated
+/// one (`VIRTUAL_ENV`) or the project's `.venv`.
+fn python_venv_present(workspace: &Path) -> bool {
+    std::env::var_os("VIRTUAL_ENV").is_some_and(|v| !v.is_empty())
+        || workspace_file(workspace, ".venv/pyvenv.cfg")
+}
+
+/// Whether a pytest `test` step ended with exit code 5, "no tests collected": a
+/// project with no tests yet has nothing to run, which is not a failing suite
+/// (Node skips a missing test script; cargo and go pass with no tests).
+fn pytest_collected_nothing(step: &VerifyStep, outcome: &VerifyOutcome) -> bool {
+    step.name == "test"
+        && outcome.exit_code == 5
+        && (step.program == "pytest" || step.args.iter().any(|a| a == "pytest"))
 }
 
 /// Wall-clock budget for ONE named-test run ([`run_named_test`]). A single test is a
@@ -256,6 +412,12 @@ pub enum NamedTestOutcome {
     Passed,
     /// The runner ran the named test and it FAILED.
     Failed,
+    /// The runner ran, but no test by that name was among the tests it ran: the
+    /// name filter matched nothing (Go's `[no tests to run]`, jest / vitest skipping
+    /// every test) or matched only OTHER tests (`pytest -k test_login` running
+    /// `test_login_redirect`). The named test does not exist in that tree, so it
+    /// neither passed nor failed there.
+    NotFound,
     /// The question could not be asked at all — no recognised project, no test runner
     /// on PATH, a spawn error, or a timeout. **Not a verdict**: a caller must treat
     /// this as "we could not check", never as a pass or a fail.
@@ -331,12 +493,12 @@ fn named_test_step(
         // `cargo test <substring>` is a plain SUBSTRING match, not a pattern, but
         // the filter sits BEFORE `--`, where cargo still parses its own options:
         // accept only a Rust path (`module::tests::name`).
-        ProjectKind::Rust => test.split("::").all(is_plain_test_ident).then(|| {
-            step(
-                "cargo",
-                vec!["test".into(), "--quiet".into(), t, "--".into()],
-            )
-        }),
+        // Without `--quiet`, libtest prints one `test <path> ... ok` line per test, which
+        // is how the verdict tells THIS test from others the substring filter ran.
+        ProjectKind::Rust => test
+            .split("::")
+            .all(is_plain_test_ident)
+            .then(|| step("cargo", vec!["test".into(), t, "--".into()])),
         ProjectKind::Node => {
             // Only meaningful when the project declares a test script AND that script
             // runs a runner for which `-t` means "filter by name" (jest / vitest).
@@ -345,19 +507,29 @@ fn named_test_step(
             }
             let (pm, _) = node_package_manager(workspace);
             // `-t <name>` is a jest/vitest name filter (a regex there too, but they
-            // treat a non-matching pattern as "no tests ran", not as a syntax error);
-            // the `--` separates it from the package manager's own args.
-            Some(step(
-                pm,
-                vec!["run".into(), "test".into(), "--".into(), "-t".into(), t],
-            ))
+            // treat a non-matching pattern as "no tests ran", not as a syntax error).
+            // npm, yarn 1 and bun strip a `--` that separates it from their own
+            // args; pnpm and Yarn 2+ forward it literally, and jest then reads the
+            // filter as a test-path pattern (0 matches, exit 1) while vitest ignores
+            // it and runs the whole suite.
+            let mut args: Vec<String> = vec!["run".into(), "test".into()];
+            if package_manager_strips_separator(workspace, pm) {
+                args.push("--".into());
+            }
+            args.extend(["-t".into(), jest_name_pattern(test)]);
+            Some(step(pm, args))
         }
         // pytest `-k` is an EXPRESSION (`and` / `or` / `not` / parens). A `-`, a space,
         // a bracket, or a parenthesis in the name is a syntax error → exit 4, which is
         // NOT a failing test.
-        ProjectKind::Python => {
-            is_plain_test_ident(test).then(|| step("pytest", vec!["-k".into(), t, "-q".into()]))
-        }
+        ProjectKind::Python => is_plain_test_ident(test).then(|| {
+            let env = python_install(workspace, &which).0;
+            let (program, mut args) = python_tool(workspace, env, "pytest", &which);
+            // `-v` prints one `<file>::<test> PASSED` line per test: `-k` is a
+            // substring match, so the verdict must find THIS test among them.
+            args.extend(["-k".into(), t, "-v".into()]);
+            step(&program, args)
+        }),
         // Go `-run` is a REGEX. A name carrying `[`, `(`, `+`, `.` … is either an
         // invalid pattern (exit != 0) or a pattern that matches the wrong set.
         ProjectKind::Go => is_plain_test_ident(test).then(|| {
@@ -388,7 +560,8 @@ fn named_test_step(
 /// uses, so a wedged runner can never hang the director.
 ///
 /// Fail-open: an unrecognised project, a missing runner, a spawn error, or a timeout
-/// is [`NamedTestOutcome::Unavailable`] — the caller must degrade, never block.
+/// is [`NamedTestOutcome::Unavailable`] — the caller must degrade, never block. A
+/// run in which no test by that name ran is [`NamedTestOutcome::NotFound`].
 pub async fn run_named_test(workspace: &Path, test: &str) -> NamedTestOutcome {
     run_named_test_bounded(workspace, test, NAMED_TEST_TIMEOUT_SECS).await
 }
@@ -416,17 +589,219 @@ pub async fn run_named_test_bounded(
         return NamedTestOutcome::Unavailable; // no runner on PATH → cannot ask
     }
     let command_str = format!("{} {}", step.program, step.args.join(" "));
-    let out = run_step_command(workspace, kind, &step, command_str, timeout_secs).await;
+    let (out, truncated) =
+        run_step_command_capture(workspace, kind, &step, command_str, timeout_secs).await;
     // A spawn failure / timeout records `exit_code == -1`; neither is a verdict about
     // the test — they are our own inability to ask.
     if out.exit_code < 0 {
         return NamedTestOutcome::Unavailable;
     }
-    if out.passed {
-        NamedTestOutcome::Passed
-    } else {
-        NamedTestOutcome::Failed
+    named_test_verdict(kind, test, &out, truncated)
+}
+
+/// `test` as a jest / vitest `-t` pattern. `-t` is an unanchored regular
+/// expression over a test's full name ("describe … test"), so a bare `login` also
+/// ran `login redirect`; escaped and anchored at the end, it runs the test whose
+/// name IS `test` (inside any `describe`).
+fn jest_name_pattern(test: &str) -> String {
+    let mut pattern = String::with_capacity(test.len() + 8);
+    for c in test.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
     }
+    pattern.push('$');
+    pattern
+}
+
+/// What a runner's output says about the ONE named test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestSighting {
+    Passed,
+    Failed,
+    /// The runner reported the tests it ran, and the named test was not one of them.
+    NotRun,
+    /// The output does not say (an unrecognised format, or a run that ended before
+    /// any test ran).
+    Unknown,
+}
+
+/// Read ONE named test's verdict out of its runner's output. The exit code alone
+/// does not say: every runner exits 0 when its name filter matched NOTHING (Go's
+/// `[no tests to run]`, jest / vitest skipping every test, deno filtering all out),
+/// and cargo's and pytest's filters are substring matches that can run OTHER tests
+/// (`test_login_redirect` for `test_login`). So a test the runner did not report
+/// running is [`NamedTestOutcome::NotFound`], never a pass. When the answer should
+/// be in output that was cut to its bounded tail, the question is
+/// [`NamedTestOutcome::Unavailable`] rather than a guess.
+fn named_test_verdict(
+    kind: ProjectKind,
+    test: &str,
+    out: &VerifyOutcome,
+    truncated: bool,
+) -> NamedTestOutcome {
+    let log = format!("{}\n{}", out.stdout, out.stderr);
+    let sighting = match kind {
+        ProjectKind::Rust => cargo_test_sighting(&log, test),
+        ProjectKind::Python => pytest_sighting(&log, test, out.exit_code),
+        ProjectKind::Go => go_test_sighting(&log),
+        ProjectKind::Node => node_test_sighting(&log),
+        ProjectKind::Deno => deno_test_sighting(&log),
+        ProjectKind::None => TestSighting::Unknown,
+    };
+    match sighting {
+        TestSighting::Passed => NamedTestOutcome::Passed,
+        TestSighting::Failed => NamedTestOutcome::Failed,
+        TestSighting::NotRun if truncated => NamedTestOutcome::Unavailable,
+        TestSighting::NotRun => NamedTestOutcome::NotFound,
+        TestSighting::Unknown if !out.passed => NamedTestOutcome::Failed,
+        TestSighting::Unknown if truncated => NamedTestOutcome::Unavailable,
+        TestSighting::Unknown => NamedTestOutcome::Passed,
+    }
+}
+
+/// cargo / libtest: `test tests::adds_numbers ... ok` lines, matched on the exact
+/// name or the last path segments (`adds_numbers`, `tests::adds_numbers`).
+fn cargo_test_sighting(log: &str, test: &str) -> TestSighting {
+    let suffix = format!("::{test}");
+    let mut harness_ran = false;
+    let mut passed = false;
+    for line in log.lines().map(str::trim) {
+        harness_ran |= line.starts_with("running ") || line.starts_with("test result:");
+        let Some((name, result)) = line
+            .strip_prefix("test ")
+            .and_then(|rest| rest.split_once(" ... "))
+        else {
+            continue;
+        };
+        let name = name.trim();
+        if name != test && !name.ends_with(&suffix) {
+            continue;
+        }
+        if result.starts_with("FAILED") {
+            return TestSighting::Failed;
+        }
+        passed |= result.starts_with("ok");
+    }
+    if passed {
+        TestSighting::Passed
+    } else if harness_ran {
+        TestSighting::NotRun
+    } else {
+        TestSighting::Unknown
+    }
+}
+
+/// pytest `-v`: `tests/test_a.py::test_login PASSED` lines and the summary's
+/// `FAILED tests/test_a.py::test_login - …`, matched on the node id's last part
+/// (a parametrized `test_login[1-2]` included). Exit 5 means nothing was collected.
+fn pytest_sighting(log: &str, test: &str, exit_code: i32) -> TestSighting {
+    let mut passed = false;
+    for line in log.lines() {
+        let is_ours = line.split_whitespace().any(|token| {
+            token.rsplit_once("::").is_some_and(|(_, last)| {
+                last.split_once('[').map_or(last, |(name, _)| name) == test
+            })
+        });
+        if !is_ours {
+            continue;
+        }
+        if line.contains("FAILED") || line.contains("ERROR") {
+            return TestSighting::Failed;
+        }
+        passed |= line.contains("PASSED") || line.contains("XPASS");
+    }
+    match (passed, exit_code) {
+        (true, _) => TestSighting::Passed,
+        // 0: tests ran and passed; 1: some failed; 5: none collected — in every
+        // case the output lists the tests that ran, and this one is not there.
+        (false, 0 | 1 | 5) => TestSighting::NotRun,
+        _ => TestSighting::Unknown,
+    }
+}
+
+/// `go test -run ^Name$`: the pattern is anchored, so any package that ran a test
+/// ran THIS one. A package that ran none prints `ok … [no tests to run]`.
+fn go_test_sighting(text: &str) -> TestSighting {
+    let mut listed = false;
+    for line in text.lines() {
+        if line.starts_with("--- FAIL") || line.starts_with("FAIL") {
+            return TestSighting::Failed;
+        }
+        if line.starts_with("ok") && !line.contains("[no tests to run]") {
+            return TestSighting::Passed;
+        }
+        listed |= line.starts_with("ok") || line.starts_with('?');
+    }
+    if listed {
+        TestSighting::NotRun
+    } else {
+        TestSighting::Unknown
+    }
+}
+
+/// jest (`Tests:       1 passed, 2 skipped, 3 total`) and vitest
+/// (`Tests  1 passed | 2 skipped (3)`) summaries: with no test passed or failed,
+/// the name filter skipped every test.
+fn node_test_sighting(text: &str) -> TestSighting {
+    for line in text.lines().rev() {
+        let line = strip_ansi(line).trim().to_ascii_lowercase();
+        if !(line.starts_with("tests:") || line.starts_with("tests ")) {
+            continue;
+        }
+        return if line.contains("failed") {
+            TestSighting::Failed
+        } else if line.contains("passed") {
+            TestSighting::Passed
+        } else {
+            TestSighting::NotRun
+        };
+    }
+    TestSighting::Unknown
+}
+
+/// deno's summary, `ok | 0 passed | 0 failed | 4 filtered out`.
+fn deno_test_sighting(text: &str) -> TestSighting {
+    let count = |line: &str, label: &str| {
+        line.split('|').find_map(|part| {
+            let (n, rest) = part.trim().split_once(' ')?;
+            (rest.trim_start().starts_with(label)).then(|| n.parse::<u64>().ok())?
+        })
+    };
+    for line in text.lines().rev().map(strip_ansi) {
+        let (Some(passed), Some(failed)) = (count(&line, "passed"), count(&line, "failed")) else {
+            continue;
+        };
+        return if failed > 0 {
+            TestSighting::Failed
+        } else if passed > 0 {
+            TestSighting::Passed
+        } else {
+            TestSighting::NotRun
+        };
+    }
+    TestSighting::Unknown
+}
+
+/// `line` without ANSI colour / cursor escape sequences.
+pub(crate) fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The dev-server configuration UmaDev uses for `/preview`, so the command
@@ -667,6 +1042,33 @@ fn has_node_script(workspace: &Path, script: &str) -> bool {
     json.get("scripts").and_then(|s| s.get(script)).is_some()
 }
 
+/// Whether `package.json`'s test script is the placeholder `npm init` / `pnpm init`
+/// writes — `echo "Error: no test specified" && exit 1` — which runs no test and
+/// always fails.
+fn node_test_script_is_placeholder(workspace: &Path) -> bool {
+    package_json(workspace)
+        .and_then(|json| {
+            let script = json.get("scripts")?.get("test")?.as_str()?;
+            Some(script.to_ascii_lowercase())
+        })
+        .is_some_and(|script| script.contains("no test specified") && script.contains("exit 1"))
+}
+
+/// Checks the project's manifest names that cannot run as a real check here,
+/// recorded as visible skips rather than dropped silently.
+fn skipped_checks(kind: ProjectKind, workspace: &Path) -> Vec<VerifyOutcome> {
+    let mut out = Vec::new();
+    if kind == ProjectKind::Node && node_test_script_is_placeholder(workspace) {
+        out.push(VerifyOutcome::skipped_due_to(
+            kind,
+            "test",
+            format!("{} run test", node_package_manager(workspace).0),
+            "package.json's test script is the `npm init` placeholder, which runs no test",
+        ));
+    }
+    out
+}
+
 /// Pick the Node package manager + install args from the workspace's
 /// lockfile. Falls back to `npm` when no lockfile is present.
 fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static str]) {
@@ -684,6 +1086,40 @@ fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static s
     } else {
         ("npm", &["install", "--no-audit", "--no-fund", "--silent"])
     }
+}
+
+/// Whether `<pm> run <script> -- <args>` drops the `--` before the script sees
+/// its arguments. npm, yarn 1 and bun do; pnpm and Yarn 2+ (berry) pass it on
+/// as a literal argument, so extra arguments must follow the script name
+/// directly there.
+fn package_manager_strips_separator(workspace: &Path, pm: &str) -> bool {
+    match pm {
+        "pnpm" => false,
+        "yarn" => !yarn_is_berry(workspace),
+        _ => true,
+    }
+}
+
+/// Whether the workspace uses Yarn 2+ (berry) rather than yarn 1: its
+/// `packageManager` field names `yarn@2` or later, its `yarn.lock` is the berry
+/// format (a `__metadata:` block instead of the `# yarn lockfile v1` header), or
+/// it carries berry's `.yarnrc.yml`.
+fn yarn_is_berry(workspace: &Path) -> bool {
+    let declared = package_json(workspace).and_then(|json| {
+        let spec = json.get("packageManager")?.as_str()?.to_string();
+        let version = spec.strip_prefix("yarn@")?;
+        version
+            .split('.')
+            .next()
+            .and_then(|major| major.parse::<u32>().ok())
+    });
+    if let Some(major) = declared {
+        return major >= 2;
+    }
+    if file_contains(workspace, "yarn.lock", "yarn lockfile v1") {
+        return false;
+    }
+    file_contains(workspace, "yarn.lock", "__metadata:") || workspace_file(workspace, ".yarnrc.yml")
 }
 
 /// Detect the project kind from workspace files.
@@ -880,22 +1316,26 @@ fn install_has_failed(outcomes: &[VerifyOutcome]) -> bool {
         .any(|o| o.step == "install" && !o.passed && !o.skipped)
 }
 
-/// Resolve the effective per-step timeout: the env override wins, then
-/// the step's own budget (if non-zero), then the global default.
 /// Resolve the effective per-step timeout. Semantics:
-/// - A step with its own budget (`step_timeout_secs != 0`, i.e. the slow
-///   install/test/build steps) always gets AT LEAST that budget — even when
-///   `UMADEV_VERIFY_TIMEOUT_SECS` is set low, so a user who lowers the
-///   global default doesn't artificially time out `cargo build --release`.
-/// - The env override otherwise raises the default-budget steps (fmt/clippy).
-/// - Final fallback: [`DEFAULT_TIMEOUT_SECS`].
+/// - `UMADEV_VERIFY_TIMEOUT_SECS`, when set, is the budget of EVERY step,
+///   exactly as documented — it can lower the slow install/test/build budgets
+///   (a CI that wants to fail fast) as well as raise them.
+/// - Otherwise a step with its own budget (`step_timeout_secs != 0`, i.e. the
+///   slow install/test/build steps) gets that budget, and every other step gets
+///   [`DEFAULT_TIMEOUT_SECS`].
 fn effective_timeout(step_timeout_secs: u64, global_override: Option<u64>) -> u64 {
-    let baseline = global_override.unwrap_or(DEFAULT_TIMEOUT_SECS);
-    if step_timeout_secs != 0 {
-        baseline.max(step_timeout_secs)
-    } else {
-        baseline
+    match global_override {
+        Some(secs) => secs,
+        None if step_timeout_secs != 0 => step_timeout_secs,
+        None => DEFAULT_TIMEOUT_SECS,
     }
+}
+
+/// `UMADEV_VERIFY_TIMEOUT_SECS` as a budget: a positive whole number of seconds.
+/// Unset, unparsable or `0` (a budget no step could meet) means "not set".
+fn verify_timeout_override(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
 }
 
 /// Run the full verify step sequence for `workspace`. Returns one
@@ -919,9 +1359,8 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
     };
 
     // A global env override, when set, overrides EVERY step's budget.
-    let global_override = std::env::var("UMADEV_VERIFY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
+    let global_override =
+        verify_timeout_override(std::env::var("UMADEV_VERIFY_TIMEOUT_SECS").ok().as_deref());
 
     // P1-8: once the dependency-install step FAILS (network/environment, not the
     // project's code), every step that needs the installed dependencies is
@@ -966,8 +1405,19 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         // (ran, exited non-zero / timed out — not a skip) is picked up by
         // `install_has_failed` on the next iteration, arming the dependent-step
         // short-circuit above (P1-8).
-        outcomes.push(run_step_command(workspace, kind, &step, command_str, timeout_secs).await);
+        let outcome = run_step_command(workspace, kind, &step, command_str, timeout_secs).await;
+        outcomes.push(if pytest_collected_nothing(&step, &outcome) {
+            VerifyOutcome::skipped_due_to(
+                kind,
+                step.name,
+                outcome.command,
+                "pytest collected no tests (exit 5) — there is nothing to run yet",
+            )
+        } else {
+            outcome
+        });
     }
+    outcomes.extend(skipped_checks(kind, workspace));
 
     // FRESHNESS STAMP: record WHICH source tree these outcomes describe, so a later
     // reader can tell a green run of today's code from a green run of code that has
@@ -996,12 +1446,29 @@ async fn run_step_command(
     command_str: String,
     timeout_secs: u64,
 ) -> VerifyOutcome {
+    run_step_command_capture(workspace, kind, step, command_str, timeout_secs)
+        .await
+        .0
+}
+
+/// [`run_step_command`], also saying whether older output was dropped to keep
+/// the captured tails bounded — a reader looking for ONE line (a named test's
+/// verdict) must not read a line that was cut away as a line that never existed.
+async fn run_step_command_capture(
+    workspace: &Path,
+    kind: ProjectKind,
+    step: &VerifyStep,
+    command_str: String,
+    timeout_secs: u64,
+) -> (VerifyOutcome, bool) {
     let started = Instant::now();
     // A resolved `.cmd`/`.bat` shim is spawned directly, never via `cmd /c`, so
     // Rust's hardened batch-argument encoding applies to model-supplied
     // arguments such as a red-to-green test name.
     let mut vcmd = Command::new(resolve_program(&step.program));
     vcmd.args(&step.args).current_dir(workspace);
+    // Install and test scripts are the project's (and its dependencies') code.
+    umadev_process::child_env::scrub_leaked_secrets(vcmd.as_std_mut());
     let options = umadev_process::BoundedCommandOptions {
         timeout: Duration::from_secs(timeout_secs),
         stdout_bytes: CAPTURE_CAP,
@@ -1014,7 +1481,7 @@ async fn run_step_command(
             // A non-skippable install that can't even spawn is an install failure
             // too — passed=false, so `install_has_failed` picks it up and arms the
             // dependent-step short-circuit (P1-8).
-            return VerifyOutcome::from_spawn_error(
+            let outcome = VerifyOutcome::from_spawn_error(
                 kind,
                 step.name,
                 command_str,
@@ -1022,24 +1489,21 @@ async fn run_step_command(
                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 step.skippable,
             );
+            return (outcome, false);
         }
     };
+    let truncated = output.stdout_truncated || output.stderr_truncated;
     let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     truncate_in_place(&mut stdout, CAPTURE_CAP);
     truncate_in_place(&mut stderr, CAPTURE_CAP);
 
     if output.timed_out {
-        return VerifyOutcome::from_timeout(
-            kind,
-            step.name,
-            command_str,
-            timeout_secs,
-            stdout,
-            stderr,
-        );
+        let outcome =
+            VerifyOutcome::from_timeout(kind, step.name, command_str, timeout_secs, stdout, stderr);
+        return (outcome, truncated);
     }
-    match output.status {
+    let outcome = match output.status {
         Some(status) => VerifyOutcome {
             project_kind: kind,
             step: step.name.to_string(),
@@ -1060,7 +1524,8 @@ async fn run_step_command(
             started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             step.skippable,
         ),
-    }
+    };
+    (outcome, truncated)
 }
 
 /// Append an outcome (plus timestamp + phase tag) to
@@ -1328,6 +1793,63 @@ mod tests {
         assert!(s.args.contains(&"-t".to_string()));
         pkg("jest --ci");
         assert!(named_test_step(ProjectKind::Node, tmp.path(), "renders_the_card", 90).is_some());
+    }
+
+    #[test]
+    fn named_test_step_does_not_forward_a_literal_separator_under_pnpm() {
+        // pnpm 10 and Yarn 4 pass a `--` after the script name on to the script, so
+        // `pnpm run test -- -t name` runs `jest -- -t name`: jest reads the filter as a
+        // test-path pattern (0 matches, exit 1) and vitest runs the whole suite.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"x","scripts":{"test":"jest"}}"#,
+        )
+        .unwrap();
+        let args = |root: &Path| {
+            named_test_step(ProjectKind::Node, root, "adds_numbers", 90)
+                .expect("jest takes -t")
+                .args
+        };
+        let dash_dash = "--".to_string();
+
+        fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        let pnpm = args(root);
+        assert!(!pnpm.contains(&dash_dash), "pnpm: {pnpm:?}");
+        assert_eq!(pnpm[..2], ["run".to_string(), "test".to_string()]);
+        assert!(pnpm.windows(2).any(|w| w[0] == "-t"), "{pnpm:?}");
+
+        fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        fs::write(
+            root.join("yarn.lock"),
+            "__metadata:\n  version: 8\n  cacheKey: 10\n",
+        )
+        .unwrap();
+        let berry = args(root);
+        assert!(!berry.contains(&dash_dash), "yarn berry: {berry:?}");
+
+        // yarn 1, npm and bun strip the separator, so it stays there.
+        fs::write(
+            root.join("yarn.lock"),
+            "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n# yarn lockfile v1\n",
+        )
+        .unwrap();
+        assert!(args(root).contains(&dash_dash), "yarn 1");
+        fs::remove_file(root.join("yarn.lock")).unwrap();
+        assert!(args(root).contains(&dash_dash), "npm");
+        fs::write(root.join("bun.lock"), "{}").unwrap();
+        assert!(args(root).contains(&dash_dash), "bun");
+
+        // `packageManager` decides when the lockfile is not yet written.
+        fs::remove_file(root.join("bun.lock")).unwrap();
+        fs::write(root.join("yarn.lock"), "").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"x","packageManager":"yarn@4.9.2","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        assert!(!args(root).contains(&dash_dash), "packageManager yarn@4");
     }
 
     #[test]
@@ -1629,29 +2151,32 @@ mod tests {
     }
 
     #[test]
-    fn effective_timeout_slow_step_keeps_its_budget() {
-        // A slow step keeps AT LEAST its own budget, even when the env
-        // override is lower — so a low global cap can't time out
-        // `cargo build --release`.
-        assert_eq!(effective_timeout(0, None), DEFAULT_TIMEOUT_SECS);
+    fn verify_timeout_override_applies_to_slow_steps() {
+        // CONFIG.md: `UMADEV_VERIFY_TIMEOUT_SECS` is the budget of EVERY step. A CI
+        // that sets 60 to fail fast must not still wait 600 s on install/test/build.
         assert_eq!(
-            effective_timeout(300, None),
-            300,
-            "slow step default = its budget"
+            effective_timeout(SLOW_STEP_TIMEOUT_SECS, Some(60)),
+            60,
+            "a lower override lowers the slow install/test/build budget too"
         );
         assert_eq!(effective_timeout(0, Some(45)), 45, "fast step honours env");
-        // Slow budget (300) wins over a lower env (45):
-        assert_eq!(
-            effective_timeout(300, Some(45)),
-            300,
-            "slow step must keep its 300s budget even when env is 45"
-        );
-        // Higher env (900) wins over slow budget (300):
         assert_eq!(
             effective_timeout(300, Some(900)),
             900,
-            "a higher env override raises the slow step too"
+            "a higher override raises the slow step too"
         );
+        // Unset: each step keeps its own budget.
+        assert_eq!(effective_timeout(300, None), 300, "slow step = its budget");
+        assert_eq!(effective_timeout(0, None), DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn verify_timeout_override_reads_a_positive_number_of_seconds() {
+        assert_eq!(verify_timeout_override(Some("60")), Some(60));
+        assert_eq!(verify_timeout_override(Some(" 90 ")), Some(90));
+        assert_eq!(verify_timeout_override(Some("0")), None);
+        assert_eq!(verify_timeout_override(Some("soon")), None);
+        assert_eq!(verify_timeout_override(None), None);
     }
 
     #[test]
@@ -1681,6 +2206,358 @@ mod tests {
         assert!(verify_steps(ProjectKind::None, tmp.path()).is_none());
     }
 
+    // ── Python: install the way the project is declared ──────────────────────
+
+    fn install_step(steps: &[VerifyStep]) -> Option<&VerifyStep> {
+        steps.iter().find(|s| s.name == "install")
+    }
+
+    #[test]
+    fn python_requirements_only_project_gets_a_requirements_install() {
+        // A Flask/FastAPI/Django app with only `requirements.txt`: `uv sync` fails with
+        // "No `pyproject.toml` found" and `pip install -e .` with "does not appear to
+        // be a Python project", which failed every verify of a healthy project.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("requirements.txt"), "flask==3.0.3\n").unwrap();
+        let steps = verify_steps(ProjectKind::Python, tmp.path()).unwrap();
+        let install = install_step(&steps).expect("the requirements are installed");
+        assert!(
+            !install.args.iter().any(|a| a == "sync" || a == "-e"),
+            "{} {:?}",
+            install.program,
+            install.args
+        );
+        assert!(
+            install
+                .args
+                .windows(2)
+                .any(|w| w[0] == "-r" && w[1] == "requirements.txt"),
+            "{} {:?}",
+            install.program,
+            install.args
+        );
+    }
+
+    #[test]
+    fn a_poetry_project_is_never_uv_synced() {
+        // A Poetry-format pyproject has no `[project]` table, so `uv sync` fails with
+        // "No `project` table found".
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.poetry]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [tool.poetry.dependencies]\npython = \"^3.11\"\n",
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Python, tmp.path()).unwrap();
+        let install = install_step(&steps).expect("a Poetry project is installed");
+        assert!(
+            !install.args.iter().any(|a| a == "sync"),
+            "{} {:?}",
+            install.program,
+            install.args
+        );
+    }
+
+    #[test]
+    fn a_uv_project_runs_its_tools_inside_its_virtualenv() {
+        // `uv sync` installs into `.venv`; a global pytest cannot import from there.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependency-groups]\ndev = [\"pytest>=8\"]\n",
+        )
+        .unwrap();
+        let steps = python_steps(tmp.path(), &|bin| bin == "uv");
+        let install = install_step(&steps).expect("install");
+        assert_eq!(
+            (install.program.as_str(), install.args.clone()),
+            ("uv", vec!["sync".to_string()])
+        );
+        let test = steps.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.program, "uv");
+        assert_eq!(test.args, ["run", "--no-sync", "pytest"]);
+        // ruff is neither declared nor installed: a plain lookup, skipped when absent.
+        let lint = steps.iter().find(|s| s.name == "lint").expect("lint");
+        assert_eq!(lint.program, "ruff");
+        assert!(lint.skippable);
+
+        // Without uv the project installs with pip and runs the tools from PATH.
+        let steps = python_steps(tmp.path(), &|_| false);
+        let install = install_step(&steps).expect("install");
+        assert_eq!(install.program, "pip");
+        assert_eq!(install.args, ["install", "-e", "."]);
+        assert_eq!(
+            steps.iter().find(|s| s.name == "test").unwrap().program,
+            "pytest"
+        );
+    }
+
+    #[test]
+    fn a_poetry_project_installs_and_tests_with_poetry() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.poetry]\nname = \"app\"\n\n[tool.poetry.group.dev.dependencies]\n\
+             pytest = \"^8.0\"\n",
+        )
+        .unwrap();
+        let steps = python_steps(tmp.path(), &|bin| bin == "poetry" || bin == "uv");
+        let install = install_step(&steps).expect("install");
+        assert_eq!(install.program, "poetry");
+        assert_eq!(install.args, ["install"]);
+        let test = steps.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.program, "poetry");
+        assert_eq!(test.args, ["run", "pytest"]);
+    }
+
+    #[test]
+    fn a_requirements_project_uses_the_virtualenv_uv_would_install_into() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("requirements.txt"), "fastapi\npytest\n").unwrap();
+        fs::create_dir_all(tmp.path().join(".venv")).unwrap();
+        fs::write(tmp.path().join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let steps = python_steps(tmp.path(), &|bin| bin == "uv");
+        let install = install_step(&steps).expect("install");
+        assert_eq!(install.program, "uv");
+        assert_eq!(install.args, ["pip", "install", "-r", "requirements.txt"]);
+        let test = steps.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.args, ["run", "--no-sync", "pytest"]);
+    }
+
+    #[test]
+    fn pytest_exit_5_is_not_a_failure() {
+        // pytest exits 5 when it collects no tests — a new project has none yet.
+        let step = VerifyStep {
+            name: "test",
+            program: "uv".to_string(),
+            args: vec!["run".into(), "--no-sync".into(), "pytest".into()],
+            skippable: true,
+            timeout_secs: 0,
+        };
+        let mut outcome = outcome("test", false, false);
+        outcome.exit_code = 5;
+        assert!(pytest_collected_nothing(&step, &outcome));
+        // A real pytest failure is still a failure.
+        outcome.exit_code = 1;
+        assert!(!pytest_collected_nothing(&step, &outcome));
+        // Exit 5 from another tool means what that tool says it means.
+        let cargo = VerifyStep {
+            program: "cargo".to_string(),
+            args: vec!["test".into()],
+            ..step
+        };
+        outcome.exit_code = 5;
+        assert!(!pytest_collected_nothing(&cargo, &outcome));
+    }
+
+    #[tokio::test]
+    async fn a_python_project_with_no_tests_yet_verifies_clean() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+        )
+        .unwrap();
+        let outcomes = run_verify(tmp.path()).await;
+        assert!(!outcomes.is_empty());
+        assert!(
+            outcomes.iter().all(|o| o.passed || o.skipped),
+            "{outcomes:?}"
+        );
+    }
+
+    // ── a named-test filter that matched nothing is not a pass ───────────────
+
+    #[tokio::test]
+    async fn named_test_that_matches_nothing_is_not_passed() {
+        // `go test -run ^TestAdd$` prints `[no tests to run]` and exits 0 when only
+        // `TestAddNegative` exists. Read as a pass, a brand-new `TestAdd` was reported
+        // as "ALREADY PASSED" at its step's pre-state.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("go.mod"), "module example.com/x\n\ngo 1.18\n").unwrap();
+        fs::write(
+            root.join("add.go"),
+            "package x\n\nfunc Add(a, b int) int { return a + b }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("add_test.go"),
+            "package x\n\nimport \"testing\"\n\nfunc TestAddNegative(t *testing.T) {\n\
+             \tif Add(-1, -1) != -2 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
+        )
+        .unwrap();
+        let absent = run_named_test(root, "TestAdd").await;
+        assert_ne!(absent, NamedTestOutcome::Passed, "nothing ran");
+        let present = run_named_test(root, "TestAddNegative").await;
+        assert_ne!(present, NamedTestOutcome::Failed, "the real test passes");
+    }
+
+    fn named_outcome(passed: bool, exit_code: i32, stdout: &str, stderr: &str) -> VerifyOutcome {
+        VerifyOutcome {
+            exit_code,
+            passed,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            ..outcome("named-test", passed, false)
+        }
+    }
+
+    #[test]
+    fn named_test_verdicts_read_which_tests_actually_ran() {
+        use NamedTestOutcome as T;
+        let verdict = |kind, test, out: &VerifyOutcome| named_test_verdict(kind, test, out, false);
+
+        // Go: `-run ^TestAdd$` with only `TestAddNegative` in the module.
+        let none = named_outcome(
+            true,
+            0,
+            "ok  \tex.com/x\t0.003s [no tests to run]\n?   \tex.com/x/e\t[no test files]\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Go, "TestAdd", &none), T::NotFound);
+        let ran = named_outcome(
+            true,
+            0,
+            "ok  \tex.com/x\t(cached)\nok  \tex.com/x/sub\t0.002s [no tests to run]\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Go, "TestAdd", &ran), T::Passed);
+        let failed = named_outcome(
+            false,
+            1,
+            "--- FAIL: TestAdd (0.00s)\nFAIL\tex.com/x\t0.008s\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Go, "TestAdd", &failed), T::Failed);
+
+        // cargo: the substring filter ran `add_negative`, not `add`.
+        let other = named_outcome(true, 0, "\nrunning 1 test\ntest tests::add_negative ... ok\n\ntest result: ok. 1 passed; 0 failed\n", "");
+        assert_eq!(verdict(ProjectKind::Rust, "add", &other), T::NotFound);
+        assert_eq!(
+            verdict(ProjectKind::Rust, "tests::add_negative", &other),
+            T::Passed
+        );
+        assert_eq!(
+            verdict(ProjectKind::Rust, "add_negative", &other),
+            T::Passed
+        );
+        // Our test passed while another matching one failed: our verdict is a pass.
+        let mixed = named_outcome(
+            false,
+            101,
+            "running 2 tests\ntest tests::add ... ok\ntest tests::add_more ... FAILED\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Rust, "add", &mixed), T::Passed);
+        // It does not compile: no test ran, and none can pass.
+        let broken = named_outcome(false, 101, "", "error[E0425]: cannot find value `x`");
+        assert_eq!(verdict(ProjectKind::Rust, "add", &broken), T::Failed);
+
+        // pytest `-k test_login -v` ran only `test_login_redirect`.
+        let longer = named_outcome(
+            true,
+            0,
+            "tests/test_a.py::test_login_redirect PASSED [100%]\n=== 1 passed in 0.01s ===\n",
+            "",
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login", &longer),
+            T::NotFound
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login_redirect", &longer),
+            T::Passed
+        );
+        let deselected = named_outcome(
+            false,
+            5,
+            "collected 2 items / 2 deselected / 0 selected\n",
+            "",
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login", &deselected),
+            T::NotFound
+        );
+        let class_param = named_outcome(
+            false,
+            1,
+            "tests/t.py::TestAuth::test_login[admin] FAILED [ 50%]\n",
+            "",
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login", &class_param),
+            T::Failed
+        );
+
+        // jest / vitest: `-t` skipped every test.
+        let skipped = named_outcome(true, 0, "", "Tests:       2 skipped, 2 total\n");
+        assert_eq!(verdict(ProjectKind::Node, "adds", &skipped), T::NotFound);
+        let vitest = named_outcome(true, 0, "      Tests  1 passed | 1 skipped (2)\n", "");
+        assert_eq!(verdict(ProjectKind::Node, "adds", &vitest), T::Passed);
+        let colored = named_outcome(
+            true,
+            0,
+            "\u{1b}[1mTests:\u{1b}[22m       \u{1b}[33m3 skipped\u{1b}[39m, 3 total",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Node, "adds", &colored), T::NotFound);
+
+        // deno: everything filtered out.
+        let filtered = named_outcome(
+            true,
+            0,
+            "ok | 0 passed | 0 failed | 4 filtered out (3ms)\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Deno, "adds", &filtered), T::NotFound);
+
+        // An unrecognised report keeps the exit code's answer.
+        let plain = named_outcome(true, 0, "all good\n", "");
+        assert_eq!(verdict(ProjectKind::Node, "adds", &plain), T::Passed);
+        // A verdict cut out of a truncated tail is unknown, not "absent".
+        assert_eq!(
+            named_test_verdict(ProjectKind::Go, "TestAdd", &none, true),
+            T::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_jest_name_filter_matches_the_whole_test_name_not_a_prefix() {
+        assert_eq!(jest_name_pattern("login"), "login$");
+        assert_eq!(
+            jest_name_pattern("adds 1 + 2 (fast)"),
+            "adds 1 \\+ 2 \\(fast\\)$"
+        );
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"test":"jest"}}"#,
+        )
+        .unwrap();
+        let s = named_test_step(ProjectKind::Node, tmp.path(), "login", 90).expect("jest");
+        assert_eq!(s.args.last().map(String::as_str), Some("login$"));
+    }
+
+    #[tokio::test]
+    async fn a_pytest_name_filter_does_not_pass_on_a_longer_test_name() {
+        // `pytest -k test_login` is a substring match: it runs `test_login_redirect`,
+        // which says nothing about a `test_login` that does not exist yet.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("pyproject.toml"), "[tool.pytest.ini_options]\n").unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("tests/test_auth.py"),
+            "def test_login_redirect():\n    assert 1 == 1\n",
+        )
+        .unwrap();
+        let outcome = run_named_test(root, "test_login").await;
+        assert_ne!(outcome, NamedTestOutcome::Passed, "test_login never ran");
+    }
+
     #[test]
     fn package_json_depends_on_detects_declared_deps() {
         // Regression: the typecheck picker used to check
@@ -1695,6 +2572,37 @@ mod tests {
         assert!(package_json_depends_on(tmp.path(), "vue-tsc"));
         assert!(package_json_depends_on(tmp.path(), "typescript"));
         assert!(!package_json_depends_on(tmp.path(), "eslint"));
+    }
+
+    #[test]
+    fn npm_init_placeholder_test_script_is_a_visible_skip_not_a_test_run() {
+        // The placeholder always exits 1: running it failed every build-clean check
+        // of a project that simply has no tests yet.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        assert!(steps.iter().all(|s| s.name != "test"), "{steps:?}");
+        let skipped = skipped_checks(ProjectKind::Node, tmp.path());
+        assert!(
+            skipped.iter().any(|o| o.step == "test"
+                && o.skipped
+                && o.passed
+                && o.stderr.contains("placeholder")),
+            "{skipped:?}"
+        );
+        // A real test script still runs.
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        assert!(steps.iter().any(|s| s.name == "test"));
+        assert!(skipped_checks(ProjectKind::Node, tmp.path()).is_empty());
     }
 
     #[test]

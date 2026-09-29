@@ -3063,24 +3063,28 @@ Answer with exactly one of: ADD, UPDATE, INVALIDATE, NOOP — nothing else."
     (system, user)
 }
 
-/// Parse a base reply into a [`ReconcileDecision`]. Tolerant: scans for the
-/// verdict word anywhere in the reply (bases sometimes add a sentence). Anything
-/// unrecognised → [`ReconcileDecision::Noop`] (fail-open: an unclear verdict
-/// never mutates the corpus).
+/// Parse a base reply into a [`ReconcileDecision`]. Tolerant: the verdict is
+/// the FIRST whole-word verdict token anywhere in the reply (bases sometimes
+/// lead with "verdict:" or add a sentence), so a trailing explanation such as
+/// "NOOP — nothing to INVALIDATE" cannot override the verdict, and words like
+/// "addresses" / "updated" are not verdicts. Anything unrecognised →
+/// [`ReconcileDecision::Noop`] (fail-open: an unclear verdict never mutates
+/// the corpus).
 #[must_use]
 pub fn parse_reconcile_decision(reply: &str) -> ReconcileDecision {
-    let up = reply.to_ascii_uppercase();
-    // Order matters: check the rarer, more-specific verbs before NOOP so a reply
-    // like "INVALIDATE — it's wrong" isn't shadowed.
-    if up.contains("INVALIDATE") {
-        ReconcileDecision::Invalidate
-    } else if up.contains("UPDATE") {
-        ReconcileDecision::Update
-    } else if up.contains("ADD") {
-        ReconcileDecision::Add
-    } else {
-        ReconcileDecision::Noop
-    }
+    let up = reply
+        .to_ascii_uppercase()
+        .replace("NO-OP", "NOOP")
+        .replace("NO_OP", "NOOP");
+    up.split(|c: char| !c.is_ascii_alphanumeric())
+        .find_map(|word| match word {
+            "INVALIDATE" => Some(ReconcileDecision::Invalidate),
+            "UPDATE" => Some(ReconcileDecision::Update),
+            "ADD" => Some(ReconcileDecision::Add),
+            "NOOP" => Some(ReconcileDecision::Noop),
+            _ => None,
+        })
+        .unwrap_or(ReconcileDecision::Noop)
 }
 
 /// A reconcile judge: given a fresh lesson and its similar priors, return the
@@ -8735,6 +8739,27 @@ mod tests {
             ReconcileDecision::Noop
         );
         assert_eq!(parse_reconcile_decision(""), ReconcileDecision::Noop);
+    }
+
+    #[test]
+    fn parse_reconcile_decision_takes_the_first_whole_word_verdict() {
+        assert_eq!(
+            parse_reconcile_decision("NOOP — nothing to INVALIDATE"),
+            ReconcileDecision::Noop
+        );
+        assert_eq!(
+            parse_reconcile_decision("No-op: no need to UPDATE the old lesson"),
+            ReconcileDecision::Noop
+        );
+        assert_eq!(
+            parse_reconcile_decision("UPDATE (do not ADD a duplicate)"),
+            ReconcileDecision::Update
+        );
+        // Substrings of other words are not verdicts.
+        assert_eq!(
+            parse_reconcile_decision("This addresses an UPDATED path"),
+            ReconcileDecision::Noop
+        );
     }
 
     #[test]

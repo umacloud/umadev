@@ -461,10 +461,9 @@ fn test_step_files(id: &str) -> crate::plan_state::StepFiles {
 /// Seed the three core-doc deliverables the doc-first skeleton requires, so a
 /// deliberate step-driven build's prepended PM/architect/UIUX doc steps pass their
 /// FileContains/FileExists acceptance and the plan proceeds to the code steps.
-/// Also seeds an execution plan citing the PRD's `FR-001` so the requirement-
-/// coverage floor is satisfied — otherwise the PRD's declared `FR-001` reads as an
-/// uncovered requirement, failing the contract floor a backend step verifies against
-/// (`ContractMatches`) and stalling the build at the frontend phase.
+/// Also seeds an execution plan citing the PRD's `FR-001`, so the requirement is
+/// traced and the final gate's coverage check stays clean even under strict
+/// coverage.
 ///
 /// Also seeds the TWO code-phase-prep deliverables the skeleton now guarantees
 /// structurally: an authored test file under `tests/` (the QA test-authoring
@@ -2335,6 +2334,189 @@ async fn non_tool_silent_hang_on_a_live_base_redrives_once_then_fails() {
     );
 }
 
+/// A hung base whose interrupt never settles (`InterruptPending`), like a real
+/// driver: once closed it refuses sends and reports its process exit. Counts the
+/// turns it actually accepted and how often it was closed.
+struct UnsettledHangSession {
+    sends: Arc<std::sync::Mutex<u32>>,
+    ends: Arc<std::sync::Mutex<u32>>,
+    exited: Option<std::process::ExitStatus>,
+    /// Start a tool before hanging, so the hang is mid-tool.
+    tool_first: bool,
+}
+
+impl UnsettledHangSession {
+    fn new() -> Self {
+        Self {
+            sends: Arc::new(std::sync::Mutex::new(0)),
+            ends: Arc::new(std::sync::Mutex::new(0)),
+            exited: None,
+            tool_first: false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BaseSession for UnsettledHangSession {
+    async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+        if self.exited.is_some() {
+            return Err(SessionError::Closed);
+        }
+        *self.sends.lock().unwrap() += 1;
+        Ok(())
+    }
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        if std::mem::take(&mut self.tool_first) {
+            return Some(SessionEvent::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "docker build ."}),
+            });
+        }
+        std::future::pending::<()>().await;
+        None
+    }
+    async fn respond(
+        &mut self,
+        _req_id: &str,
+        _decision: ApprovalDecision,
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        Err(SessionError::InterruptPending(
+            "the hung turn has not ended".into(),
+        ))
+    }
+    async fn end(&mut self) -> Result<(), SessionError> {
+        *self.ends.lock().unwrap() += 1;
+        self.exited = Some(a_real_exit_status());
+        Ok(())
+    }
+    fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.exited
+    }
+}
+
+#[tokio::test]
+async fn next_event_idle_closes_a_session_whose_interrupt_does_not_settle() {
+    // The hung turn may still end later; left open, its result would end the next
+    // turn sent on this session.
+    let mut sess = UnsettledHangSession::new();
+    let ends = Arc::clone(&sess.ends);
+    let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+    let ev = tokio::time::timeout(
+        Duration::from_secs(10),
+        next_event_idle(&mut sess, budget, false, None),
+    )
+    .await
+    .expect("the watchdog settles");
+    assert!(
+        matches!(ev, IdleEvent::IdleTimedOut { exit: Some(_), .. }),
+        "the closed base's exit is surfaced: {ev:?}"
+    );
+    assert_eq!(*ends.lock().unwrap(), 1, "the unsettled session is closed");
+}
+
+#[tokio::test]
+async fn non_tool_hang_whose_interrupt_does_not_settle_is_not_redriven() {
+    // A re-drive would send the same directive onto a session whose hung turn can
+    // still deliver its result, ending the re-driven turn with it and leaving the
+    // conversation one turn out of step. The turn fails honestly instead.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, rec) = sink();
+    let mut sess = UnsettledHangSession::new();
+    let sends = Arc::clone(&sess.sends);
+    let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        drive_one_turn(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            budget,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        ),
+    )
+    .await
+    .expect("the watchdog settles");
+    match out {
+        Err(reason) => assert!(
+            reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
+            "the hang fails honestly as an idle settle: {reason}"
+        ),
+        Ok(_) => panic!("a hung base must fail its turn"),
+    }
+    assert_eq!(
+        *sends.lock().unwrap(),
+        1,
+        "no turn is re-driven onto a session whose interrupt did not settle"
+    );
+    // In any language: the UI language is process-wide state.
+    let is_redrive = |note: &str| {
+        umadev_i18n::Lang::ALL
+            .iter()
+            .any(|&lang| note == umadev_i18n::t(lang, "tui.retry.silent_redrive"))
+    };
+    assert!(
+        !rec.events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if is_redrive(n))),
+        "no re-drive is announced"
+    );
+}
+
+#[tokio::test]
+async fn a_run_budget_settle_closes_a_session_whose_interrupt_does_not_settle() {
+    // The budget settle hands the step on gracefully, and a later step can run on
+    // the same session, so a turn the interrupt did not settle must not stay open to
+    // end that step's turn. Covers the deadline passing mid-turn and mid-tool.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, rec) = sink();
+    let budget = IdleBudget::new(Duration::from_millis(40), Duration::from_millis(20));
+    for tool_first in [false, true] {
+        let mut sess = UnsettledHangSession::new();
+        sess.tool_first = tool_first;
+        let ends = Arc::clone(&sess.ends);
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let deadline = if tool_first {
+            deadline
+        } else {
+            std::time::Instant::now()
+        };
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            drive_one_turn(
+                &mut sess,
+                &opts(tmp.path()),
+                &events,
+                "build it".to_string(),
+                budget,
+                deadline,
+            ),
+        )
+        .await
+        .expect("the budget settles");
+        assert!(
+            out.is_ok(),
+            "the settle stays graceful (mid-tool: {tool_first})"
+        );
+        assert_eq!(
+            *ends.lock().unwrap(),
+            1,
+            "the unsettled session is closed (mid-tool: {tool_first})"
+        );
+    }
+    for path in ["run budget reached mid-turn", "run budget reached mid-tool"] {
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains(path))),
+            "the {path} settle ran"
+        );
+    }
+}
+
 #[tokio::test]
 async fn in_tool_silent_hang_on_a_live_base_never_redrives() {
     // Part 2 guard: an IN-TOOL live base (a long `docker build`) goes silent but must
@@ -2905,7 +3087,7 @@ fn fix_directive_carries_the_bounded_raw_failure_log_when_captured() {
 // ── Wave 4: required acceptance floor (deliberate only; bugfix repro test) ──
 
 /// Write a PRD declaring FR-001 + FR-002 and a tasks list covering only FR-001,
-/// so `uncovered_requirements` reports FR-002 as a coverage gap.
+/// so requirement coverage reports FR-002 as untraced.
 fn seed_coverage_gap(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("output")).unwrap();
     std::fs::write(
@@ -2963,18 +3145,115 @@ fn a_backend_only_run_is_not_blocked_by_a_leftover_uiux_doc() {
 
 #[test]
 fn acceptance_floor_blocks_a_deliberate_build_with_a_coverage_gap() {
-    // A deliberate build with a declared-but-unimplemented requirement must
-    // surface a coverage gap as a blocking finding (the required floor).
+    // Under strict coverage, a deliberate build with a declared-but-untraced
+    // requirement surfaces it as a blocking finding. By default it is advisory,
+    // like the legacy spec gate: a note, never a finding the base is asked to fix.
     let tmp = tempfile::TempDir::new().unwrap();
     seed_coverage_gap(tmp.path());
-    let o = opts(tmp.path());
+    let mut o = opts(tmp.path());
     let route = build_route();
+    let floor = acceptance_floor(&o, Some(&route), None);
+    assert!(
+        !floor.blocking.iter().any(|b| b.contains("coverage gap")),
+        "{:?}",
+        floor.blocking
+    );
+    assert!(
+        floor.notes.iter().any(|n| n.contains("FR-002")),
+        "{:?}",
+        floor.notes
+    );
+    o.strict_coverage = true;
     let blocking = acceptance_floor_blocking(&o, Some(&route));
     assert!(
         blocking
             .iter()
             .any(|b| b.contains("coverage gap") && b.contains("FR-002")),
         "the uncovered requirement is a blocking finding: {blocking:?}"
+    );
+}
+
+#[tokio::test]
+async fn deliberate_final_gate_is_not_blocked_by_coverage_without_a_task_list() {
+    // Every fresh deliberate build: the PM step writes a PRD numbering FR-001, and
+    // nothing the director writes is a legacy task list. Coverage is advisory unless
+    // strict coverage is on, so the final gate must not tell the base to "build"
+    // FR-001 (a finding no edit could clear); the user sees an advisory note.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_core_docs(tmp.path());
+    std::fs::remove_file(tmp.path().join("output/demo-execution-plan.md")).unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(vec![], true, r#"{"accepts": true, "blocking": []}"#);
+    let o = opts(tmp.path());
+    assert!(!o.strict_coverage);
+    let qc = run_auto_qc(
+        &mut sess,
+        &o,
+        &events,
+        Some(&build_route()),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert!(
+        !qc.blocking.iter().any(|b| b.contains("coverage gap")),
+        "{:?}",
+        qc.blocking
+    );
+    assert!(
+        rec.events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("FR-001"))),
+        "the untraced requirement is still reported: {:?}",
+        rec.events()
+    );
+}
+
+#[test]
+fn strict_coverage_blocks_an_untraced_requirement_until_it_is_traced() {
+    // The genuine case: with strict coverage on (per run, or `[pipeline]
+    // strict_coverage = true` in `.umadevrc`), an FR-id nothing traces blocks, and
+    // the base can clear it by tracing the id where it is built.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_core_docs(tmp.path());
+    std::fs::remove_file(tmp.path().join("output/demo-execution-plan.md")).unwrap();
+    let mut o = opts(tmp.path());
+    o.strict_coverage = true;
+    let route = build_route();
+    let blocking = acceptance_floor_blocking(&o, Some(&route));
+    assert!(
+        blocking
+            .iter()
+            .any(|b| b.contains("coverage gap") && b.contains("FR-001")),
+        "{blocking:?}"
+    );
+
+    o.strict_coverage = false;
+    std::fs::write(
+        tmp.path().join(".umadevrc"),
+        "[pipeline]\nstrict_coverage = true\n",
+    )
+    .unwrap();
+    assert!(
+        acceptance_floor_blocking(&o, Some(&route))
+            .iter()
+            .any(|b| b.contains("coverage gap") && b.contains("FR-001")),
+        "the project's strict_coverage setting blocks too"
+    );
+
+    // The architecture doc now traces FR-001 → the gap clears.
+    std::fs::write(
+        tmp.path().join("output/demo-architecture.md"),
+        "# Architecture\n\n## API\nGET /api/x — login (FR-001)\n",
+    )
+    .unwrap();
+    assert!(
+        !acceptance_floor_blocking(&o, Some(&route))
+            .iter()
+            .any(|b| b.contains("coverage gap")),
+        "a traced requirement is covered"
     );
 }
 
@@ -2989,9 +3268,11 @@ async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
 
-    // Deliberate route → the floor runs → the coverage gap blocks.
+    // Deliberate route → the floor runs → the coverage gap blocks (strict coverage,
+    // so the gap is a blocking finding rather than an advisory note).
     let mut deliberate = opts(tmp.path());
     deliberate.requirement = "做一个完整的任务管理产品".to_string();
+    deliberate.strict_coverage = true;
     let route = build_route();
     let qc = run_auto_qc(
         &mut sess,
@@ -3012,6 +3293,7 @@ async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
     // Lean requirement → QC returns at the lean short-circuit, BEFORE the floor.
     let mut lean = opts(tmp.path());
     lean.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+    lean.strict_coverage = true;
     let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None, false, false).await;
     assert!(
         !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
@@ -3032,6 +3314,7 @@ async fn deliberate_route_with_lean_reading_requirement_still_runs_full_gate() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
     let mut o = opts(tmp.path());
+    o.strict_coverage = true;
     // A requirement the keyword classifier would call LEAN…
     o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
     assert!(
@@ -3084,6 +3367,73 @@ fn acceptance_floor_is_fail_open_when_artifacts_are_missing() {
     assert!(
         acceptance_floor_blocking(&o, Some(&route)).is_empty(),
         "an empty project yields no fabricated acceptance failures"
+    );
+}
+
+/// An architecture doc planning `GET /api/items` (implemented by a real backend
+/// registration) and `GET /api/orders` (implemented nowhere).
+fn seed_items_backend(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("output")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("output/demo-architecture.md"),
+        "# API\n\n\
+         | Method | Path | Description | Auth |\n\
+         |---|---|---|---|\n\
+         | GET | /api/items | list items | none |\n\
+         | GET | /api/orders | list orders | none |\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/server.js"),
+        "app.get('/api/items', listItems);\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_genuinely_missing_endpoint_still_blocks_the_deliberate_floor() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_items_backend(tmp.path());
+    let o = opts(tmp.path());
+    let blocking = acceptance_floor_blocking(&o, Some(&build_route()));
+    assert!(
+        blocking
+            .iter()
+            .any(|b| b.contains("planned endpoint not implemented") && b.contains("/api/orders")),
+        "{blocking:?}"
+    );
+    assert!(
+        !blocking.iter().any(|b| b.contains("/api/items")),
+        "{blocking:?}"
+    );
+}
+
+#[test]
+fn an_endpoint_check_that_cannot_run_is_a_note_not_a_blocking_gap() {
+    // More source than the scan can read: whether `/api/orders` exists is unknown,
+    // and no edit can make the check run. The final gate must not tell the base to
+    // implement it (a finding it can never clear); the user sees a note instead.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_items_backend(tmp.path());
+    for i in 0..crate::acceptance::MAX_SOURCE_FILES {
+        std::fs::write(
+            tmp.path().join(format!("src/m{i}.js")),
+            format!("export const v{i} = {i};\n"),
+        )
+        .unwrap();
+    }
+    let o = opts(tmp.path());
+    let floor = acceptance_floor(&o, Some(&build_route()), None);
+    assert!(
+        !floor.blocking.iter().any(|b| b.contains("acceptance")),
+        "{:?}",
+        floor.blocking
+    );
+    assert!(
+        floor.notes.iter().any(|n| n.contains("600")),
+        "{:?}",
+        floor.notes
     );
 }
 
@@ -3246,6 +3596,35 @@ fn budget_exhausted_slides_on_productivity_but_keeps_an_absolute_cap() {
         budget_exhausted(past_cap, tight_cap, past_cap, idle),
         "the absolute cap stops even a continuously-productive build"
     );
+}
+
+#[test]
+fn a_driven_step_that_fails_acceptance_still_slides_the_between_steps_window() {
+    // CONFIG.md: the director budget is an idle window of NO base activity. Two
+    // steps whose turns the base worked through for 20 minutes each, both Blocked by
+    // their acceptance, are 40 minutes of activity: the run must not pause at the
+    // 30-minute window between them, only at the absolute cap.
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let idle = Duration::from_secs(30 * 60);
+    let hard_cap = start + idle * RUN_BUDGET_ABSOLUTE_MULT;
+    let first = start + Duration::from_secs(20 * 60);
+    let clock = slide_step_budget_clock(start, true, false, first);
+    let second = first + Duration::from_secs(20 * 60);
+    let clock = slide_step_budget_clock(clock, true, false, second);
+    assert!(
+        !budget_exhausted(second, hard_cap, clock, idle),
+        "an active build is not paused between steps"
+    );
+    assert!(budget_exhausted(hard_cap, hard_cap, hard_cap, idle));
+
+    // A step whose base completed no turn is no activity: a stalled run still winds
+    // down one window after the last activity.
+    let stalled = slide_step_budget_clock(start, false, false, first);
+    assert_eq!(stalled, start);
+    assert!(budget_exhausted(start + idle, hard_cap, stalled, idle));
+    // Accepted progress (e.g. a step verified on evidence alone) still counts.
+    assert_eq!(slide_step_budget_clock(start, false, true, first), first);
 }
 
 #[test]
@@ -3692,6 +4071,87 @@ async fn routed_loop_emits_intent_decided() {
             == 1,
         "exactly one IntentDecided(build) is emitted"
     );
+}
+
+#[tokio::test]
+async fn failed_synthesis_does_not_reuse_the_previous_plan() {
+    // A second deliberate run whose planning turn fails open (the base replied with
+    // no JSON) builds in one end-to-end turn. It must not be judged against the
+    // PREVIOUS run's plan (its new file would read as unplanned work to delete), and
+    // `/continue` must not later resume the old plan under the new requirement.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let old = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles {
+                create: vec!["old/".into()],
+                modify: Vec::new(),
+            },
+            id: "old-api".into(),
+            title: "Build the old API".into(),
+            seat: crate::critics::Seat::BackendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    plan_state::save(&old, tmp.path()).unwrap();
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![
+            text_turn("not json at all"),
+            text_turn("Built the new feature. Done."),
+        ],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    )
+    .with_main_send_write(tmp.path().join("src/new.ts"), "export const fresh = 1;\n");
+    let o = opts(tmp.path());
+    let route = build_route();
+
+    let outcome =
+        drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+    assert!(
+        !matches!(&outcome, DirectorLoopOutcome::Failed(reason) if reason.contains("src/new.ts")),
+        "{outcome:?}"
+    );
+    assert!(
+        plan_state::load(tmp.path()).is_none_or(|p| !p.steps.iter().any(|s| s.id == "old-api")),
+        "the previous run's plan must not stand in for this run's"
+    );
+    assert!(!has_resumable_director_plan(tmp.path()));
+}
+
+#[tokio::test]
+async fn a_routed_run_saves_the_route_its_resume_keeps() {
+    // A natural-language build runs under the model-decided route (here Fast,
+    // frontend-only). That route is saved beside the plan, so a later `/continue`
+    // resumes under it rather than under the route the keyword router derives from
+    // the requirement text.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![text_turn("not json"), text_turn("Built it. Done.")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let mut o = opts(tmp.path());
+    o.requirement = "做一个完整的电商平台，包含用户、商品、订单、支付和后台管理".to_string();
+    let mut route = build_route();
+    route.kind = crate::planner::TaskKind::FrontendOnly;
+    route.depth = crate::router::Depth::Fast;
+    route.est_budget = crate::router::Budget::for_route(route.class, route.depth);
+    assert_ne!(crate::router::for_run(&o.requirement).depth, route.depth);
+
+    let _ = drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+    assert_eq!(resume_route(tmp.path(), &o.requirement), route);
 }
 
 #[tokio::test]
@@ -5681,6 +6141,36 @@ async fn blocked_step_strands_its_dependent_which_is_honestly_marked_and_noted()
         note_seen(&rec, "因前置被阻塞而跳过"),
         "the stranded-scope Note is surfaced"
     );
+}
+
+#[test]
+fn director_transcript_notes_come_from_the_catalog_in_every_language() {
+    // These notes were hard-coded Simplified Chinese, so English and Traditional
+    // Chinese users read untranslated zh-CN in an otherwise localized transcript.
+    use umadev_i18n::{t, tf, Lang};
+    let has_cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let stranded = tf(Lang::En, "plan.stranded_skipped", &["2"]);
+    assert!(
+        stranded.contains('2') && !has_cjk(&stranded),
+        "English stranded-steps note: {stranded}"
+    );
+    for key in [
+        "plan.stranded_skipped",
+        "team.post_build_qc_started",
+        "signal.first_pass_low",
+        "signal.sizing_heavier",
+        "signal.sizing_lighter",
+    ] {
+        for lang in Lang::ALL {
+            assert_ne!(t(lang, key), key, "{key} is missing in {}", lang.code());
+        }
+        assert!(
+            !has_cjk(t(Lang::En, key)),
+            "{key} in en: {}",
+            t(Lang::En, key)
+        );
+        assert!(has_cjk(t(Lang::ZhTw, key)), "{key} in zh-TW");
+    }
 }
 
 #[tokio::test]
@@ -8682,6 +9172,190 @@ async fn a_budget_paused_plan_resumes_only_the_remaining_steps() {
     );
 }
 
+#[tokio::test]
+async fn a_budget_pause_after_a_blocked_step_resumes_to_a_clean_delivery() {
+    // A step settles Blocked (its ledger attempt goes Failed) and the run then parks at
+    // the budget. `/continue` reopens the SAME ledger, repairs the step as attempt 2 and
+    // every step passes — including a dependent queued against the failed attempt. The
+    // failed first attempt is history: the resumed run must deliver, not fail its
+    // clean-delivery invariant on an "incomplete" ledger.
+    use crate::plan_state::{AcceptanceSpec, EvidenceContract, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let (events, _rec) = sink();
+    let mk = |id: &str, deps: &[&str], evidence: Vec<EvidenceContract>| PlanStep {
+        files: test_step_files(id),
+        id: id.to_string(),
+        title: format!("STEP_{id} the work"),
+        seat: crate::critics::Seat::FrontendEngineer,
+        kind: StepKind::Build,
+        depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence,
+        status: StepStatus::Pending,
+    };
+    let alpha_file = EvidenceContract::FileExists {
+        path: "src/alpha.rs".to_string(),
+    };
+    let plan = Plan {
+        steps: vec![
+            mk("alpha", &[], vec![alpha_file]),
+            mk("beta", &["alpha"], Vec::new()),
+        ],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    let o = opts(tmp.path());
+    let route = build_route();
+
+    // FIRST run: alpha's declared file never appears, so it settles Blocked; the spent
+    // budget then parks the run before beta.
+    let mut sess = FakeSession::new(
+        vec![text_turn("STEP_alpha attempted")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let already_past = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    let paused = drive_director_loop_with_idle(
+        &mut sess,
+        &o,
+        &events,
+        "GO".into(),
+        Some(plan),
+        Some(&route),
+        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        already_past,
+    )
+    .await;
+    assert!(
+        matches!(
+            paused,
+            DirectorLoopOutcome::PausedAtBudget { done: 0, total: 2 }
+        ),
+        "alpha blocked, then the budget parked the run: {paused:?}"
+    );
+
+    // `/continue`: this session's turns write alpha's file, so attempt 2 passes.
+    let mut resume_sess = FakeSession::new(
+        vec![text_turn("STEP_alpha fixed"), text_turn("STEP_beta done")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    )
+    .with_main_send_write(tmp.path().join("src/alpha.rs"), "pub fn alpha() {}\n");
+    let outcome = drive_director_loop_resume(&mut resume_sess, &o, &events, &route).await;
+    assert!(
+        matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+        "a repaired step's failed first attempt must not fail a clean delivery: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_preflight_never_flips_done_steps_to_blocked() {
+    // A Fast single-turn plan (which runs no surface preflight) parked at a final
+    // review outage, or a plan saved before file surfaces existed, reaches `/continue`
+    // with a Done, file-less Build step. The preflight gates only work that will still
+    // run: the Done step stays Done and the parked review is retried, instead of every
+    // `/continue` failing "execution contract is incomplete".
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let route = build_route();
+    let o = opts(tmp.path());
+    let plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "build".into(),
+            title: "Build it in one turn".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Done,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    plan_state::save(&plan, tmp.path()).unwrap();
+    save_operational_review_checkpoint(
+        tmp.path(),
+        &OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(tmp.path()),
+            required_seats: Some(route.team.clone()),
+            entry_task_run_id: None,
+            consecutive_outages: 1,
+            evidence: OperationalReviewEvidence::default(),
+            terminally_settled: false,
+        },
+    )
+    .unwrap();
+
+    let mut sess = FakeSession::new(
+        vec![text_turn("final report")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+    assert!(
+        matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+        "the parked final review resumes over the Done step: {outcome:?}"
+    );
+    let saved = plan_state::load(tmp.path()).expect("the plan stays on disk");
+    assert_eq!(
+        saved.steps.iter().find(|s| s.id == "build").unwrap().status,
+        StepStatus::Done,
+        "a Done step is never flipped to Blocked by the resume preflight"
+    );
+}
+
+#[test]
+fn the_final_gate_notes_a_completed_step_without_a_surface_instead_of_blocking() {
+    // The same kind of plan when source changed after the pause: the full final
+    // gate runs its scope check. A Done step never runs a writer again, so the base
+    // is not told to "re-plan" it (it cannot); its changes cannot be attributed, so
+    // the user sees that the scope was not checked.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let o = opts(tmp.path());
+    let plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "single-turn-build".into(),
+            title: "Build it in one turn".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Done,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    plan_state::save(&plan, tmp.path()).unwrap();
+    std::fs::write(tmp.path().join("later.ts"), "export const later = 2;\n").unwrap();
+
+    let floor = acceptance_floor(&o, Some(&build_route()), None);
+    assert!(
+        !floor
+            .blocking
+            .iter()
+            .any(|b| b.contains("execution contract incomplete") || b.contains("later.ts")),
+        "{:?}",
+        floor.blocking
+    );
+    assert!(
+        floor.notes.iter().any(|n| n.contains("single-turn-build")),
+        "{:?}",
+        floor.notes
+    );
+}
+
 #[test]
 fn plan_progress_recitation_is_bounded_and_honest() {
     // PLAN RECITATION lock test: the compact per-step "where we are in the plan"
@@ -9382,4 +10056,108 @@ async fn run_lane_host_requests_fall_back_to_protocol_shaped_rejection_with_no_s
         ),
         "folder trust with no surface stays KeepGated: {resolved:?}"
     );
+}
+
+#[tokio::test]
+async fn resolve_host_request_does_not_auto_allow_an_upstream_boundary() {
+    use umadev_runtime::{HostApprovalOption, HostApprovalOptionKind, HostRequest, HostResponse};
+    // Grok sends `session/request_permission` under Auto only when its own
+    // policy still demands a confirmation, and the host flags that request.
+    // The contract (GROK_BUILD_SOURCE_CONTRACT §6): show it to a live user, or
+    // return a safe non-approval when there is none — never auto-select
+    // allow_once. The chat lane already does; the /run and continuous lanes
+    // resolve through here.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let options = opts(tmp.path());
+    assert_eq!(options.mode, TrustMode::Auto);
+    let (events, rec) = sink();
+    let approval = |metadata: serde_json::Value| HostRequest::Approval {
+        action: "Bash".to_string(),
+        target: "npm test".to_string(),
+        message: None,
+        options: vec![
+            HostApprovalOption {
+                id: "allow-once".to_string(),
+                label: "Allow once".to_string(),
+                kind: HostApprovalOptionKind::AllowOnce,
+            },
+            HostApprovalOption {
+                id: "reject-once".to_string(),
+                label: "Reject".to_string(),
+                kind: HostApprovalOptionKind::RejectOnce,
+            },
+        ],
+        metadata,
+    };
+    let boundary = approval(serde_json::json!({
+        "requestedProfile": "auto",
+        "upstreamPermissionBoundary": true
+    }));
+    let decided = |response: HostResponse| match response {
+        HostResponse::Approval {
+            decision,
+            selected_option_id,
+            ..
+        } => (decision, selected_option_id),
+        other => panic!("an approval must be answered as one: {other:?}"),
+    };
+
+    // No live user: the only safe answer is a denial, and the user is told.
+    assert_eq!(
+        decided(resolve_host_request(&options, &events, "b1", &boundary).await),
+        (ApprovalDecision::Deny, Some("reject-once".to_string()))
+    );
+    assert!(rec
+        .events()
+        .iter()
+        .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("npm test"))));
+
+    // The same ordinary request without the flag stays Auto's to allow.
+    let ordinary = approval(serde_json::json!({"requestedProfile": "auto"}));
+    assert_eq!(
+        decided(resolve_host_request(&options, &events, "o1", &ordinary).await),
+        (ApprovalDecision::Allow, Some("allow-once".to_string()))
+    );
+
+    // A live user decides the boundary even though Auto would allow the action,
+    // and the host learns that only the user's answer may settle it: the TUI
+    // must not release it when the user switches the tier to Auto.
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let probe = Arc::clone(&asked);
+    let approve: crate::interaction::ApprovalFn = Arc::new(move |request| {
+        probe.lock().unwrap().push(request);
+        Box::pin(async { true }) as crate::interaction::ApprovalFuture
+    });
+    let interaction = || RunInteraction {
+        steer: None,
+        approval: Some(Arc::clone(&approve)),
+        host_request: None,
+        confirm_gates: false,
+    };
+    let hosted = crate::interaction::hosted(
+        interaction(),
+        resolve_host_request(&options, &events, "b2", &boundary),
+    )
+    .await;
+    assert_eq!(
+        decided(hosted),
+        (ApprovalDecision::Allow, Some("allow-once".to_string()))
+    );
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [crate::interaction::ApprovalRequest {
+            action: "Bash".to_string(),
+            target: "npm test".to_string(),
+            requires_user_answer: true,
+        }]
+    );
+
+    // That approval is not remembered: the next boundary request asks again.
+    let again = crate::interaction::hosted(
+        interaction(),
+        resolve_host_request(&options, &events, "b3", &boundary),
+    )
+    .await;
+    assert_eq!(decided(again).0, ApprovalDecision::Allow);
+    assert_eq!(asked.lock().unwrap().len(), 2);
 }

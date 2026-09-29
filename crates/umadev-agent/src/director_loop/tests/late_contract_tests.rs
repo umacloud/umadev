@@ -3,11 +3,16 @@ use super::*;
 // ── BOUNDED RE-PLAN of a blocked subtree (attempt_replan_blocked_subtree) ──
 
 /// scaffold(Done) → api(Blocked) → ui(Pending): a blocked step that STRANDS a
-/// dependent (`ui`). `mk` mirrors the inline PlanStep builder the other tests use.
+/// dependent (`ui`). Each step claims `src/<id>/`, as a plan that passed the
+/// execution-contract preflight does. `mk` mirrors the inline PlanStep builder the
+/// other tests use.
 fn blocked_subtree_plan() -> Plan {
     use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
     let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
-        files: plan_state::StepFiles::default(),
+        files: plan_state::StepFiles {
+            create: vec![format!("src/{id}/")],
+            modify: Vec::new(),
+        },
         id: id.into(),
         title: format!("Build the {id}"),
         seat: crate::critics::Seat::BackendEngineer,
@@ -100,6 +105,108 @@ async fn replan_triggers_once_merges_a_validated_subdag_and_is_bounded() {
     .await;
     assert!(!again, "at most ONE re-plan per run");
     assert_eq!(plan, before, "a second attempt leaves the plan unchanged");
+}
+
+#[tokio::test]
+async fn a_replan_gives_every_new_build_step_a_file_surface() {
+    // The replacement is driven like any other step, so a Build step without a file
+    // surface would get a zero change budget and fail the final gate's execution
+    // contract. The retired steps' surface is carried into the replacement, so what
+    // the blocked step already wrote stays claimed instead of reading as unplanned.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, _rec) = sink();
+    // The reply declares no `files`: the replacement inherits the retired surface.
+    let mut sess = FakeSession::new(vec![], true, REPLAN_SUBDAG);
+    let o = opts(tmp.path());
+    let mut plan = blocked_subtree_plan();
+    let mut replanned = false;
+    assert!(
+        attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "api",
+            "Build the api",
+            &[],
+            &mut replanned,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await
+    );
+    for id in ["api2", "ui2"] {
+        let step = plan.steps.iter().find(|s| s.id == id).unwrap();
+        let claims: Vec<&str> = step.files.all().collect();
+        assert!(
+            claims.contains(&"src/api/") && claims.contains(&"src/ui/"),
+            "{id} inherits the retired surface: {claims:?}"
+        );
+    }
+    let contract =
+        crate::execution_contract::ExecutionContract::from_plan(&build_route(), "x", &plan);
+    assert!(contract.preflight_violations().is_empty(), "{plan:?}");
+
+    // A reply that declares its own files keeps them, on top of the inherited ones.
+    let mut sess = FakeSession::new(
+        vec![],
+        true,
+        r#"{"steps":[{"id":"api3","title":"alt api","seat":"backend-engineer","kind":"build",
+            "depends_on":["scaffold"],"acceptance":"source-present",
+            "files":{"create":["src/orders/api.ts"],"modify":[]}}]}"#,
+    );
+    let mut plan = blocked_subtree_plan();
+    let mut replanned = false;
+    assert!(
+        attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "api",
+            "Build the api",
+            &[],
+            &mut replanned,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await
+    );
+    let step = plan.steps.iter().find(|s| s.id == "api3").unwrap();
+    let claims: Vec<&str> = step.files.all().collect();
+    assert!(
+        claims.contains(&"src/orders/api.ts") && claims.contains(&"src/api/"),
+        "{claims:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_replan_with_no_surface_to_run_under_is_not_merged() {
+    // Retired steps from a plan saved before surfaces were required leave nothing
+    // to inherit; a replacement Build step that declares none could never pass the
+    // execution-contract preflight, so the honest strand stands.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(vec![], true, REPLAN_SUBDAG);
+    let o = opts(tmp.path());
+    let mut plan = blocked_subtree_plan();
+    for step in &mut plan.steps {
+        step.files = plan_state::StepFiles::default();
+    }
+    let before = plan.clone();
+    let mut replanned = false;
+    let merged = attempt_replan_blocked_subtree(
+        &mut sess,
+        &o,
+        &events,
+        &mut plan,
+        "api",
+        "Build the api",
+        &[],
+        &mut replanned,
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(!merged);
+    assert_eq!(plan, before);
 }
 
 #[tokio::test]
@@ -919,7 +1026,7 @@ async fn resolve_approval_headless_keeps_the_floor_and_hosted_asks_the_user() {
 
     // Hosted + user APPROVES → Allow, interactive.
     let approve: crate::interaction::ApprovalFn =
-        Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
+        Arc::new(|_request| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
     let hosted_allow = crate::interaction::hosted(
         crate::interaction::RunInteraction {
             steer: None,
@@ -942,7 +1049,7 @@ async fn resolve_approval_headless_keeps_the_floor_and_hosted_asks_the_user() {
 
     // Hosted + user DENIES an (unremembered) escalation → Deny, interactive.
     let deny: crate::interaction::ApprovalFn =
-        Arc::new(|_a, _t| Box::pin(async { false }) as crate::interaction::ApprovalFuture);
+        Arc::new(|_request| Box::pin(async { false }) as crate::interaction::ApprovalFuture);
     let hosted_deny = crate::interaction::hosted(
         crate::interaction::RunInteraction {
             steer: None,
@@ -970,7 +1077,7 @@ async fn resolve_approval_auto_frees_installs_but_still_asks_on_disasters() {
 
     let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let consulted_probe = Arc::clone(&consulted);
-    let never: crate::interaction::ApprovalFn = Arc::new(move |_a, _t| {
+    let never: crate::interaction::ApprovalFn = Arc::new(move |_request| {
         consulted_probe.store(true, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async { false }) as crate::interaction::ApprovalFuture
     });
@@ -996,7 +1103,7 @@ async fn resolve_approval_auto_frees_installs_but_still_asks_on_disasters() {
     // A destructive disaster still surfaces the interactive prompt in Auto,
     // and the user's verdict decides.
     let approve: crate::interaction::ApprovalFn =
-        Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
+        Arc::new(|_request| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
     let asked = crate::interaction::hosted(
         crate::interaction::RunInteraction {
             steer: None,

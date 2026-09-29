@@ -6,7 +6,7 @@ use umadev_agent::{
 use umadev_runtime::Message;
 
 use crate::interaction_bridge::{
-    await_host_input, await_user_approval, ApprovalHolder, ApprovalReply, HostInputHolder,
+    await_host_input, await_run_approval, ApprovalHolder, ApprovalReply, HostInputHolder,
 };
 use crate::session_slot::{PermissionedSession, SessionHolder, SessionIdentity};
 use crate::{
@@ -14,6 +14,24 @@ use crate::{
     director_source_hardgate, open_director_session, resolve_goal_mode, start_failed_note,
     RouteDecision, ABORT_SENTINEL,
 };
+
+/// The `/run` approval callback: the same y/n pause the chat drain uses, and
+/// the request tells the pause whether a switch to Auto may release it.
+fn run_approval_callback(
+    holder: ApprovalHolder,
+    sink: Arc<ChannelSink>,
+) -> umadev_agent::ApprovalFn {
+    Arc::new(move |request: umadev_agent::ApprovalRequest| {
+        let holder = holder.clone();
+        let sink = sink.clone();
+        Box::pin(async move {
+            matches!(
+                await_run_approval(&holder, &sink, &request).await,
+                ApprovalReply::Allow
+            )
+        }) as umadev_agent::ApprovalFuture
+    })
+}
 
 /// Select the Director only for fresh runs or a resume with a real Director
 /// cursor. Workflow-only legacy resumes must stay on their persisted phase path.
@@ -257,6 +275,12 @@ pub(super) async fn run_director_loop(
             s.base_session_id = prior_base_session_id.clone();
             s.base_resume_identity = resume_identity.base_resume_identity.clone();
             s.permission_profile = Some(options.mode.base_permissions());
+            // A resume keeps the confirmation gate it is parked at: a gate opened by
+            // the plan's LAST step (a docs-only run's docs_confirm) is that plan's
+            // only resume cursor, and the resume clears it once it has re-attached.
+            if let Some(state) = persisted_state.as_ref() {
+                s.active_gate.clone_from(&state.active_gate);
+            }
             s
         };
         let _ = umadev_agent::write_workflow_state(&root, &baseline);
@@ -271,9 +295,16 @@ pub(super) async fn run_director_loop(
         // (a bare goal still builds). A natural-language build passes the healthy
         // model verdict already produced on the read-only intent child, so Director
         // drives the exact class/kind/depth/team the selected brain chose. The
-        // deterministic availability fallback never reaches this entry.
-        let route =
-            route_override.unwrap_or_else(|| umadev_agent::router::for_run(&options.requirement));
+        // deterministic availability fallback never reaches this entry. A resume
+        // (`/continue`, a gate approval) keeps the route its run was planned under,
+        // saved beside the plan, instead of re-deriving one from the text.
+        let route = route_override.unwrap_or_else(|| {
+            if resume {
+                umadev_agent::resume_route(&root, &options.requirement)
+            } else {
+                umadev_agent::router::for_run(&options.requirement)
+            }
+        });
         let firmware = umadev_agent::compose_firmware(&root, &route, &options.requirement).await;
         let firmware = (!firmware.trim().is_empty()).then_some(firmware);
 
@@ -426,19 +457,7 @@ pub(super) async fn run_director_loop(
         //  - `steer` lets the loop fold queued user steering into the next step.
         // The CLI drive never scopes this, so headless behaviour is unchanged.
         let interaction = {
-            let holder = approval.clone();
-            let cb_sink = sink.clone();
-            let approval_cb: umadev_agent::ApprovalFn =
-                Arc::new(move |action: String, target: String| {
-                    let holder = holder.clone();
-                    let cb_sink = cb_sink.clone();
-                    Box::pin(async move {
-                        matches!(
-                            await_user_approval(&holder, &cb_sink, &action, &target).await,
-                            ApprovalReply::Allow
-                        )
-                    }) as umadev_agent::ApprovalFuture
-                });
+            let approval_cb = run_approval_callback(approval.clone(), sink.clone());
             let input_holder = host_input.clone();
             let input_sink = sink.clone();
             let host_request_cb: umadev_agent::HostRequestFn = Arc::new(
@@ -686,5 +705,63 @@ pub(super) fn resolve_workflow_resume_identity(
         } else {
             state.backend.clone()
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::interaction_bridge::{
+        allow_pending_approval, pending_approval_item, release_pending_approval_on_auto_switch,
+    };
+
+    fn run_request(requires_user_answer: bool) -> umadev_agent::ApprovalRequest {
+        umadev_agent::ApprovalRequest {
+            action: "Bash".to_string(),
+            target: "npm test".to_string(),
+            requires_user_answer,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_approval_only_the_user_may_answer_survives_a_switch_to_auto() {
+        let root = tempfile::tempdir().unwrap();
+        let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        let (sink, _events) = ChannelSink::new();
+        let approve = run_approval_callback(Arc::clone(&holder), Arc::new(sink));
+
+        // An ordinary /run approval is released when the user switches to Auto,
+        // which would run `npm test` unasked.
+        let mut ordinary = approve(run_request(false));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut ordinary)
+                .await
+                .is_err()
+        );
+        release_pending_approval_on_auto_switch(&holder, root.path());
+        assert!(ordinary.await, "the switch to Auto releases it as allowed");
+
+        // An upstream permission boundary is not: the base's own policy still
+        // wants the user's answer, whatever UmaDev's tier.
+        let mut boundary = approve(run_request(true));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut boundary)
+                .await
+                .is_err()
+        );
+        release_pending_approval_on_auto_switch(&holder, root.path());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut boundary)
+                .await
+                .is_err(),
+            "the switch to Auto must not answer for the user"
+        );
+        assert!(allow_pending_approval(
+            &holder,
+            &pending_approval_item(&holder).unwrap()
+        ));
+        assert!(boundary.await, "the user's explicit answer settles it");
     }
 }

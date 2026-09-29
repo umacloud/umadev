@@ -271,6 +271,12 @@
 "intent.quick_edit" = "Small, well-scoped change ({}) — on it directly with a targeted check."
 "intent.explain" = "A read-only explanation ({}) — I'll answer without touching the workspace."
 "intent.chat" = "This is a conversation ({}) — replying directly, no dev flow."
+"intent.rationale.chat" = "A conversation: reply directly, without the dev flow."
+"intent.rationale.explain" = "An explanation or a question: read-only, the workspace stays untouched."
+"intent.rationale.quick_edit" = "A small change: one quick writer plus a targeted check is enough."
+"intent.rationale.debug_fast" = "A small defect: locate and fix it quickly."
+"intent.rationale.debug_deep" = "A defect with an unclear blast radius: the dev flow locates, fixes, and regression-tests it."
+"intent.rationale.build" = "Judged a full build: the request is large and spans several parts, so a multi-role team delivering in stages is safer."
 "intent.depth.fast" = "fast"
 "intent.depth.standard" = "standard"
 "intent.depth.deep" = "deep"
@@ -279,6 +285,7 @@
 "intent.writer_lock_blocked" = "[blocked] intent · the mutating turn could not acquire the workspace writer lock: {}"
 "intent.targeted_verification_missing" = "[blocked] The scoped code change landed, but no successful targeted test/build/lint evidence was observed. The turn is not marked complete; run the narrowest relevant check and retry."
 "intent.git_commit_host_boundary" = "[blocked] Git commits are host-owned transactions and are never delegated to an AI base. Send a standalone ordinary commit request first (for example, `commit the current changes`), then send any test, edit, push, amend, or other action as a separate request."
+"intent.git_commit_done" = "[ok] Created local commit {}\nCommitted files: {}"
 "intent.git_commit_cancelled" = "Git commit cancelled; the existing workflow and session pause state is unchanged. Check `git status` to verify the working tree."
 "intent.git_commit_worker_failed" = "The Git commit transaction ended unexpectedly before publishing a result; the existing workflow and session pause state is unchanged. Check `git status` to verify the working tree."
 
@@ -320,6 +327,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode does not guarantee same-turn steering on this transport; queued intact for the next turn."
 "input.steer.grok_acp_unsupported" = "Grok Build's negotiated ACP session does not support steering; queued intact for the next turn."
 "input.steer.kimi_acp_unsupported" = "Kimi Code's negotiated ACP session does not support same-turn steering; queued intact for the next turn."
+"input.steer.returned" = "This message was not confirmed as delivered before the turn ended, so it is back in the input box; send it again if you still need it."
 "input.steer.not_active_queued" = "The resident turn is not ready for live input yet; queued intact for the next turn."
 "input.steer.backpressure_queued" = "The same-turn input lane is busy; queued intact and visibly for the next turn."
 "input.steer.safe_point_backpressure_queued" = "The live steer lane is busy, so this was not submitted to the base; queued intact and visibly for the next ordinary turn."
@@ -383,7 +391,7 @@
 "plan.panel.collapsed" = "Plan {}/{} — /plan to expand"
 "plan.panel.active_step" = "step {}/{} · running"
 "plan.panel.interrupted" = "Plan (interrupted — /continue to resume)"
-"run.transient_resume_hint" = "Rate-limited or briefly interrupted — this run's plan is saved; type `/continue` to resume the unfinished steps."
+"run.transient_resume_hint" = "Rate-limited, out of quota or briefly interrupted — this run's plan is saved; type `/continue` to resume the unfinished steps."
 "run.budget_pause_resume_hint" = "Time budget reached — this run paused at step {}/{}; type `/continue` to finish the remaining steps."
 "run.operational_pause_resume_hint" = "Required review service is temporarily unavailable ({}) — this run paused at step {}/{} without changing code or failing the plan. Type `/continue` to retry this step."
 "plan.summary.header" = "Task summary — {} done · {} in progress · {} blocked · {} not started"
@@ -524,6 +532,7 @@
 # Shared config write error
 "config.write_failed" = "(could not write {}: {})"
 "config.save_failed_note" = "[warn] Setting applied for this session, but could not be saved (it will revert on next launch): {}"
+"config.unreadable" = "[warn] Your settings file {} could not be read ({}). UmaDev started with default settings and left the file unchanged. Fix it and restart; if you change a setting before then, the unreadable file is first copied next to it as a .bak file."
 
 # Chitchat replies (offline keyword heuristic)
 "chitchat.greeting" = "Hi! I'm UmaDev — your AI coding project-director Agent.\n\nJust type the product you want and I'll start the 9-phase pipeline:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n  A blog system"
@@ -639,6 +648,18 @@
 "continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
 "continue.unowned_run" = "The saved run in .umadev was not written by UmaDev on this machine (it may have come with the repository), so it was not resumed. Review it:\n{}\nTo run this plan as shown, send /continue adopt. To start over, type a new requirement."
+"plan.stranded_skipped" = "team · {} plan step(s) skipped because a prerequisite was blocked (marked blocked, not run)"
+"team.post_build_qc_started" = "team · the build has finished but is not accepted yet — running the design/quality scan + team review (the same acceptance as /run)"
+"qc.floor_input_unreadable" = "{} could not be read completely: {}"
+"qc.acceptance_scan_incomplete" = "the source scan stopped before reading every source file: it reads at most {} files, {} MB in total, {} MB per UTF-8 file and {} directory levels, and never follows a symlinked source file or directory"
+"qc.acceptance_unavailable" = "floor · the planned API endpoints were not checked ({}) — this does not block delivery; check them yourself before shipping"
+"qc.coverage_nothing_to_trace" = "no plan, task list or architecture doc exists yet to trace the PRD's requirements to"
+"qc.coverage_advisory" = "floor · {} PRD requirement(s) are not traced to any plan step, task list or architecture doc: {} — advisory only; set UMADEV_STRICT_COVERAGE=1 to make untraced requirements block delivery"
+"qc.coverage_unavailable" = "floor · requirement coverage was not checked ({}) — this does not block delivery"
+"qc.scope_not_judged" = "floor · the change scope was not checked: completed plan step(s) {} declared no file surface, so this run's changes cannot be attributed to plan steps — this does not block delivery"
+"signal.first_pass_low" = "signal · requests of this kind rarely pass acceptance on the first try ({}%) — the light path has been unreliable here; consider more checks or a lower autonomy mode (advisory only; the deterministic floor is unchanged)"
+"signal.sizing_heavier" = "signal · requests of this kind have often been under-sized (the light path kept escalating into a real multi-step build) — future defaults could be one size heavier (advisory only; this run and the deterministic floor are unchanged)"
+"signal.sizing_lighter" = "signal · requests of this kind have often been over-sized (the heavy path kept producing only a tiny result) — future defaults could be one size lighter (advisory only; this run and the deterministic floor are unchanged)"
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
 "revise.no_gate" = "No checkpoint is open, nothing to revise — to change output, wait for the run to pause at a checkpoint (confirm the core docs / confirm the frontend preview)."
 
@@ -717,6 +738,7 @@
 "template.switched" = "Seed template switched to `{}` — the next run's frontend phase will follow this template's page structure and quality bar."
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[mode] This run was saved in {} mode, but this session is in {} mode, so it continues with this session's permissions. To continue it with its saved permissions, switch with /mode {}."
 "run.busy_reopen" = "A pipeline is running — /cancel it before starting again, to avoid two pipelines writing the same workspace."
 "run.usage" = "Usage: /run [--slug <slug>] <requirement>\n  Example: /run --slug my-project build a login system\n  Example: /run build an end-to-end test suite (slug auto-uses the directory name)"
 "goal.busy_reopen" = "A task is already running — /cancel it before /goal, to avoid two tasks writing the same workspace."
@@ -791,7 +813,7 @@
 "deploy.starting" = "Starting deploy, running: `{}`\n  (this may require logging into the platform CLI; follow the prompts)"
 
 # /auto and /manual
-"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · permanent setting -> auto_approve_gates in .umadevrc)"
+"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · applies to this session; new sessions start guarded)"
 "review.manual_on" = "[ok] Review mode: on. Every checkpoint pauses, shows the output, and waits for you to type c to approve or text to revise.\n  (to go fully automatic -> /auto · clarifying questions always ask you first)"
 
 # /animations
@@ -840,6 +862,8 @@
 
 # /deploy pre-confirm preflight
 "deploy.confirm_preflight" = "Ready to deploy (not run yet). Will run:\n  {}\n\nPre-deploy checklist: 1) build/tests passed  2) env vars and secrets configured on the target platform  3) target environment (prod/preview) correct  4) DB migration / rollback plan ready.\nWhen everything checks out, type /deploy confirm to actually deploy."
+"deploy.cli_preflight" = "Ready to deploy (not run yet). Will run:\n  {}\n\nPre-deploy checklist: 1) build/tests passed  2) env vars and secrets configured on the target platform  3) target environment (prod/preview) correct  4) DB migration / rollback plan ready."
+"deploy.cli_run_hint" = "When everything checks out, run `{}` to actually deploy (add `--yes` to skip the confirmation in scripts)."
 
 # Worker / base spawn error hints (emitted from background tasks, use the process-wide language)
 "worker.init_failed" = "[warn] Could not initialize worker `{}`: {}\n  Check: is the custom provider's kind/base_url/key correct? Or use /backend to pick a logged-in CLI; /offline to switch to offline templates."
@@ -862,6 +886,7 @@
 "base.fail.auth.grok" = "Grok Build is not logged in — run `grok login` in your terminal, then /continue; UmaDev never opens a login browser automatically"
 "base.fail.auth.generic" = "Base not logged in / auth failed — run the base's login command (or check your API key), then /continue"
 "base.fail.ratelimit" = "Base hit a rate limit — wait for it to reset (see the base's message below), or /model to switch model, or switch base"
+"base.fail.quota" = "Base usage quota or account balance is used up — wait for it to reset (see the base's message below), top up, or /model to switch model; retrying won't help"
 "base.fail.overloaded" = "Base is overloaded (busy) — retry shortly, or /model to a lighter model, or switch base"
 "base.fail.network" = "Cannot reach the base model endpoint — check your network or proxy settings"
 "base.fail.network.ssl" = "SSL / certificate verification failed — check your proxy or corporate cert (NODE_EXTRA_CA_CERTS)"
@@ -1247,6 +1272,8 @@
 "tui.bang.spawn_failed" = "failed to run: {}"
 "tui.bang.timeout" = "command timed out"
 "tui.bang.no_output" = "(no output)"
+"tui.local.cancelled" = "[cancelled] Stopped at your request; the command and everything it started were terminated."
+"tui.local.busy" = "A local command is still running. Wait for it to finish, or stop it first with Esc Esc, Ctrl+C or /cancel."
 "tui.local.output_truncated" = "[older command output truncated]"
 # Slash-command descriptions that the help overlay + palette share (one source).
 # Most commands reuse the tui.help.* strings above; these cover the verbs that
@@ -1362,7 +1389,7 @@
 "gate.name.clarify" = "the clarifying-questions checkpoint"
 "gate.name.docs" = "the core-docs checkpoint"
 "gate.name.preview" = "the frontend-preview checkpoint"
-"continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {} (to relax: /mode auto; for full bypass on the claude base set UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
+"continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {} (to relax: after /mode auto, installs, fetches and other ordinary network work no longer ask; an irreversible action needs your confirmation on every tier, so approve it in the interactive TUI or run it yourself)"
 "continuous.dangerous_action_denied_plan" = "[plan] This is read-only (Plan) mode; the write/command the base wanted is declined as read-only (not your decision): {} -> {}. To let it actually act, /mode guarded (confirm each step) or /mode auto, then retry."
 "continuous.tool_call_blocked" = "[gov] {} phase: base tool call tripped {} — {} (target: {})"
 "continuous.phase_truncated" = "[warn] {} phase was truncated (base hit its turn limit); keeping what was produced, continuing."
@@ -1376,6 +1403,8 @@
 "continuous.team.cross_review_header" = "[team] {} role-team cross-review (read-only forks, parallel): {} critic(s) each review from their own seat…"
 "continuous.team.seat_passed" = "[team] {}: passed, no blocking items."
 "continuous.team.seat_blocking" = "[team] {}: raised {} blocking item(s)."
+"continuous.team.review_reduced_files" = "[team] {} review runs on a reduced scope: {} of {} required changed file(s) fit whole; the rest were sent as declared samples or omissions (see the review manifest)."
+"continuous.team.review_reduced_scope" = "[team] {} review runs on a reduced scope: the set of files this run changed could not be read in full, so the reviewers see a declared priority sample."
 "continuous.verify_failed" = "[verify] Real build/test/lint had failing step(s) (recorded to the audit; the quality gate scores against it)."
 "continuous.quality_gate_result" = "Quality gate result: {}/100 · {} (deterministic hard signal)"
 "continuous.quality_gate_advisory" = "Quality score: {}/100 — advisory suggestions (a lean task; not a blocker)"

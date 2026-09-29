@@ -18,27 +18,33 @@
 //!
 //! Launch flags (from the headless stream-json contract):
 //! `claude --print --input-format stream-json --output-format stream-json
-//! --verbose --session-id <uuid> --permission-mode <plan|default|bypassPermissions>
-//! --allowedTools <read-only + research + sub-agent set; auto adds the mutating
-//! Edit/Write/Bash/NotebookEdit>` (+ optional `--append-system-prompt`). The base's
-//! native read/research/delegate tools (incl. `Agent`/`Task` sub-agents) are
-//! pre-approved so they run natively instead of eating a per-tool approval — see
-//! the internal `PLAN_ALLOWED_TOOLS` / `GUARDED_ALLOWED_TOOLS` /
-//! `AUTO_ALLOWED_TOOLS` allowlists.
+//! --verbose --session-id <uuid> --permission-mode <plan|default>
+//! --allowedTools <read-only + research + sub-agent set>
+//! --permission-prompt-tool stdio` (+ optional `--append-system-prompt`). The
+//! base's native read/research/delegate tools (incl. `Agent`/`Task` sub-agents)
+//! are pre-approved so they run natively instead of eating a per-tool approval —
+//! see the internal `PLAN_ALLOWED_TOOLS` / `GUARDED_ALLOWED_TOOLS` allowlists.
 //! We deliberately use `--append-system-prompt` (NOT `--system-prompt`, which
 //! would replace the tool guidance and degrade the base into a chat box).
 //!
-//! The permission mode tracks the autonomy tier so claude is consistent with the
-//! codex / opencode drivers: `autonomous` (auto tier) → `bypassPermissions` (the
-//! base runs with FULL ACCESS and never interrupts — matching codex
-//! `approvalPolicy: never` + full-access sandbox and opencode's wildcard-allow
-//! ruleset; UmaDev's PreToolUse/PostToolUse governance hooks still see every
-//! tool call, since claude runs hooks regardless of the permission mode),
-//! Guarded → `default` (claude raises a
-//! `can_use_tool` approval for each tool, which becomes a `NeedApproval` the
-//! orchestrator answers — the human-in-the-loop floor, so the
-//! irreversible-action gate is not bypassed), and Plan → `plan` with a strict
-//! read-only allowlist. `UMADEV_CLAUDE_PERMISSION_MODE` can only tighten Auto;
+//! `--permission-prompt-tool stdio` makes claude send every permission "ask" to
+//! UmaDev as a `can_use_tool` control request on this same channel. Without it
+//! claude answers each ask itself and, in `--print` mode, denies it.
+//!
+//! The permission mode tracks the autonomy tier. Guarded and Auto both run
+//! claude's `default` mode with the read-only + delegate allowlist, so every
+//! other tool call (an edit, a shell command, a web fetch) raises a
+//! `can_use_tool` approval that becomes a `NeedApproval` the orchestrator answers
+//! with UmaDev's trust floor: Guarded asks the user about consequential actions;
+//! Auto allows reversible work at once and still asks before an irreversible or
+//! uncertain one (a force-push, a publish, a deploy, `rm -rf`, a write outside
+//! the workspace). UmaDev's optional PreToolUse/PostToolUse hooks still see every
+//! tool call. Plan → `plan` with a strict read-only allowlist. In `plan` mode
+//! claude asks before a write instead of refusing it, so a Plan-profile session
+//! (and every read-only fork) denies each ordinary tool request itself. On every
+//! tier `AskUserQuestion` and `ExitPlanMode` reach UmaDev as typed
+//! `HostRequest`s, and a request claude withdraws settles as
+//! `HostRequestSettled`. `UMADEV_CLAUDE_PERMISSION_MODE` can only tighten Auto;
 //! it can never widen Plan or Guarded.
 //!
 //! Fail-open by contract: a garbled line is skipped, a dead session surfaces a
@@ -54,7 +60,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use umadev_runtime::{
     ApprovalDecision, AskQuestion, AskUserQuestion, BackgroundTaskSignal, BasePermissionProfile,
     BaseSession, DeliveryReceiptStage, DeliveryReport, ExitPlanMode, FileInputMode, HostAnswer,
@@ -90,6 +96,13 @@ const KNOWN_COMMAND_CAP: usize = 256;
 /// Dropping an evicted sender wakes its waiter, so a hostile peer cannot retain
 /// futures indefinitely.
 const PENDING_CLIENT_CONTROL_CAP: usize = 128;
+/// The [`SessionEvent::HostRequestSettled`] reason when Claude withdraws a
+/// pending `can_use_tool` request (`control_cancel_request`).
+const CLAUDE_CANCELLED_REQUEST: &str = "base cancelled";
+/// What a Plan-profile session tells Claude when it denies an ordinary tool
+/// request itself (see [`ClaudeSession::read_only`]).
+const PLAN_SESSION_DENIAL: &str =
+    "UmaDev runs this Claude session read-only (Plan); this action is not allowed here";
 /// A protocol ACK is useful but must never hold the interactive surface
 /// hostage. Older Claude versions may accept the input without replaying a UUID;
 /// after this deadline the honest receipt remains `transport_written`.
@@ -97,6 +110,24 @@ const REPLAY_ACK_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 /// Claude advertises `interrupt_receipt_v1` before returning a typed receipt.
 /// Waiting is bounded so a broken/newer peer can never hold Esc hostage.
 const INTERRUPT_RECEIPT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// How long [`BaseSession::interrupt`] waits in total, receipt included, for the
+/// interrupted turn's terminal frame. Claude emits it milliseconds after its
+/// interrupt ACK; the bound stays below the 5-second limit callers put on the
+/// whole interrupt.
+const INTERRUPT_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long `end` and `Drop` let Claude exit on its own once its stdin closed
+/// before the process tree is killed. An idle Claude writes its transcript and
+/// exits within a few hundred milliseconds of end of input.
+const CLAUDE_EOF_GRACE: std::time::Duration = END_REAP_BUDGET;
+/// How long [`ClaudeSession::resume`] waits for a resumed Claude to answer its
+/// readiness probe. A slow start is not a failure: past this bound the session
+/// is handed out as before.
+const RESUME_CONFIRM_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The terminal reason the stdout pump reports when the stream ends without
+/// Claude's own `result` frame.
+const STREAM_ENDED_REASON: &str = "base session ended unexpectedly";
+/// How long a resume that ended early waits for Claude's own reason frame.
+const RESUME_EXIT_REASON_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_INPUT_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// A single stdout NDJSON record may be large (for example a tool result), but
 /// it must not be able to grow the reader buffer without bound.
@@ -143,9 +174,10 @@ impl PendingClaudeControls {
         self.by_id.get(req_id).cloned()
     }
 
-    fn remove(&mut self, req_id: &str) {
-        self.by_id.remove(req_id);
+    /// Forget one request; `true` when it was still pending.
+    fn remove(&mut self, req_id: &str) -> bool {
         self.order.retain(|id| id != req_id);
+        self.by_id.remove(req_id).is_some()
     }
 }
 
@@ -345,9 +377,10 @@ pub struct ClaudeSession {
     /// The base child. Behind a [`std::sync::Mutex`] so the `&self`
     /// [`BaseSession::try_exit_status`] can do a non-blocking `try_wait()` peek
     /// (which needs `&mut Child`) without forcing the whole trait method to take
-    /// `&mut self`. `kill_on_drop(true)` still fires when the struct (and so the
-    /// `Child`) drops; `end()` kills through the lock.
-    child: std::sync::Mutex<Child>,
+    /// `&mut self`. Shared so a dropped session can hand the process tree to a
+    /// detached [`ProcessTreeEnd`]; `kill_on_drop(true)` still fires when the
+    /// last owner drops the `Child`.
+    child: Arc<std::sync::Mutex<Child>>,
     /// Windows kill-on-close Job Object holding the base's whole process tree so a
     /// native grandchild can't orphan once the Node trampoline exits (`taskkill`
     /// walks only the live parent chain). Terminated in `end`/`Drop`. `None` off
@@ -355,13 +388,18 @@ pub struct ClaudeSession {
     /// fallback in [`crate::kill_isolated_process_tree`] stands).
     #[cfg(windows)]
     process_job: Option<umadev_process::KillOnCloseJob>,
-    stdin: ChildStdin,
+    /// `None` once `end` or `Drop` closed it: end of input is how Claude
+    /// finishes on its own.
+    stdin: Option<ChildStdin>,
     events: mpsc::Receiver<SessionEvent>,
     /// Exact unresolved control payloads, keyed by Claude request id. Needed to
     /// preserve normal tool input and to merge structured question answers.
     pending_controls: SharedPendingClaudeControls,
     /// Exact client UUID → replay ACK waiters. Prompt content is never stored.
     pending_replay_acks: SharedPendingClaudeReplayAcks,
+    /// Bumped by the stdout pump for every frame that only a working turn
+    /// produces (see [`frame_marks_turn_activity`]).
+    turn_activity: watch::Receiver<u64>,
     /// UUID-only lifecycle/capability state for typed interrupt receipts. This
     /// lets Esc cancel only UmaDev-originated queued commands and ignore Claude's
     /// internally queued UUIDs.
@@ -381,6 +419,18 @@ pub struct ClaudeSession {
     program: String,
     /// The workspace this session runs in, so a fork operates in the same dir.
     workspace: std::path::PathBuf,
+    /// The client UUID of the user frame whose turn has not reached its
+    /// terminal event yet. [`BaseSession::interrupt`] consumes that turn's
+    /// remaining frames through its `TurnDone`, so the next turn never reads the
+    /// aborted turn's terminal as its own.
+    turn_in_flight: Option<String>,
+    /// `true` when Claude runs in its `plan` permission mode (the Plan profile
+    /// and every read-only fork). With the stdio permission channel, `plan` mode
+    /// asks the host before a write instead of refusing it, so this session
+    /// denies every ordinary tool request itself and never surfaces it: Plan
+    /// stays read-only whatever the caller would answer. Questions and plan
+    /// confirmation still reach the caller as typed requests.
+    read_only: bool,
     /// Temp file backing `--append-system-prompt-file` when the composed firmware
     /// was too large for the command line (the Windows `cmd.exe` ~8191 cap; see
     /// [`crate::command_line_budget`]). Held for the whole session lifetime so
@@ -397,8 +447,8 @@ impl ClaudeSession {
     /// appending `append_system` to the base's system prompt. A fresh pinned
     /// session id is generated.
     ///
-    /// The permission profile maps Plan/Guarded/Auto to Claude's native
-    /// `plan`/`default`/`bypassPermissions` modes.
+    /// The permission profile maps Plan to Claude's native `plan` mode and
+    /// Guarded/Auto to `default`; every permission ask reaches UmaDev.
     ///
     /// `max_turns` is an OPTIONAL per-run turn ceiling (a runaway backstop): `Some(n)`
     /// spawns claude with `--max-turns <n>`, `None` leaves it unbounded (today's
@@ -465,7 +515,10 @@ impl ClaudeSession {
     ///
     /// `UMADEV_CLAUDE_BIN` override honored. A spawn or resume failure surfaces as
     /// [`SessionError::Start`]; the caller must decide explicitly whether this task
-    /// may start fresh or must preserve its existing conversation identity.
+    /// may start fresh or must preserve its existing conversation identity. A
+    /// conversation Claude cannot find is such a failure: the session is handed
+    /// out only once Claude has answered a readiness probe, and Claude's own
+    /// "No conversation found with session ID …" becomes the error.
     pub async fn resume(
         workspace: &Path,
         append_system: Option<&str>,
@@ -483,8 +536,30 @@ impl ClaudeSession {
         // makes kill/exit-status target cmd.exe while the real node `claude` orphans. Using
         // the real binary directly fixes both on the continuous (default) path.
         let program = crate::claude::resolve_claude_program();
-        Self::spawn_with_args(
+        Self::resume_with_program(
             &program,
+            workspace,
+            append_system,
+            session_id,
+            permissions,
+            max_turns,
+            model,
+        )
+        .await
+    }
+
+    /// [`Self::resume`] against an explicit `program` (a test fake).
+    async fn resume_with_program(
+        program: &str,
+        workspace: &Path,
+        append_system: Option<&str>,
+        session_id: &str,
+        permissions: BasePermissionProfile,
+        max_turns: Option<u32>,
+        model: &str,
+    ) -> Result<Self, SessionError> {
+        let mut session = Self::spawn_with_args(
+            program,
             workspace,
             &resume_session_args_for_profile(
                 session_id,
@@ -496,7 +571,70 @@ impl ClaudeSession {
             session_id,
         )
         .await
-        .map_err(crate::redaction::sanitize_session_error)
+        .map_err(crate::redaction::sanitize_session_error)?;
+        session
+            .confirm_resumed()
+            .await
+            .map_err(crate::redaction::sanitize_session_error)?;
+        Ok(session)
+    }
+
+    /// Prove the resumed conversation exists before handing the session out.
+    ///
+    /// When Claude cannot find the conversation (its 30-day transcript sweep, a
+    /// moved project, another config dir) it prints a `result` frame naming the
+    /// id and exits at startup, before reading any input. A side-effect-free
+    /// control request (`mcp_status`) is answered as soon as a resumed session
+    /// is ready (an unknown subtype is answered with an error just as promptly);
+    /// an exit before that answer becomes [`SessionError::Start`] with Claude's
+    /// reason, so callers apply their stale-id fallback at once.
+    async fn confirm_resumed(&mut self) -> Result<(), SessionError> {
+        let request_id = new_session_id();
+        let answered = self
+            .protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register_client_control(request_id.clone());
+        let probe = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "mcp_status" }
+        })
+        .to_string();
+        let outcome = match self.write_line(&probe).await {
+            Ok(()) => tokio::time::timeout(RESUME_CONFIRM_BUDGET, answered)
+                .await
+                .map(|answer| answer.is_ok()),
+            Err(_) => Ok(false),
+        };
+        self.protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget_client_control(&request_id);
+        match outcome {
+            // Answered, or still starting: the conversation is not known missing.
+            Ok(true) | Err(_) => Ok(()),
+            // The stream ended before an answer: Claude exited during startup.
+            Ok(false) => Err(SessionError::Start(self.early_exit_reason().await)),
+        }
+    }
+
+    /// Claude's own reason for exiting before the first turn: the `result`
+    /// frame it printed, else its stderr.
+    async fn early_exit_reason(&mut self) -> String {
+        let deadline = tokio::time::Instant::now() + RESUME_EXIT_REASON_BUDGET;
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, self.events.recv()).await {
+            if let SessionEvent::TurnDone { status, .. } = event {
+                match status {
+                    TurnStatus::Failed(reason) if reason != STREAM_ENDED_REASON => return reason,
+                    _ => break,
+                }
+            }
+        }
+        self.stderr_drain.shutdown().await;
+        self.stderr.snapshot().unwrap_or_else(|| {
+            "Claude exited before the resumed conversation was ready".to_string()
+        })
     }
 
     /// Spawn a `claude` child with an explicit argument vector and wire up the
@@ -595,28 +733,33 @@ impl ClaudeSession {
         let pending_controls = Arc::new(Mutex::new(PendingClaudeControls::default()));
         let pending_replay_acks = Arc::new(Mutex::new(PendingClaudeReplayAcks::default()));
         let protocol = Arc::new(Mutex::new(ClaudeProtocolState::default()));
+        let (activity_tx, turn_activity) = watch::channel(0_u64);
         tokio::spawn(pump_stdout(
             stdout,
             tx,
             Arc::clone(&pending_controls),
             Arc::clone(&pending_replay_acks),
             Arc::clone(&protocol),
+            activity_tx,
         ));
 
         Ok(Self {
-            child: std::sync::Mutex::new(child),
+            child: Arc::new(std::sync::Mutex::new(child)),
             #[cfg(windows)]
             process_job,
-            stdin,
+            stdin: Some(stdin),
             events: rx,
             pending_controls,
             pending_replay_acks,
+            turn_activity,
             protocol,
             stderr: stderr_tail,
             stderr_drain,
             session_id: session_id.to_string(),
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
+            turn_in_flight: None,
+            read_only: runs_in_plan_mode(&args),
             _firmware_file: firmware_file,
         })
     }
@@ -625,6 +768,16 @@ impl ClaudeSession {
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// Hand the process tree to a [`ProcessTreeEnd`]; the session keeps only a
+    /// shared handle for exit-status reads.
+    fn process_tree_end(&mut self) -> ProcessTreeEnd {
+        ProcessTreeEnd {
+            child: Arc::clone(&self.child),
+            #[cfg(windows)]
+            job: self.process_job.take(),
+        }
     }
 
     /// Write one NDJSON line + flush to the live session's stdin.
@@ -636,19 +789,29 @@ impl ClaudeSession {
         // a fresh session (+ transcript replay) instead of surfacing the confusing pipe error
         // and re-resuming a corpse every subsequent turn.
         if let Some(status) = self.try_exit_status() {
+            // The base is gone, so its stderr is complete: finish reading it and
+            // name the reason it gave (a refused flag, a bad model, a lost login).
+            self.stderr_drain.shutdown().await;
+            let reason = self
+                .stderr
+                .snapshot()
+                .map_or_else(String::new, |tail| format!("; base stderr: {tail}"));
             return Err(SessionError::Send(format!(
-                "base session ended before send (base exited: {status})"
+                "base session ended before send (base exited: {status}){reason}"
             )));
         }
-        self.stdin
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(SessionError::Closed);
+        };
+        stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| SessionError::Send(e.to_string()))?;
-        self.stdin
+        stdin
             .write_all(b"\n")
             .await
             .map_err(|e| SessionError::Send(e.to_string()))?;
-        self.stdin
+        stdin
             .flush()
             .await
             .map_err(|e| SessionError::Send(e.to_string()))?;
@@ -671,6 +834,18 @@ impl ClaudeSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(req_id);
+    }
+
+    /// Answer one pending `can_use_tool` request with its exact envelope.
+    async fn write_control_response(
+        &mut self,
+        req_id: &str,
+        payload: &Value,
+    ) -> Result<(), SessionError> {
+        self.write_line(&control_response_line(req_id, payload))
+            .await?;
+        self.forget_control(req_id);
+        Ok(())
     }
 
     /// Register before the stdin write so a fast replay cannot race ahead of
@@ -706,6 +881,12 @@ impl ClaudeSession {
     /// Write one user frame and wait only for Claude's documented replay ACK.
     /// Timeout/old-version shapes retain the truthful transport receipt; they
     /// never become a send error and never claim that the model processed input.
+    ///
+    /// Claude 2.1.x before the typed receipt replays the input only once the
+    /// turn's first content block is complete, while its deltas start at once.
+    /// The wait therefore also ends as soon as the base is visibly working on
+    /// the turn: the caller can render that output now, and the receipt stays
+    /// the honest transport one.
     async fn write_user_line_with_receipt(
         &mut self,
         line: &str,
@@ -713,15 +894,20 @@ impl ClaudeSession {
     ) -> Result<DeliveryReceiptStage, SessionError> {
         self.register_command(uuid);
         let receiver = self.register_replay_ack(uuid);
+        // Output the base produces from here on belongs to this turn.
+        self.turn_activity.mark_unchanged();
         if let Err(error) = self.write_line(line).await {
             self.forget_replay_ack(uuid);
             self.forget_command(uuid);
             return Err(error);
         }
-        let acknowledged = matches!(
-            tokio::time::timeout(REPLAY_ACK_BUDGET, receiver).await,
-            Ok(Ok(()))
-        );
+        self.turn_in_flight = Some(uuid.to_string());
+        let acknowledged = tokio::select! {
+            biased;
+            ack = receiver => ack.is_ok(),
+            _ = self.turn_activity.changed() => false,
+            () = tokio::time::sleep(REPLAY_ACK_BUDGET) => false,
+        };
         self.forget_replay_ack(uuid);
         Ok(if acknowledged {
             DeliveryReceiptStage::ProtocolAcknowledged
@@ -746,6 +932,7 @@ impl ClaudeSession {
             self.forget_command(uuid);
             return Err(error);
         }
+        self.turn_in_flight = Some(uuid.to_string());
         let pending = Arc::clone(&self.pending_replay_acks);
         let uuid = uuid.to_string();
         tokio::spawn(async move {
@@ -764,23 +951,101 @@ impl ClaudeSession {
         });
         Ok(())
     }
+
+    /// Cancel the exact UmaDev commands a typed interrupt receipt still lists
+    /// as queued, and return their UUIDs.
+    async fn cancel_still_queued(
+        &mut self,
+        request_id: &str,
+        receipt: oneshot::Receiver<Value>,
+    ) -> Result<Vec<String>, SessionError> {
+        let Ok(Ok(payload)) = tokio::time::timeout(INTERRUPT_RECEIPT_BUDGET, receipt).await else {
+            self.protocol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget_client_control(request_id);
+            tracing::warn!("Claude advertised interrupt_receipt_v1 but no typed receipt arrived");
+            return Ok(Vec::new());
+        };
+        let still_queued = self
+            .protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .known_still_queued(&payload);
+        // The official receipt may include Claude-internal UUIDs. Never cancel
+        // those; cancel every exact UmaDev UUID promptly, including all members
+        // of a coalesced batch, before returning control to the interactive loop.
+        for message_uuid in &still_queued {
+            let cancel = serde_json::json!({
+                "type": "control_request",
+                "request_id": new_session_id(),
+                "request": {
+                    "subtype": "cancel_async_message",
+                    "message_uuid": message_uuid
+                }
+            })
+            .to_string();
+            self.write_line(&cancel)
+                .await
+                .map_err(crate::redaction::sanitize_session_error)?;
+        }
+        tracing::debug!(
+            cancelled_queued_commands = still_queued.len(),
+            "Claude interrupt receipt settled"
+        );
+        Ok(still_queued)
+    }
+
+    /// Consume the interrupted turn's remaining frames through its terminal
+    /// event. Claude acknowledges an interrupt first and emits the aborted
+    /// turn's `result` just after; left unread, that `result` would end the NEXT
+    /// turn as a failure and keep the conversation one turn out of step. With no
+    /// turn in flight there is nothing to wait for.
+    async fn settle_interrupted_turn(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionError> {
+        if self.turn_in_flight.is_none() {
+            return Ok(());
+        }
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                // The stream's end is terminal too: nothing of the turn remains.
+                Ok(Some(SessionEvent::TurnDone { .. }) | None) => {
+                    self.turn_in_flight = None;
+                    return Ok(());
+                }
+                // The aborted turn's own output; its caller has stopped reading.
+                // A permission request it raised is withdrawn by Claude itself.
+                Ok(Some(_)) => {}
+                Err(_) => {
+                    return Err(SessionError::InterruptPending(format!(
+                        "Claude did not end the interrupted turn within {}s",
+                        INTERRUPT_SETTLE_BUDGET.as_secs()
+                    )))
+                }
+            }
+        }
+    }
 }
 
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
         // A dropped session (timed-out / cancelled turn, or teardown that skipped
-        // `end()`) must kill the whole process GROUP so no tool/subagent (or, on
-        // an npm trampoline install, native base) grandchild is orphaned to init.
-        // Windows: terminate the Job Object first (reaches a grandchild taskkill
-        // can't). The blocking group-kill recovers a poisoned lock and briefly
-        // spins on contention so the group kill still fires (a bare `try_lock`
-        // skipped it on poison/contention); fail-open to `kill_on_drop` on overrun.
-        #[cfg(windows)]
-        if let Some(job) = self.process_job.take() {
-            job.terminate();
-            drop(job);
+        // `end()`) must not leave any of its process tree behind, but an idle
+        // Claude must not be killed before it writes its transcript either (see
+        // `end`). Closing stdin lets Claude finish; a detached task gives it the
+        // same grace as `end` and then kills the whole group, so the caller never
+        // blocks. A turn still running was abandoned: given that grace, Claude
+        // would go on running it, tools included, after its caller moved on. So
+        // then, and without a runtime to run that task, the tree is killed at once.
+        drop(self.stdin.take());
+        let tree = self.process_tree_end();
+        if self.turn_in_flight.is_none() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(tree.finish());
+            }
         }
-        kill_isolated_process_tree_blocking(&self.child);
     }
 }
 
@@ -865,10 +1130,26 @@ impl BaseSession for ClaudeSession {
         // No internal timeout BY DESIGN — the runner owns phase/run budgets and
         // races this against them (then calls `interrupt`). Keeping the session
         // a pure relay avoids a synthetic TurnDone racing a real one.
-        self.events
-            .recv()
-            .await
-            .map(crate::redaction::sanitize_session_event)
+        loop {
+            let event = self.events.recv().await?;
+            if let SessionEvent::NeedApproval { req_id, .. } = &event {
+                if self.read_only {
+                    // Plan mode's ask-before-write, answered the way `--print`
+                    // answered it before the stdio channel: a denial. A failed
+                    // write means the base is gone; its EOF terminal follows.
+                    if self.pending_control(req_id).is_some() {
+                        let _ = self
+                            .write_control_response(req_id, &deny_payload(PLAN_SESSION_DENIAL))
+                            .await;
+                    }
+                    continue;
+                }
+            }
+            if matches!(event, SessionEvent::TurnDone { .. }) {
+                self.turn_in_flight = None;
+            }
+            return Some(crate::redaction::sanitize_session_event(event));
+        }
     }
 
     async fn respond(
@@ -885,12 +1166,9 @@ impl BaseSession for ClaudeSession {
             return Ok(());
         };
         let payload = legacy_approval_payload(decision, Some(&pending));
-        let line = control_response_line(req_id, &payload);
-        self.write_line(&line)
+        self.write_control_response(req_id, &payload)
             .await
-            .map_err(crate::redaction::sanitize_session_error)?;
-        self.forget_control(req_id);
-        Ok(())
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn respond_host(
@@ -904,15 +1182,13 @@ impl BaseSession for ClaudeSession {
             return Ok(());
         };
         let payload = typed_host_response_payload(response, Some(&pending));
-        let line = control_response_line(req_id, &payload);
-        self.write_line(&line)
+        self.write_control_response(req_id, &payload)
             .await
-            .map_err(crate::redaction::sanitize_session_error)?;
-        self.forget_control(req_id);
-        Ok(())
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
+        let deadline = tokio::time::Instant::now() + INTERRUPT_SETTLE_BUDGET;
         let request_id = new_session_id();
         // Old Claude builds return an untyped empty ACK. Feature-detect the
         // receipt so Esc never acquires a new 1.5-second delay on those builds.
@@ -925,12 +1201,7 @@ impl BaseSession for ClaudeSession {
                 .interrupt_receipt_v1
                 .then(|| protocol.register_client_control(request_id.clone()))
         };
-        let line = serde_json::json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": { "subtype": "interrupt" }
-        })
-        .to_string();
+        let line = interrupt_line(&request_id);
         if let Err(error) = self.write_line(&line).await {
             self.protocol
                 .lock()
@@ -939,63 +1210,38 @@ impl BaseSession for ClaudeSession {
             return Err(crate::redaction::sanitize_session_error(error));
         }
 
-        let Some(receipt) = receipt else {
-            return Ok(());
-        };
-        let Ok(Ok(payload)) = tokio::time::timeout(INTERRUPT_RECEIPT_BUDGET, receipt).await else {
-            self.protocol
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .forget_client_control(&request_id);
-            tracing::warn!("Claude advertised interrupt_receipt_v1 but no typed receipt arrived");
-            return Ok(());
-        };
-        let still_queued = self
-            .protocol
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .known_still_queued(&payload);
-        // The official receipt may include Claude-internal UUIDs. Never cancel
-        // those; cancel every exact UmaDev UUID promptly, including all members
-        // of a coalesced batch, before returning control to the interactive loop.
-        for message_uuid in &still_queued {
-            let cancel = serde_json::json!({
-                "type": "control_request",
-                "request_id": new_session_id(),
-                "request": {
-                    "subtype": "cancel_async_message",
-                    "message_uuid": message_uuid
-                }
-            })
-            .to_string();
-            self.write_line(&cancel)
-                .await
-                .map_err(crate::redaction::sanitize_session_error)?;
+        if let Some(receipt) = receipt {
+            let cancelled = self.cancel_still_queued(&request_id, receipt).await?;
+            if self
+                .turn_in_flight
+                .as_ref()
+                .is_some_and(|uuid| cancelled.contains(uuid))
+            {
+                // The turn never started; its cancelled command has no terminal.
+                self.turn_in_flight = None;
+            }
         }
-        tracing::debug!(
-            cancelled_queued_commands = still_queued.len(),
-            "Claude interrupt receipt settled"
-        );
-        Ok(())
+        self.settle_interrupted_turn(deadline).await
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Best-effort: kill the whole process GROUP (drops stdin → EOF, tears
-        // down the reader/stderr tasks) AND wait (bounded) for the direct child
-        // to be reaped so shutdown is deterministic and leaves no orphan — a
-        // direct-child kill would reparent tool/subagent grandchildren to init.
-        // On overrun we fail open to kill_on_drop. Consistent with codex /
-        // opencode `end()`.
-        //
-        // Windows: terminate the Job Object FIRST so the native `claude` grandchild
-        // is killed even after the trampoline has exited (taskkill can no longer
-        // reach it); the group reap below is the cross-platform backstop.
-        #[cfg(windows)]
-        if let Some(job) = self.process_job.take() {
-            job.terminate();
-            drop(job);
+        // Graceful first, as the ACP driver ends its sessions. Claude writes its
+        // transcript up to half a second after a turn's result; killing it at
+        // once could lose the whole conversation, and a later `--resume` would
+        // find nothing. So stop a turn still running (its frames are not
+        // awaited, and a Claude that stopped reading cannot hold the write up),
+        // close stdin, and give Claude `CLAUDE_EOF_GRACE` to exit on its own.
+        // Then the whole process GROUP is killed and the direct child reaped
+        // (bounded), so no tool/subagent grandchild is left behind — a
+        // direct-child kill would reparent them to init. On Windows the Job
+        // Object is terminated too, which reaches a native grandchild taskkill
+        // cannot.
+        if self.turn_in_flight.take().is_some() {
+            let line = interrupt_line(&new_session_id());
+            let _ = tokio::time::timeout(CLAUDE_EOF_GRACE, self.write_line(&line)).await;
         }
-        reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
+        drop(self.stdin.take());
+        self.process_tree_end().finish().await;
         self.stderr_drain.shutdown().await;
         Ok(())
     }
@@ -1017,6 +1263,71 @@ impl BaseSession for ClaudeSession {
         // accumulated transcript for full-context cross-session resume.
         Some(&self.session_id)
     }
+}
+
+/// Ends a Claude process tree without ever leaving it running: Claude gets
+/// [`CLAUDE_EOF_GRACE`] after its stdin closed to exit on its own, which is when
+/// it writes its transcript, and then the whole tree is killed and the direct
+/// child reaped. Dropped unfinished (no runtime, or one shutting down before
+/// the task ran), it kills the tree at once, as a dropped session always did.
+struct ProcessTreeEnd {
+    child: Arc<std::sync::Mutex<Child>>,
+    #[cfg(windows)]
+    job: Option<umadev_process::KillOnCloseJob>,
+}
+
+impl ProcessTreeEnd {
+    /// Dropping `self` at the end terminates the Windows Job Object (see `Drop`).
+    async fn finish(self) {
+        if !wait_for_isolated_exit(&self.child, CLAUDE_EOF_GRACE).await {
+            reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
+        }
+    }
+}
+
+impl Drop for ProcessTreeEnd {
+    fn drop(&mut self) {
+        // Windows: terminate the Job Object, which reaches a native grandchild a
+        // process-tree kill cannot once the trampoline has exited. After `finish`
+        // the group kill finds the child reaped and signals nothing: a reaped
+        // child has no id, so its reusable group id is never signalled. The
+        // blocking group-kill recovers a poisoned lock and briefly spins on
+        // contention; fail-open to `kill_on_drop` on overrun.
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            job.terminate();
+            drop(job);
+        }
+        kill_isolated_process_tree_blocking(&self.child);
+    }
+}
+
+/// Poll until the isolated child has exited (its remaining group is killed and
+/// the child reaped), or `budget` elapses; `true` when it exited.
+async fn wait_for_isolated_exit(
+    child: &std::sync::Mutex<Child>,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if try_exit_isolated_process_tree(child).is_some() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The stream-json `interrupt` control request.
+fn interrupt_line(request_id: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "interrupt" }
+    })
+    .to_string()
 }
 
 /// Exact stream-json envelope for resolving a `can_use_tool` request.
@@ -1217,33 +1528,40 @@ fn claude_question_id(_question: &AskQuestion, index: usize) -> String {
 /// Record or cancel pending controls before their public events are sent. This
 /// preserves exact input without placing protocol-only mutable state in the
 /// runtime event type.
-fn observe_control_frame(line: &str, pending: &SharedPendingClaudeControls) {
-    let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
-        return;
-    };
+///
+/// Claude withdraws a `can_use_tool` request with `control_cancel_request` when
+/// the turn is aborted or a hook decided first. A request that was still pending
+/// yields [`SessionEvent::HostRequestSettled`] so a surface can retract the
+/// approval or question it is showing for it.
+fn observe_control_frame(
+    line: &str,
+    pending: &SharedPendingClaudeControls,
+) -> Option<SessionEvent> {
+    let frame = serde_json::from_str::<Value>(line.trim()).ok()?;
     match frame.get("type").and_then(Value::as_str) {
         Some("control_request") => {
-            let Some((req_id, request)) = pending_control_from_frame(&frame) else {
-                return;
-            };
+            let (req_id, request) = pending_control_from_frame(&frame)?;
             pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(req_id, request);
+            None
         }
         Some("control_cancel_request") => {
-            if let Some(req_id) = frame
+            let req_id = frame
                 .get("request_id")
                 .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-            {
-                pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(req_id);
-            }
+                .filter(|id| !id.is_empty())?;
+            let was_pending = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(req_id);
+            was_pending.then(|| SessionEvent::HostRequestSettled {
+                req_id: req_id.to_string(),
+                reason: CLAUDE_CANCELLED_REQUEST.to_string(),
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -1314,6 +1632,7 @@ async fn pump_stdout(
     pending_controls: SharedPendingClaudeControls,
     pending_replay_acks: SharedPendingClaudeReplayAcks,
     protocol: SharedClaudeProtocolState,
+    activity: watch::Sender<u64>,
 ) {
     // Read raw bytes per line and decode LOSSY: `next_line` returns `Err` on a
     // single invalid UTF-8 byte, and the old `while let Ok(Some)` treated that as
@@ -1341,12 +1660,23 @@ async fn pump_stdout(
                     // model output. Never render the user's own input a second time.
                     continue;
                 }
-                observe_control_frame(line, &pending_controls);
+                if let Some(settled) = observe_control_frame(line, &pending_controls) {
+                    if tx
+                        .send(crate::redaction::sanitize_session_event(settled))
+                        .await
+                        .is_err()
+                    {
+                        return; // consumer dropped → stop
+                    }
+                }
                 if let Ok(frame) = serde_json::from_str::<Value>(line) {
                     protocol
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .observe(&frame);
+                    if frame_marks_turn_activity(&frame) {
+                        activity.send_modify(|seen| *seen = seen.wrapping_add(1));
+                    }
                 }
                 for ev in gate.on_line(line) {
                     if tx
@@ -1361,7 +1691,7 @@ async fn pump_stdout(
             Ok(Some(ClaudeFrameRead::Oversized)) => {
                 break "Claude stream-json frame exceeded the 32 MiB safety limit";
             }
-            Ok(None) => break "base session ended unexpectedly",
+            Ok(None) => break STREAM_ENDED_REASON,
             Err(_) => break "base session stdout could not be read",
         }
     };
@@ -1396,6 +1726,17 @@ async fn pump_stdout(
             },
         ))
         .await;
+}
+
+/// Main-line frames that only a turn in progress produces. `system`, lifecycle
+/// and control-response frames also arrive between turns, a background
+/// sub-agent's frames are not the turn's, and a replay is the ACK itself.
+fn frame_marks_turn_activity(frame: &Value) -> bool {
+    parent_tool_use_id(frame).is_none()
+        && matches!(
+            frame.get("type").and_then(Value::as_str),
+            Some("stream_event" | "assistant" | "user" | "result" | "control_request")
+        )
 }
 
 /// Read one LF-delimited stream-json record while bounding retained memory.
@@ -1544,8 +1885,8 @@ fn maybe_divert_firmware(
     divert_append_system_to_file_in(args.to_vec(), &std::env::temp_dir())
 }
 
-/// The read-only + delegate native tools UmaDev ALWAYS pre-approves — even in
-/// Guarded — so the base keeps its native capabilities under UmaDev instead of
+/// The read-only + delegate native tools UmaDev ALWAYS pre-approves — in Guarded
+/// and Auto — so the base keeps its native capabilities under UmaDev instead of
 /// eating a `can_use_tool` round-trip (and, in interactive Guarded chat, a
 /// confusing user pause that fail-open DENIES) for every `Grep` / `Glob`,
 /// Claude's task-list tools, and every sub-agent spawn.
@@ -1573,35 +1914,34 @@ const PLAN_ALLOWED_TOOLS: &str = "Read,Grep,Glob";
 
 const GUARDED_ALLOWED_TOOLS: &str = "Read,Grep,Glob,TodoWrite,TaskCreate,TaskGet,TaskUpdate,TaskList,Agent,Task,TaskOutput,BashOutput,AgentOutput";
 
-/// AUTO additionally pre-approves the MUTATING working set (`Edit` / `Write` / `Bash`
-/// / `NotebookEdit`) so an unattended autonomous run is never interrupted by a
-/// per-tool prompt — the autonomy tier the user opted into.
-const AUTO_ALLOWED_TOOLS: &str = "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,\
-     TaskCreate,TaskGet,TaskUpdate,TaskList,NotebookEdit,Agent,Task,TaskOutput,BashOutput,AgentOutput";
-
 /// Resolve Claude's permission mode and allowlist as one policy pair. Keeping
-/// them coupled matters: changing Auto's mode to `default` while retaining its
-/// mutating `--allowedTools` list would still pre-authorize those mutations.
+/// them coupled matters: a mutating `--allowedTools` entry would pre-authorize
+/// that mutation whatever the mode, and UmaDev would never be asked.
 fn claude_permission_args_for_profile(
     permissions: BasePermissionProfile,
 ) -> (&'static str, &'static str) {
     let override_mode = std::env::var("UMADEV_CLAUDE_PERMISSION_MODE").ok();
-    let no_skip = std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1");
-    resolve_claude_permission_args(permissions, override_mode.as_deref(), no_skip)
+    resolve_claude_permission_args(permissions, override_mode.as_deref())
 }
 
 /// Pure permission-policy core. Plan and Guarded are fixed postures, so no
-/// environment/config override can widen them. Auto accepts only a small
-/// whitelist of known Claude modes, all at or below its native bypass posture.
-/// Claude's classifier-backed `auto` is deliberately distinct from raw
-/// `bypassPermissions`: it gets the non-mutating allowlist so Edit/Bash still
-/// pass through Claude's classifier. Unknown future values fail safely to
-/// Guarded. `UMADEV_NO_SKIP_PERMS=1` forbids bypass while still permitting the
-/// official classifier-backed Auto and tighter Plan/dontAsk postures.
+/// environment/config override can widen them.
+///
+/// Auto runs Claude's `default` mode with the same read-only allowlist as
+/// Guarded, so every other call (an edit, a shell command, a web fetch) asks
+/// UmaDev over the stdio permission channel and the trust floor answers it:
+/// reversible work at once, an irreversible or uncertain action only after a
+/// confirmation. Guarded and Auto differ only in how UmaDev answers. Claude's
+/// `acceptEdits` is not used: it also runs `rm`, `mv`, `cp`, `sed`, `mkdir` and
+/// `touch` in the workspace without asking, so an `rm -rf` would skip the floor.
+///
+/// The internal `UMADEV_CLAUDE_PERMISSION_MODE` override may only pick a known
+/// posture in which Claude never approves on its own: `plan`, `dontAsk` (denies
+/// instead of asking) or `default`/`manual`. `bypassPermissions`, `acceptEdits`,
+/// Claude's classifier-backed `auto` and any unknown value keep the native pair.
 fn resolve_claude_permission_args(
     permissions: BasePermissionProfile,
     override_mode: Option<&str>,
-    no_skip: bool,
 ) -> (&'static str, &'static str) {
     match permissions {
         BasePermissionProfile::Plan => ("plan", PLAN_ALLOWED_TOOLS),
@@ -1611,26 +1951,11 @@ fn resolve_claude_permission_args(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_ascii_lowercase);
-            if no_skip {
-                return match requested.as_deref() {
-                    Some("plan") => ("plan", PLAN_ALLOWED_TOOLS),
-                    Some("dontask") => ("dontAsk", GUARDED_ALLOWED_TOOLS),
-                    Some("auto") => ("auto", GUARDED_ALLOWED_TOOLS),
-                    Some("manual") => ("manual", GUARDED_ALLOWED_TOOLS),
-                    _ => ("default", GUARDED_ALLOWED_TOOLS),
-                };
-            }
             match requested.as_deref() {
-                None | Some("bypasspermissions") => ("bypassPermissions", AUTO_ALLOWED_TOOLS),
-                Some("auto") => ("auto", GUARDED_ALLOWED_TOOLS),
-                Some("acceptedits") => ("acceptEdits", GUARDED_ALLOWED_TOOLS),
-                Some("dontask") => ("dontAsk", GUARDED_ALLOWED_TOOLS),
                 Some("plan") => ("plan", PLAN_ALLOWED_TOOLS),
+                Some("dontask") => ("dontAsk", GUARDED_ALLOWED_TOOLS),
                 Some("manual") => ("manual", GUARDED_ALLOWED_TOOLS),
-                // Never pass through an unknown mode: a future Claude release
-                // could assign it broader semantics than UmaDev understands.
-                // The known `default` mode lands on the same guarded pair.
-                Some(_) => ("default", GUARDED_ALLOWED_TOOLS),
+                _ => ("default", GUARDED_ALLOWED_TOOLS),
             }
         }
     }
@@ -1639,13 +1964,12 @@ fn resolve_claude_permission_args(
 /// The argument vector preceding any input — the stream-json continuous-session
 /// flags. Exposed for tests. `--append-system-prompt` (NOT `--system-prompt`).
 ///
-/// `autonomous` picks the permission mode so claude tracks the trust tier like
-/// the codex / opencode drivers: `true` → `bypassPermissions` (full access,
-/// never interrupts; governance hooks still audit every call), `false` →
-/// `default` (claude raises a `can_use_tool` approval per tool, which
-/// the orchestrator answers — keeping the human-in-the-loop / irreversible-action
-/// floor live). Environment overrides are confined to Auto and may only select
-/// a known equal-or-tighter posture; Plan/Guarded remain fixed.
+/// `autonomous` picks the trust tier: `true` → Auto, `false` → Guarded. Both run
+/// claude's `default` mode with the read-only allowlist, so every other tool call
+/// raises a `can_use_tool` approval that the orchestrator answers — Guarded with
+/// the human in the loop, Auto with the irreversible-action floor alone.
+/// Environment overrides are confined to Auto and may only select a known
+/// equal-or-tighter posture; Plan/Guarded remain fixed.
 ///
 /// `max_turns` is the OPTIONAL per-run turn ceiling (a runaway backstop): `Some(n)`
 /// appends `--max-turns <n>`, `None` omits the flag entirely — leaving claude's
@@ -1711,6 +2035,7 @@ fn session_args_for_profile(
         "--allowedTools".to_string(),
         allowed_tools.to_string(),
     ];
+    push_permission_prompt_tool(&mut args);
     args.extend(crate::model_args(model));
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -1718,6 +2043,21 @@ fn session_args_for_profile(
         args.push(sys.to_string());
     }
     args
+}
+
+/// Route every permission "ask" to UmaDev as a `can_use_tool` control request on
+/// this stdio channel. Without it Claude resolves each ask itself and, in
+/// `--print` mode, denies it: no approval, question or plan confirmation would
+/// ever reach UmaDev, and a Guarded session could not change a file.
+fn push_permission_prompt_tool(args: &mut Vec<String>) {
+    args.push("--permission-prompt-tool".to_string());
+    args.push("stdio".to_string());
+}
+
+/// Whether an argument vector starts Claude in its `plan` permission mode.
+fn runs_in_plan_mode(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == "--permission-mode" && pair[1] == "plan")
 }
 
 /// Append `--max-turns <n>` to `args` when a cap is set; a `None` cap appends
@@ -1785,6 +2125,7 @@ fn resume_session_args_for_profile(
         "--allowedTools".to_string(),
         allowed_tools.to_string(),
     ];
+    push_permission_prompt_tool(&mut args);
     args.extend(crate::model_args(model));
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -1826,13 +2167,15 @@ pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
         // line). The consult's model context is genuinely clean at the host level.
         "--session-id".to_string(),
         fork_session_id.to_string(),
-        // Read-only: plan mode never applies an edit. The tool list makes only
-        // Read/Grep/Glob prompt-free; it does not independently restrict tools.
+        // Read-only: plan mode asks before any edit, and the session denies
+        // every such ask itself (see `ClaudeSession::read_only`). The tool list
+        // makes only Read/Grep/Glob prompt-free; it does not restrict tools.
         "--permission-mode".to_string(),
         "plan".to_string(),
         "--allowedTools".to_string(),
         "Read,Grep,Glob".to_string(),
     ];
+    push_permission_prompt_tool(&mut args);
     // A read-only verdict consult is turn-capped LOW — a runaway backstop so a critic
     // can never spin a long agentic loop (see `CRITIC_FORK_MAX_TURNS`).
     push_max_turns(&mut args, Some(CRITIC_FORK_MAX_TURNS));
@@ -2514,6 +2857,11 @@ struct SubagentOutputGate {
     /// can never hide the main agent or masquerade as an idle hang.
     deferral_broken: bool,
     pending_done: Option<SessionEvent>,
+    /// The main-line API message whose content streamed as deltas (its id from
+    /// `message_start`) and whether any text or thinking delta arrived for it.
+    /// Only a message that streamed may have its aggregate text suppressed.
+    streamed_message: Option<String>,
+    streamed_content: bool,
 }
 
 /// Fail-open ceiling on buffered main-line output while a background sub-agent is
@@ -2537,28 +2885,78 @@ fn held_event_bytes(event: &SessionEvent) -> usize {
 impl SubagentOutputGate {
     fn on_line(&mut self, line: &str) -> Vec<SessionEvent> {
         let parsed = serde_json::from_str::<Value>(line.trim()).ok();
-        let main_frame = parsed
-            .as_ref()
-            .is_some_and(|v| parent_tool_use_id(v).is_none());
-        let main_stream_delta = main_frame
-            && parsed
-                .as_ref()
-                .is_some_and(|v| v.get("type").and_then(Value::as_str) == Some("stream_event"));
-        let events = self
-            .grouper
-            .on_line_with_deferred_boundary(line, !self.live.is_empty());
-        self.route(events, main_stream_delta, main_frame)
+        let main = parsed.as_ref().filter(|v| parent_tool_use_id(v).is_none());
+        let main_type = main.and_then(|v| v.get("type")).and_then(Value::as_str);
+        let mut events = main.map_or_else(Vec::new, |v| self.unstreamed_content(v));
+        events.extend(
+            self.grouper
+                .on_line_with_deferred_boundary(line, !self.live.is_empty()),
+        );
+        // Main-line text is held while background agents run, whether it
+        // streamed or came whole in an aggregate frame.
+        let main_text = matches!(main_type, Some("stream_event" | "assistant"));
+        self.route(events, main_text, main.is_some())
+    }
+
+    /// Track which main-line message streamed its content, and return the text
+    /// and thinking of an aggregate `assistant` frame whose content did not.
+    ///
+    /// With `--include-partial-messages` an aggregate frame repeats what its
+    /// deltas carried. But when a streaming request fails mid-way (an overloaded
+    /// API, a gateway without SSE), Claude re-issues it without streaming and
+    /// delivers that answer ONLY in the aggregate frame of a new message id.
+    fn unstreamed_content(&mut self, v: &Value) -> Vec<SessionEvent> {
+        match v.get("type").and_then(Value::as_str) {
+            Some("stream_event") => {
+                self.observe_stream_event(v);
+                Vec::new()
+            }
+            Some("assistant") => {
+                // Deltas whose message id is unknown are taken to be this frame's.
+                let id = v.pointer("/message/id").and_then(Value::as_str);
+                let streamed = self.streamed_content
+                    && (self.streamed_message.is_none() || id == self.streamed_message.as_deref());
+                if streamed || is_synthetic_message(v) {
+                    Vec::new()
+                } else {
+                    aggregate_content_events(v)
+                }
+            }
+            Some("result") => {
+                self.streamed_message = None;
+                self.streamed_content = false;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn observe_stream_event(&mut self, v: &Value) {
+        let event = v.get("event");
+        match event.and_then(|e| e.get("type")).and_then(Value::as_str) {
+            Some("message_start") => {
+                self.streamed_message = event
+                    .and_then(|e| e.pointer("/message/id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.streamed_content = false;
+            }
+            Some("content_block_delta") if !parse_stream_event(v).is_empty() => {
+                self.streamed_content = true;
+            }
+            _ => {}
+        }
     }
 
     fn route(
         &mut self,
         events: Vec<SessionEvent>,
-        main_stream_delta: bool,
+        main_text: bool,
         main_frame: bool,
     ) -> Vec<SessionEvent> {
         let mut out = Vec::new();
         for event in events {
-            if main_stream_delta
+            if main_text
                 && !self.live.is_empty()
                 && !self.deferral_broken
                 && matches!(
@@ -2666,6 +3064,35 @@ impl SubagentOutputGate {
         self.pending_done = None;
         out
     }
+}
+
+/// Claude's own stand-in for a model reply (model `<synthetic>`), e.g. the
+/// "API Error: 429 …" message before an error `result`. The `result` frame
+/// already reports its text as the turn's failure.
+fn is_synthetic_message(v: &Value) -> bool {
+    v.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+}
+
+/// The text and thinking blocks of an aggregate `assistant` frame, in order.
+fn aggregate_content_events(v: &Value) -> Vec<SessionEvent> {
+    v.pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            let (field, event): (&str, fn(String) -> SessionEvent) =
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => ("text", SessionEvent::TextDelta),
+                    Some("thinking") => ("thinking", SessionEvent::ThinkingDelta),
+                    _ => return None,
+                };
+            block
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| event(text.to_string()))
+        })
+        .collect()
 }
 
 /// The `tool_use_id`s of every `tool_result` block in a `user` frame — the sync
@@ -3080,7 +3507,8 @@ fn parse_assistant(v: &Value) -> Vec<SessionEvent> {
 /// intentionally skipped: with `--include-partial-messages` the text already
 /// arrived as `stream_event` `TextDelta`s, so emitting the final aggregate text
 /// block here would double the reply. Only tool calls (which we read from the
-/// assembled block) are surfaced.
+/// assembled block) are surfaced. The text of a message that did not stream
+/// (Claude's non-streaming retry) is emitted by the session's output gate.
 fn block_to_event(block: &Value) -> Option<SessionEvent> {
     match block.get("type").and_then(Value::as_str) {
         Some("tool_use") => {
@@ -3228,24 +3656,37 @@ fn terminal_reason_status(v: &Value, reason: &str, is_error: bool) -> Option<Tur
 
 /// The human-readable error text off an errored `result` envelope. Prefers the
 /// base's own `result` string (where claude writes the API error, e.g. "API Error:
-/// Request rejected (429) …") so the user sees the REAL cause; falls back to naming
-/// the `subtype` when no message text is present. Never empty → never a silent
-/// failure.
+/// Request rejected (429) …") so the user sees the REAL cause, then its
+/// `errors[]` (where claude writes every other failure, e.g. "No conversation
+/// found with session ID: …"), and finally names the `subtype`. Never empty →
+/// never a silent failure.
 fn result_error_text(v: &Value, subtype: &str) -> String {
-    v.get("result")
+    if let Some(result) = v
+        .get("result")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map_or_else(
-            || {
-                if subtype.is_empty() {
-                    "base error".to_string()
-                } else {
-                    format!("base error ({subtype})")
-                }
-            },
-            str::to_string,
-        )
+    {
+        return result.to_string();
+    }
+    let errors = v
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !errors.is_empty() {
+        return truncate(&errors, 500);
+    }
+    if subtype.is_empty() {
+        "base error".to_string()
+    } else {
+        format!("base error ({subtype})")
+    }
 }
 
 /// Extract the per-turn token usage from a stream-json `result` envelope.
@@ -3731,58 +4172,56 @@ mod tests {
         assert_eq!(out, args);
     }
 
-    /// The permission mode tracks the autonomy tier (claude consistent with
-    /// codex / opencode): autonomous → `bypassPermissions` (full access, never
-    /// interrupts; governance hooks still audit), guarded → `default` (claude
-    /// asks per tool → a NeedApproval the orchestrator answers, so the
-    /// human-in-the-loop / irreversible-action floor is live).
+    /// Guarded and Auto pre-approve only read-only / delegate tools, so every
+    /// mutation raises a `can_use_tool` request that UmaDev's trust floor
+    /// answers — Guarded with the user, Auto with the irreversible-action floor.
     #[test]
-    fn guarded_gates_mutating_tools_but_auto_pre_approves_all() {
+    fn guarded_and_auto_ask_umadev_before_every_mutating_tool() {
         let _lock = PERM_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
         let _no_skip = EnvRestore::remove("UMADEV_NO_SKIP_PERMS");
-        // P1: under GUARDED (autonomous=false) the allowlist pre-approves the read-only +
-        // research + sub-agent set but NOT the MUTATING tools (Edit/Write/Bash/NotebookEdit),
-        // so each mutation still raises a `can_use_tool` control request that UmaDev's trust
-        // floor gates (the guarded gate must not be silently bypassed). The base's native
-        // read/research/delegate tools (incl. Agent/Task sub-agents) ARE pre-approved so they
-        // run natively instead of eating a per-tool pause. AUTO pre-approves the full set.
-        let guarded = session_args("sid", None, false, None);
-        let t = guarded.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(guarded[t + 1], GUARDED_ALLOWED_TOOLS);
-        for mutating in ["Edit", "Write", "Bash", "NotebookEdit"] {
+        // The allowlist pre-approves the read-only + research + sub-agent set but
+        // NOT the MUTATING tools, so each mutation raises a `can_use_tool` request
+        // that UmaDev's trust floor gates. The base's native read/delegate tools
+        // (incl. Agent/Task sub-agents) run natively instead of eating a pause.
+        for autonomous in [false, true] {
+            let args = session_args("sid", None, autonomous, None);
+            let t = args.iter().position(|a| a == "--allowedTools").unwrap();
+            assert_eq!(
+                args[t + 1],
+                GUARDED_ALLOWED_TOOLS,
+                "autonomous={autonomous}"
+            );
+            for mutating in ["Edit", "Write", "MultiEdit", "Bash", "NotebookEdit"] {
+                assert!(
+                    !args[t + 1].split(',').any(|x| x == mutating),
+                    "autonomous={autonomous} must not pre-approve {mutating}: it must reach UmaDev"
+                );
+            }
+            for native in ["Agent", "Task", "Grep", "Glob"] {
+                assert!(
+                    args[t + 1].split(',').any(|x| x == native),
+                    "autonomous={autonomous} must pre-approve the read-only/delegate tool {native}"
+                );
+            }
+            let p = args.iter().position(|a| a == "--permission-mode").unwrap();
+            assert_eq!(args[p + 1], "default", "autonomous={autonomous}");
             assert!(
-                !guarded[t + 1].split(',').any(|x| x == mutating),
-                "guarded must NOT pre-approve the mutating tool {mutating} (it must hit the gate)"
+                !args.iter().any(|a| a == "--dangerously-skip-permissions"),
+                "no session ever skips Claude's permission checks: {args:?}"
             );
         }
-        for native in ["Agent", "Task", "Grep", "Glob"] {
-            assert!(
-                guarded[t + 1].split(',').any(|x| x == native),
-                "guarded must pre-approve the read-only/delegate tool {native} so it runs natively"
-            );
-        }
-        // Plan and Guarded confirm every network reach, so neither pre-approves
-        // a web tool: a fetched URL is an exfiltration channel.
+        // No tier pre-approves a web tool: a fetched URL is an exfiltration
+        // channel, so UmaDev's floor sees every network reach.
         for list in [PLAN_ALLOWED_TOOLS, GUARDED_ALLOWED_TOOLS] {
             for web in ["WebFetch", "WebSearch"] {
                 assert!(
                     !list.split(',').any(|x| x == web),
-                    "{web} must reach the approval gate outside Auto"
+                    "{web} must reach the approval gate"
                 );
             }
-        }
-        let auto = session_args("sid", None, true, None);
-        let t = auto.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(auto[t + 1], AUTO_ALLOWED_TOOLS);
-        // Auto pre-approves the mutating set too (the autonomy tier the user opted into).
-        for tool in ["Edit", "Write", "Bash", "Agent", "Task"] {
-            assert!(
-                auto[t + 1].split(',').any(|x| x == tool),
-                "auto must pre-approve {tool}"
-            );
         }
     }
 
@@ -3801,9 +4240,8 @@ mod tests {
         let auto_idx = auto.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(
             auto[auto_idx + 1],
-            "bypassPermissions",
-            "auto → bypassPermissions (full access — the base itself never prompts; \
-             cross-base parity with codex `approvalPolicy: never` + opencode wildcard-allow)"
+            "default",
+            "auto → default: Claude asks UmaDev, whose floor still stops the irreversible"
         );
 
         let guarded = session_args("sid-g", None, false, None);
@@ -3873,6 +4311,56 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_args_route_permission_prompts_over_stdio() {
+        // Claude sends a permission "ask" to its host only when started with
+        // `--permission-prompt-tool stdio`. Without it `--print` mode denies the
+        // ask itself, so no approval, question or plan confirmation reaches UmaDev.
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _mode = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
+        let _no_skip = EnvRestore::remove("UMADEV_NO_SKIP_PERMS");
+        let routed = |args: &[String]| {
+            args.windows(2)
+                .any(|pair| pair[0] == "--permission-prompt-tool" && pair[1] == "stdio")
+        };
+        for profile in [
+            BasePermissionProfile::Plan,
+            BasePermissionProfile::Guarded,
+            BasePermissionProfile::Auto,
+        ] {
+            let fresh = session_args_for_profile("fresh", None, profile, None, "");
+            assert!(routed(&fresh), "{profile:?} fresh: {fresh:?}");
+            let resumed = resume_session_args_for_profile("resumed", None, profile, None, "");
+            assert!(routed(&resumed), "{profile:?} resume: {resumed:?}");
+        }
+        let fork = fork_session_args("fork");
+        assert!(routed(&fork), "fork: {fork:?}");
+    }
+
+    #[test]
+    fn a_withdrawn_request_settles_only_while_it_is_pending() {
+        let pending: SharedPendingClaudeControls = Arc::default();
+        let request = r#"{"type":"control_request","request_id":"w-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a.txt"}}}"#;
+        let cancel = r#"{"type":"control_cancel_request","request_id":"w-1"}"#;
+        assert_eq!(observe_control_frame(request, &pending), None);
+        assert_eq!(
+            observe_control_frame(cancel, &pending),
+            Some(SessionEvent::HostRequestSettled {
+                req_id: "w-1".to_string(),
+                reason: CLAUDE_CANCELLED_REQUEST.to_string(),
+            }),
+            "Claude withdrew a request UmaDev still has on screen"
+        );
+        assert!(pending.lock().unwrap().get("w-1").is_none());
+        assert_eq!(
+            observe_control_frame(cancel, &pending),
+            None,
+            "a request that is no longer pending settles nothing"
+        );
+    }
+
+    #[test]
     fn session_args_emit_the_selected_model_and_skip_placeholders() {
         // The HIGH audit finding: the continuous (default) claude path silently dropped
         // the user's /model choice. Both the fresh and resume arg builders must now emit
@@ -3921,7 +4409,7 @@ mod tests {
     }
 
     #[test]
-    fn bypass_override_is_confined_to_auto_and_no_skip_tightens_it() {
+    fn no_override_lets_claude_skip_umadev() {
         let _lock = PERM_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3931,53 +4419,41 @@ mod tests {
         for (profile, expected) in [
             (BasePermissionProfile::Plan, "plan"),
             (BasePermissionProfile::Guarded, "default"),
-            (BasePermissionProfile::Auto, "bypassPermissions"),
+            (BasePermissionProfile::Auto, "default"),
         ] {
             let args = session_args_for_profile("sid-b", None, profile, None, "");
             let p = args.iter().position(|a| a == "--permission-mode").unwrap();
             assert_eq!(args[p + 1], expected, "profile {profile:?}: {args:?}");
+            let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
+            assert!(!args[tools + 1].split(',').any(|tool| tool == "Bash"));
         }
-
-        std::env::set_var("UMADEV_NO_SKIP_PERMS", "1");
-        let tightened =
-            session_args_for_profile("sid-t", None, BasePermissionProfile::Auto, None, "");
-        let p = tightened
-            .iter()
-            .position(|a| a == "--permission-mode")
-            .unwrap();
-        assert_eq!(tightened[p + 1], "default");
-        let tools = tightened
-            .iter()
-            .position(|a| a == "--allowedTools")
-            .unwrap();
-        assert_eq!(tightened[tools + 1], GUARDED_ALLOWED_TOOLS);
     }
 
     #[test]
     fn pure_permission_policy_rejects_widening_and_only_tightens_auto() {
         for hostile in ["bypassPermissions", "acceptEdits", "future-root-mode"] {
             assert_eq!(
-                resolve_claude_permission_args(BasePermissionProfile::Plan, Some(hostile), false,),
+                resolve_claude_permission_args(BasePermissionProfile::Plan, Some(hostile)),
                 ("plan", PLAN_ALLOWED_TOOLS)
             );
             assert_eq!(
-                resolve_claude_permission_args(
-                    BasePermissionProfile::Guarded,
-                    Some(hostile),
-                    false,
-                ),
+                resolve_claude_permission_args(BasePermissionProfile::Guarded, Some(hostile)),
                 ("default", GUARDED_ALLOWED_TOOLS)
             );
         }
 
+        // Auto's native pair asks UmaDev before every mutation. An override can
+        // only pick a posture in which Claude never approves on its own:
+        // `bypassPermissions`, `acceptEdits` (which runs `rm`/`mv`/`cp` in the
+        // workspace unasked) and Claude's own classifier `auto` keep the native pair.
         for (override_mode, expected) in [
-            (None, ("bypassPermissions", AUTO_ALLOWED_TOOLS)),
+            (None, ("default", GUARDED_ALLOWED_TOOLS)),
             (
                 Some("bypassPermissions"),
-                ("bypassPermissions", AUTO_ALLOWED_TOOLS),
+                ("default", GUARDED_ALLOWED_TOOLS),
             ),
-            (Some("auto"), ("auto", GUARDED_ALLOWED_TOOLS)),
-            (Some("acceptEdits"), ("acceptEdits", GUARDED_ALLOWED_TOOLS)),
+            (Some("acceptEdits"), ("default", GUARDED_ALLOWED_TOOLS)),
+            (Some("auto"), ("default", GUARDED_ALLOWED_TOOLS)),
             (Some("default"), ("default", GUARDED_ALLOWED_TOOLS)),
             (Some("manual"), ("manual", GUARDED_ALLOWED_TOOLS)),
             (Some("dontAsk"), ("dontAsk", GUARDED_ALLOWED_TOOLS)),
@@ -3985,23 +4461,11 @@ mod tests {
             (Some("unknown"), ("default", GUARDED_ALLOWED_TOOLS)),
         ] {
             assert_eq!(
-                resolve_claude_permission_args(BasePermissionProfile::Auto, override_mode, false,),
-                expected
+                resolve_claude_permission_args(BasePermissionProfile::Auto, override_mode),
+                expected,
+                "override {override_mode:?}"
             );
         }
-        assert_eq!(
-            resolve_claude_permission_args(
-                BasePermissionProfile::Auto,
-                Some("bypassPermissions"),
-                true,
-            ),
-            ("default", GUARDED_ALLOWED_TOOLS)
-        );
-        assert_eq!(
-            resolve_claude_permission_args(BasePermissionProfile::Auto, Some("auto"), true),
-            ("auto", GUARDED_ALLOWED_TOOLS),
-            "official classifier-backed auto is not raw bypass and remains available under no-skip"
-        );
     }
 
     #[test]
@@ -4114,16 +4578,13 @@ mod tests {
             !args.contains(&"--session-id".to_string()),
             "a writable resume continues the existing id, never mints a new one"
         );
-        // Writable toolset (Write/Edit), NOT the read-only fork allowlist.
+        // The same allowlist as a fresh Auto start, NOT the read-only fork one:
+        // writes go through UmaDev's approval, not a plan-mode refusal.
         let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(args[tools + 1], AUTO_ALLOWED_TOOLS);
+        assert_eq!(args[tools + 1], GUARDED_ALLOWED_TOOLS);
         // Permission mode tracks autonomy exactly like a fresh start.
         let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
-        assert_eq!(
-            args[perm + 1],
-            "bypassPermissions",
-            "autonomous → bypassPermissions"
-        );
+        assert_eq!(args[perm + 1], "default", "autonomous → default");
         // Streams partial messages so a resumed reply renders token-by-token.
         assert!(args.iter().any(|a| a == "--include-partial-messages"));
         assert!(args.iter().any(|a| a == "--replay-user-messages"));
@@ -5624,6 +6085,130 @@ mod tests {
         );
     }
 
+    /// Claude 2.1.42 after a mid-stream API error (captured live): one
+    /// streamed delta of the failed attempt, then the non-streaming retry's
+    /// answer only as an aggregate `assistant` frame of another message id.
+    const NON_STREAMING_FALLBACK_FRAMES: [&str; 5] = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"46b81cea-3678-49b7-9063-679837bad49f","parent_tool_use_id":null,"uuid":"f89ea73a-42bd-40ba-a1ca-3d803f07c11b"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"46b81cea-3678-49b7-9063-679837bad49f","parent_tool_use_id":null,"uuid":"8674c29c-4a5c-45a5-9389-5d499abf2c5b"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PARTIAL "}},"session_id":"46b81cea-3678-49b7-9063-679837bad49f","parent_tool_use_id":null,"uuid":"314c0447-8765-4c15-ac11-311df8b8b882"}"#,
+        r#"{"type":"assistant","message":{"id":"msg_ns","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"FULL ANSWER FROM NON-STREAMING FALLBACK"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5},"context_management":null},"parent_tool_use_id":null,"session_id":"46b81cea-3678-49b7-9063-679837bad49f","uuid":"55ce058f-d8f2-4550-b49a-21f81b827e16"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":120,"duration_api_ms":61,"num_turns":1,"result":"FULL ANSWER FROM NON-STREAMING FALLBACK","stop_reason":"end_turn","session_id":"46b81cea-3678-49b7-9063-679837bad49f","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"4b773f7b-5c92-467b-9d53-e02232195a82"}"#,
+    ];
+
+    /// The same fallback from Claude 2.1.284 (captured live).
+    const NON_STREAMING_FALLBACK_FRAMES_2_1_284: [&str; 5] = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1_325bf4","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","parent_tool_use_id":null,"uuid":"e7308800-5f0c-4c97-92c3-1d6c0652b52c","ttft_ms":20,"user_message_uuid":"c1c2f519-7857-4b05-9cff-fe6633d2cf9f","user_message_uuids":["c1c2f519-7857-4b05-9cff-fe6633d2cf9f"]}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","parent_tool_use_id":null,"uuid":"ea0e4218-573c-41fd-9b82-f4863eb9851e"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PARTIAL "}},"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","parent_tool_use_id":null,"uuid":"1385c1e7-9533-405f-9e3a-a29299c7d9b7"}"#,
+        r#"{"type":"assistant","message":{"id":"msg_ns","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"FULL ANSWER FROM NON-STREAMING FALLBACK"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"context_management":null},"parent_tool_use_id":null,"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","uuid":"493635ca-f301-477f-acb9-70087606abe9","timestamp":"2026-09-29T11:44:48.633Z","user_message_uuid":"c1c2f519-7857-4b05-9cff-fe6633d2cf9f","user_message_uuids":["c1c2f519-7857-4b05-9cff-fe6633d2cf9f"]}"#,
+        r#"{"duration_api_ms":130,"stop_reason":"end_turn","session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","total_cost_usd":0.00014000000000000001,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-sonnet-4-5-20250929[1m]":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.00014000000000000001,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"canonicalModel":"claude-sonnet-4-5-20250929","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"FULL ANSWER FROM NON-STREAMING FALLBACK","ttft_ms":201,"type":"result","duration_ms":243,"uuid":"9b682d58-3c09-46d5-b63a-4051af5314d2","ttft_stream_ms":133,"time_to_request_ms":114,"first_content_frame_ms":134,"user_message_uuid":"c1c2f519-7857-4b05-9cff-fe6633d2cf9f","user_message_uuids":["c1c2f519-7857-4b05-9cff-fe6633d2cf9f"],"request_sent_wall_ms":1790682288546,"queued_turn_count":0,"result_index":0}"#,
+    ];
+
+    /// A normally streamed Claude 2.1.42 turn (captured live): the aggregate
+    /// `assistant` frame repeats text its deltas already carried.
+    const STREAMED_TURN_FRAMES: [&str; 8] = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"eaf898ed-8c5a-4e99-b110-1130d5dd5a79"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"281d16aa-231a-49b1-85fe-ea49c87be4eb"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"part0 (call 2) "}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"5e46081f-c6d8-4e76-a4f6-f726593b77de"}"#,
+        r#"{"type":"assistant","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"part0 (call 2) "}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1},"context_management":null},"parent_tool_use_id":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","uuid":"8c0e90f4-faaa-4059-beab-7a78ba4ada68"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"05ceb62c-4ac5-4fe3-b312-9a77b188da39"}"#,
+        r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"517e84f1-d95f-497a-b94a-d3bd7a5792fa"}"#,
+        r#"{"type":"stream_event","event":{"type":"message_stop"},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"c5f42204-2a98-4adc-8d77-ddbce72460a7"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":20,"duration_api_ms":9,"num_turns":1,"result":"part0 (call 2) ","stop_reason":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","total_cost_usd":0.00009999999999999999,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":2,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-sonnet-4-5-20250929":{"inputTokens":10,"outputTokens":2,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.00009999999999999999,"contextWindow":200000,"maxOutputTokens":32000}},"permission_denials":[],"uuid":"fd2b8ec1-ca01-4bfe-bf1e-391829f31277"}"#,
+    ];
+
+    /// Claude 2.1.42 on a 429 (captured live): a synthetic `assistant` message
+    /// carrying the error text, then the error result.
+    const SYNTHETIC_API_ERROR_FRAMES: [&str; 2] = [
+        r#"{"type":"assistant","message":{"id":"f963d6e6-fdbf-4603-8949-81b6fedabdf2","container":null,"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}"}],"context_management":null},"parent_tool_use_id":null,"session_id":"f8d4626b-a0b3-4729-a522-b1592b723e58","uuid":"323df042-c949-4eb1-8c92-006242d272be","error":"unknown"}"#,
+        r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":117,"duration_api_ms":0,"num_turns":1,"result":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}","stop_reason":"stop_sequence","session_id":"f8d4626b-a0b3-4729-a522-b1592b723e58","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"38b0d228-9918-465b-87c2-56a38ef03054"}"#,
+    ];
+
+    /// The same failure from Claude 2.1.284 after its retries (captured live).
+    const SYNTHETIC_API_ERROR_FRAMES_2_1_284: [&str; 2] = [
+        r#"{"type":"assistant","message":{"diagnostics":null,"id":"590dc3a4-889b-4119-ace4-068950009f36","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"output_tokens_details":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota"}],"context_management":null},"parent_tool_use_id":null,"session_id":"d2500074-829c-4808-a9b1-24f30e77dd79","uuid":"5366cabe-6726-4119-be48-344b75937912","timestamp":"2026-09-29T11:19:45.507Z","error":"rate_limit","is_api_error_message":true}"#,
+        r#"{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"d2500074-829c-4808-a9b1-24f30e77dd79","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","api_error_status":429,"result":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota","type":"result","duration_ms":182057,"uuid":"31217b3b-7176-4bd1-85f8-fcc98de58228","queued_turn_count":0,"result_index":0}"#,
+    ];
+
+    fn gate_events(frames: &[&str]) -> Vec<SessionEvent> {
+        let mut gate = SubagentOutputGate::default();
+        frames
+            .iter()
+            .flat_map(|frame| gate.on_line(frame))
+            .collect()
+    }
+
+    #[test]
+    fn non_streamed_fallback_answer_is_rendered() {
+        for frames in [
+            NON_STREAMING_FALLBACK_FRAMES,
+            NON_STREAMING_FALLBACK_FRAMES_2_1_284,
+        ] {
+            let events = gate_events(&frames);
+            let answer = events.iter().position(|event| {
+                matches!(event, SessionEvent::TextDelta(text)
+                    if text.contains("FULL ANSWER FROM NON-STREAMING FALLBACK"))
+            });
+            let done = events.iter().position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::TurnDone {
+                        status: TurnStatus::Completed,
+                        ..
+                    }
+                )
+            });
+            assert!(
+                matches!((answer, done), (Some(answer), Some(done)) if answer < done),
+                "the non-streamed answer must reach the user before the turn ends: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_text_is_not_repeated_from_its_aggregate_frame() {
+        let text: Vec<SessionEvent> = gate_events(&STREAMED_TURN_FRAMES)
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::TextDelta(_)))
+            .collect();
+        assert_eq!(
+            text,
+            vec![SessionEvent::TextDelta("part0 (call 2) ".to_string())]
+        );
+        // Deltas whose `message_start` was not seen still belong to the next
+        // aggregate frame: its text is not repeated either.
+        let text: Vec<SessionEvent> = gate_events(&STREAMED_TURN_FRAMES[1..])
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::TextDelta(_)))
+            .collect();
+        assert_eq!(
+            text,
+            vec![SessionEvent::TextDelta("part0 (call 2) ".to_string())]
+        );
+    }
+
+    #[test]
+    fn synthetic_api_error_message_is_not_rendered_as_the_answer() {
+        for frames in [
+            SYNTHETIC_API_ERROR_FRAMES,
+            SYNTHETIC_API_ERROR_FRAMES_2_1_284,
+        ] {
+            let events = gate_events(&frames);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, SessionEvent::TextDelta(_))),
+                "{events:?}"
+            );
+            assert!(matches!(
+                events.last(),
+                Some(SessionEvent::TurnDone { status: TurnStatus::Failed(reason), .. })
+                    if reason.contains("API Error") && reason.contains("429")
+            ));
+        }
+    }
+
     #[test]
     fn grouper_yields_identical_events_for_main_line_frames() {
         // The pump routes every line through the grouper; for MAIN-line frames it
@@ -5900,6 +6485,317 @@ cat >/dev/null
         let _ = session.end().await;
     }
 
+    /// Claude 2.1.42's frames for an interrupted turn, captured live: the
+    /// interruption marker, then an `error_during_execution` result that
+    /// arrives milliseconds AFTER the interrupt's control_response.
+    #[cfg(unix)]
+    const INTERRUPTED_USER_FRAME: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","uuid":"25f58a8d-9051-4aaa-bbb1-d441d5ebbfb9"}"#;
+    #[cfg(unix)]
+    const INTERRUPTED_RESULT_FRAME: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":1855,"duration_api_ms":0,"is_error":false,"num_turns":2,"stop_reason":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"41942427-d2f8-4de9-8bec-22088352e641","errors":[]}"#;
+
+    /// Claude 2.1.284's frames after a typed interrupt receipt that lists no
+    /// queued command (captured live): the started turn's aborted aggregate,
+    /// the interruption marker, and its `aborted_streaming` result about 80 ms
+    /// after the receipt.
+    #[cfg(unix)]
+    const RECEIPT_MESSAGE_START_FRAME: &str = r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1_5ef852","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","parent_tool_use_id":null,"uuid":"43c0ac3c-4d2e-4ed6-b4a9-b357d1630e7f","ttft_ms":8,"user_message_uuid":"ebc6a384-64ce-4531-b1d1-47ac09181cac","user_message_uuids":["ebc6a384-64ce-4531-b1d1-47ac09181cac"]}"#;
+    #[cfg(unix)]
+    const RECEIPT_ABORTED_ASSISTANT_FRAME: &str = r#"{"type":"assistant","message":{"id":"msg_1_5ef852","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"slow0 "}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1},"context_management":null},"parent_tool_use_id":null,"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","uuid":"01d29d90-dd3b-4776-8d6e-8ce73a3c71cd","timestamp":"2026-09-29T11:28:48.291Z","aborted":true,"user_message_uuid":"ebc6a384-64ce-4531-b1d1-47ac09181cac","user_message_uuids":["ebc6a384-64ce-4531-b1d1-47ac09181cac"]}"#;
+    #[cfg(unix)]
+    const RECEIPT_INTERRUPTED_USER_FRAME: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","uuid":"67473f30-aba4-45d5-bddd-0995f51f1564","timestamp":"2026-09-29T11:28:48.326Z"}"#;
+    #[cfg(unix)]
+    const RECEIPT_INTERRUPTED_RESULT_FRAME: &str = r#"{"duration_api_ms":0,"stop_reason":null,"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"terminal_reason":"aborted_streaming","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":2,"subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"user_message_uuid":"ebc6a384-64ce-4531-b1d1-47ac09181cac","type":"result","duration_ms":166,"uuid":"540bb414-f47a-4dd3-bbd3-8e8810c8b9a4","user_message_uuids":["ebc6a384-64ce-4531-b1d1-47ac09181cac"],"queued_turn_count":0,"result_index":0}"#;
+
+    /// Read events until the first `TurnDone`, bounded so a regression fails
+    /// instead of hanging the suite.
+    #[cfg(unix)]
+    async fn first_terminal(session: &mut ClaudeSession) -> SessionEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let done @ SessionEvent::TurnDone { .. } =
+                    session.next_event().await.expect("the turn's events")
+                {
+                    break done;
+                }
+            }
+        })
+        .await
+        .expect("a terminal event")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_consumes_aborted_turn_terminal_before_next_turn() {
+        let tmp = tempfile_dir();
+        let body = format!(
+            "#!/bin/sh\n\
+             IFS= read -r _turn_a\n\
+             printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"working on A\"}}}}}}'\n\
+             IFS= read -r _interrupt\n\
+             printf '%s\\n' '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"ack\"}}}}'\n\
+             sleep 0.2\n\
+             printf '%s\\n' '{INTERRUPTED_USER_FRAME}'\n\
+             printf '%s\\n' '{INTERRUPTED_RESULT_FRAME}'\n\
+             IFS= read -r _turn_b\n\
+             printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"B done\"}}'\n\
+             cat >/dev/null\n"
+        );
+        let fake = write_fake_claude(&tmp, &body);
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-interrupt-settle",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("A".to_string()).await.expect("send A");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("working on A".to_string()))
+        );
+        session
+            .interrupt()
+            .await
+            .expect("the interrupted turn settles");
+
+        session.send_turn("B".to_string()).await.expect("send B");
+        let first_terminal = first_terminal(&mut session).await;
+        assert!(
+            matches!(
+                first_terminal,
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    ..
+                }
+            ),
+            "B must not end with A's aborted terminal: {first_terminal:?}"
+        );
+
+        // Nothing is in flight now, so a further interrupt does not wait.
+        let started = tokio::time::Instant::now();
+        session.interrupt().await.expect("idle interrupt");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn typed_interrupt_receipt_still_settles_a_started_turn() {
+        // A receipt that lists no queued command means the turn had started:
+        // its aborted terminal follows the receipt and must not end turn B.
+        let tmp = tempfile_dir();
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' '{{"type":"system","subtype":"init","model":"fixture","capabilities":["interrupt_receipt_v1"]}}'
+IFS= read -r _turn_a
+printf '%s\n' '{RECEIPT_MESSAGE_START_FRAME}'
+printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"slow0 "}}}}}}'
+IFS= read -r interrupt_line
+request_id=$(printf '%s\n' "$interrupt_line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"still_queued":[]}}}}}}\n' "$request_id"
+sleep 0.1
+printf '%s\n' '{RECEIPT_ABORTED_ASSISTANT_FRAME}'
+printf '%s\n' '{RECEIPT_INTERRUPTED_USER_FRAME}'
+printf '%s\n' '{RECEIPT_INTERRUPTED_RESULT_FRAME}'
+IFS= read -r _turn_b
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"B done","terminal_reason":"completed"}}'
+cat >/dev/null
+"#
+        );
+        let fake = write_fake_claude(&tmp, &body);
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-receipt-settle",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), session.next_event())
+                .await
+                .expect("init frame observed"),
+            Some(SessionEvent::SessionModel(_))
+        ));
+        session.send_turn("A".to_string()).await.expect("send A");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("slow0 ".to_string()))
+        );
+        session
+            .interrupt()
+            .await
+            .expect("the started turn settles after the receipt");
+
+        session.send_turn("B".to_string()).await.expect("send B");
+        let first_terminal = first_terminal(&mut session).await;
+        assert!(
+            matches!(
+                first_terminal,
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    ..
+                }
+            ),
+            "B must not end with A's aborted terminal: {first_terminal:?}"
+        );
+        let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_reports_a_turn_that_never_ends_as_pending() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nIFS= read -r _turn\nIFS= read -r _interrupt\n\
+             printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"ack\"}}'\n\
+             cat >/dev/null\n",
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-interrupt-pending",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("hang".to_string()).await.expect("send");
+        let error = session.interrupt().await.unwrap_err();
+        assert!(
+            matches!(error, SessionError::InterruptPending(_)),
+            "an unsettled turn must not be reported as terminal: {error:?}"
+        );
+        let _ = session.end().await;
+    }
+
+    /// Claude 2.1.42 resuming an id it cannot find (captured live): the only
+    /// diagnostic, printed at startup before any input, then exit 1.
+    const STALE_RESUME_RESULT: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"48eca61a-ad11-4418-9c6f-f827d9f53490","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"1d8aacb4-5c38-4270-9882-2bcc4084b3ac","errors":["No conversation found with session ID: bfadf6d3-65ac-49d5-b0a3-31f5ce7e53e3"]}"#;
+    /// The same failure from Claude 2.1.284 (captured live).
+    const STALE_RESUME_RESULT_2_1_284: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"8896fa3b-5b67-451a-9364-456c92f1b98a","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"55f65831-0d0d-4832-8aac-fcc770436664","errors":["No conversation found with session ID: 8896fa3b-5b67-451a-9364-456c92f1b98a"],"result_index":0}"#;
+
+    #[test]
+    fn stale_resume_error_text_reaches_turn_failure() {
+        for frame in [STALE_RESUME_RESULT, STALE_RESUME_RESULT_2_1_284] {
+            let events = parse_stdout_line(frame);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [SessionEvent::TurnDone { status: TurnStatus::Failed(reason), .. }]
+                        if reason.contains("No conversation found with session ID")
+                ),
+                "Claude's errors[] must name the failure: {events:?}"
+            );
+        }
+        // Without result text or errors the subtype still names the failure.
+        assert_eq!(
+            result_error_text(
+                &serde_json::json!({"subtype":"error_during_execution","errors":[]}),
+                "error_during_execution"
+            ),
+            "base error (error_during_execution)"
+        );
+    }
+
+    /// Resume against a fake, bounded so a regression fails instead of hanging.
+    #[cfg(unix)]
+    async fn resume_fake(
+        fake: &std::path::Path,
+        workspace: &std::path::Path,
+        session_id: &str,
+    ) -> Result<ClaudeSession, SessionError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ClaudeSession::resume_with_program(
+                fake.to_str().unwrap(),
+                workspace,
+                None,
+                session_id,
+                BasePermissionProfile::Guarded,
+                None,
+                "",
+            ),
+        )
+        .await
+        .expect("resume returns in time")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_of_missing_conversation_is_a_start_error() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{STALE_RESUME_RESULT}'\nexit 1\n"),
+        );
+        let outcome = resume_fake(&fake, &tmp, "bfadf6d3-65ac-49d5-b0a3-31f5ce7e53e3").await;
+        let Err(SessionError::Start(reason)) = outcome else {
+            panic!("a missing conversation must fail the resume itself");
+        };
+        assert!(
+            reason.contains("No conversation found with session ID"),
+            "the caller learns why: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_that_exits_without_a_result_reports_its_stderr() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\necho 'Error: the configured model is not available' 1>&2\nexit 1\n",
+        );
+        let outcome = resume_fake(&fake, &tmp, "11111111-2222-4333-8444-555555555555").await;
+        let Err(SessionError::Start(reason)) = outcome else {
+            panic!("a base that exits at startup must fail the resume itself");
+        };
+        assert!(
+            reason.contains("the configured model is not available"),
+            "the caller learns why: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_of_a_live_conversation_is_confirmed_then_usable() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            r#"#!/bin/sh
+IFS= read -r probe
+request_id=$(printf '%s\n' "$probe" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mcpServers":[]}}}\n' "$request_id"
+IFS= read -r _turn
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"resumed"}'
+cat >/dev/null
+"#,
+        );
+        let mut session = resume_fake(&fake, &tmp, "11111111-2222-4333-8444-555555555555")
+            .await
+            .expect("a live conversation resumes");
+        session
+            .send_turn("continue".to_string())
+            .await
+            .expect("send");
+        assert!(matches!(
+            first_terminal(&mut session).await,
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ));
+        let _ = session.end().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn legacy_send_correlates_replay_without_blocking_or_leaking() {
@@ -5995,6 +6891,74 @@ cat >/dev/null
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn send_input_does_not_block_on_late_replay() {
+        // Claude 2.1.42 streams its first delta at once but replays the input
+        // only after the first whole content block, often seconds later.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            r#"#!/bin/sh
+IFS= read -r line
+uuid=$(printf '%s\n' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}},"parent_tool_use_id":null}'
+sleep 3
+printf '{"type":"user","uuid":"%s","session_id":"s","message":{"role":"user","content":"late"},"parent_tool_use_id":null,"isReplay":true}\n' "$uuid"
+printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
+cat >/dev/null
+"#,
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-late-replay",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        let started = tokio::time::Instant::now();
+        let report = session
+            .send_input(TurnInput::text("hello"))
+            .await
+            .expect("send");
+        assert!(
+            started.elapsed() < REPLAY_ACK_BUDGET,
+            "the send waited for a replay while output was already streaming: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.receipt, DeliveryReceiptStage::TransportWritten);
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("first".to_string()))
+        );
+        let _ = session.end().await;
+    }
+
+    #[test]
+    fn only_a_main_line_turn_frame_counts_as_turn_activity() {
+        for frame in [
+            r#"{"type":"stream_event","event":{"type":"message_start"},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool"}}"#,
+        ] {
+            let frame: Value = serde_json::from_str(frame).unwrap();
+            assert!(frame_marks_turn_activity(&frame), "{frame}");
+        }
+        for frame in [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"command_lifecycle","state":"queued"}"#,
+            r#"{"type":"control_response","response":{"subtype":"success"}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start"},"parent_tool_use_id":"toolu_bg"}"#,
+        ] {
+            let frame: Value = serde_json::from_str(frame).unwrap();
+            assert!(!frame_marks_turn_activity(&frame), "{frame}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn stream_eof_wakes_replay_waiter_and_keeps_receipt_honest() {
         let tmp = tempfile_dir();
         let fake = write_fake_claude(&tmp, "#!/bin/sh\nIFS= read -r _line\nexit 7\n");
@@ -6066,7 +7030,8 @@ cat >/dev/null
         session.end().await.expect("bounded end");
         assert!(!session.stderr_drain.is_active());
         assert!(
-            started.elapsed() < END_REAP_BUDGET + std::time::Duration::from_secs(1),
+            started.elapsed()
+                < CLAUDE_EOF_GRACE + END_REAP_BUDGET + std::time::Duration::from_secs(1),
             "end must not wait for the inherited stderr writer"
         );
 
@@ -6153,6 +7118,82 @@ cat >/dev/null
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn plan_profile_session_denies_ordinary_tool_requests_itself() {
+        // With the stdio permission channel Claude's `plan` mode ASKS the host
+        // before a write instead of refusing it. A Plan-profile session must stay
+        // read-only whatever its caller decides: an ordinary tool request is
+        // denied inside the session, while a question still reaches UmaDev.
+        let tmp = tempfile_dir();
+        let capture = tmp.join("write-response.json");
+        let body = format!(
+            "#!/bin/sh\n\
+             IFS= read -r _turn\n\
+             printf '%s\\n' '{{\"type\":\"control_request\",\"request_id\":\"q-1\",\"request\":{{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\",\"input\":{{\"questions\":[{{\"header\":\"DB\",\"question\":\"Which database?\",\"multiSelect\":false,\"options\":[{{\"label\":\"Postgres\",\"description\":\"SQL\"}}]}}]}}}}}}'\n\
+             IFS= read -r _answer\n\
+             printf '%s\\n' '{{\"type\":\"control_request\",\"request_id\":\"w-1\",\"request\":{{\"subtype\":\"can_use_tool\",\"tool_name\":\"Write\",\"input\":{{\"file_path\":\"a.txt\",\"content\":\"x\"}}}}}}'\n\
+             IFS= read -r response\n\
+             printf '%s\\n' \"$response\" > '{}'\n\
+             printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}}'\n\
+             cat >/dev/null\n",
+            capture.display()
+        );
+        let fake = write_fake_claude(&tmp, &body);
+        let args =
+            session_args_for_profile("sid-plan", None, BasePermissionProfile::Plan, None, "");
+        let mut session =
+            ClaudeSession::spawn_with_args(fake.to_str().unwrap(), &tmp, &args, "sid-plan")
+                .await
+                .expect("start");
+        session
+            .send_turn("look around".to_string())
+            .await
+            .expect("send");
+
+        let mut surfaced = Vec::new();
+        while let Some(event) = session.next_event().await {
+            match event {
+                SessionEvent::HostRequest { req_id, .. } => {
+                    surfaced.push(req_id.clone());
+                    session
+                        .respond_host(
+                            &req_id,
+                            HostResponse::UserInput {
+                                answers: vec![HostAnswer {
+                                    question_id: "claude-question-1".to_string(),
+                                    values: vec!["Postgres".to_string()],
+                                }],
+                            },
+                        )
+                        .await
+                        .expect("answer the question");
+                }
+                SessionEvent::NeedApproval { req_id, .. } => {
+                    surfaced.push(req_id.clone());
+                    // A caller that allows must still not unlock a Plan session.
+                    session
+                        .respond(&req_id, ApprovalDecision::Allow)
+                        .await
+                        .expect("respond");
+                }
+                SessionEvent::TurnDone { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            surfaced,
+            vec!["q-1".to_string()],
+            "only the question surfaces"
+        );
+        let response: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).expect("captured response"))
+                .expect("response JSON");
+        assert_eq!(response["response"]["request_id"], "w-1");
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
+        let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn session_groups_subagent_stream_into_one_block() {
         // End-to-end through the REAL pump: a sub-agent's streamed frames must
         // arrive as ONE grouped block (working row → header → compacted result)
@@ -6221,6 +7262,266 @@ cat >/dev/null
         );
         assert!(matches!(got.last(), Some(SessionEvent::TurnDone { .. })));
         let _ = s.end().await;
+    }
+
+    /// A fake Claude that answers one turn, then, like Claude 2.1.42, writes its
+    /// transcript a moment after its input ends and exits. `extra` runs first.
+    #[cfg(unix)]
+    fn fake_claude_writing_transcript_at_exit(
+        tmp: &std::path::Path,
+        extra: &str,
+    ) -> std::path::PathBuf {
+        write_fake_claude(
+            tmp,
+            &format!(
+                "#!/bin/sh\n{extra}\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{input}'; done\n\
+                 sleep 0.3\n\
+                 echo flushed > '{transcript}'\n",
+                input = tmp.join("input-after-turn.log").display(),
+                transcript = tmp.join("transcript.jsonl").display(),
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(what: &str, budget: std::time::Duration, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + budget;
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_lets_claude_write_its_transcript_before_the_tree_dies() {
+        // Claude 2.1.42 writes its transcript up to half a second after a turn's
+        // result. Killing it at once lost the conversation, so `--resume` of that
+        // session later found nothing.
+        let tmp = tempfile_dir();
+        let fake = fake_claude_writing_transcript_at_exit(&tmp, "");
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-eof",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("one".to_string()).await.expect("send");
+        assert!(matches!(
+            first_terminal(&mut session).await,
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ));
+        session.end().await.expect("end");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("transcript.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("flushed\n"),
+            "end() killed Claude before it wrote its transcript"
+        );
+        assert!(session.try_exit_status().is_some(), "end() reaps the child");
+        // The turn had ended, so nothing but end of input was sent.
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("input-after-turn.log")).unwrap_or_default(),
+            ""
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_stops_a_running_turn_before_closing_input() {
+        let tmp = tempfile_dir();
+        let log = tmp.join("input-after-turn.log");
+        let fake = write_fake_claude(
+            &tmp,
+            &format!(
+                "#!/bin/sh\n\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"working\"}}}}}}'\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+                log.display()
+            ),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-eof-turn",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("long".to_string()).await.expect("send");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("working".to_string()))
+        );
+        let started = tokio::time::Instant::now();
+        session.end().await.expect("end");
+        assert!(
+            started.elapsed() < CLAUDE_EOF_GRACE,
+            "a Claude that exits at end of input is not waited out: {:?}",
+            started.elapsed()
+        );
+        let sent: Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .expect("input after the turn")
+                .lines()
+                .next()
+                .expect("one line"),
+        )
+        .expect("JSON");
+        assert_eq!(sent["request"]["subtype"], "interrupt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_lets_claude_finish_then_reaps_it() {
+        let tmp = tempfile_dir();
+        let pid_file = tmp.join("claude.pid");
+        let fake = fake_claude_writing_transcript_at_exit(
+            &tmp,
+            &format!("echo $$ > '{}'\n", pid_file.display()),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-drop",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("one".to_string()).await.expect("send");
+        let _ = first_terminal(&mut session).await;
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("pid number");
+
+        let started = std::time::Instant::now();
+        drop(session);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "dropping a session must not block its caller"
+        );
+        let transcript = tmp.join("transcript.jsonl");
+        wait_until(
+            "a dropped session killed Claude before it wrote its transcript",
+            std::time::Duration::from_secs(10),
+            || transcript.exists(),
+        )
+        .await;
+        wait_until(
+            "a dropped session left its Claude process behind",
+            std::time::Duration::from_secs(10),
+            || !process_alive(pid),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_mid_turn_stops_claude_at_once() {
+        // The caller abandoned the turn. At end of input Claude would go on
+        // running it, so it gets no grace: nothing it does lands afterwards.
+        let tmp = tempfile_dir();
+        let late = tmp.join("late-write");
+        let fake = write_fake_claude(
+            &tmp,
+            &format!(
+                "#!/bin/sh\n\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"working\"}}}}}}'\n\
+                 while IFS= read -r _line; do :; done\n\
+                 sleep 0.5\n\
+                 echo late > '{}'\n",
+                late.display()
+            ),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-drop-turn",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("long".to_string()).await.expect("send");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("working".to_string()))
+        );
+        drop(session);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !late.exists(),
+            "a session dropped mid-turn let Claude keep running that turn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_still_kills_a_claude_that_ignores_end_of_input() {
+        let tmp = tempfile_dir();
+        let pids = tmp.join("pids");
+        let fake = write_fake_claude(
+            &tmp,
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho \"$$ $!\" > '{}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"fixture\"}}'\n\
+                 sleep 30\n",
+                pids.display()
+            ),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-drop-deaf",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        assert!(matches!(
+            session.next_event().await,
+            Some(SessionEvent::SessionModel(_))
+        ));
+        let pids: Vec<i32> = std::fs::read_to_string(&pids)
+            .expect("pids")
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("pid"))
+            .collect();
+        drop(session);
+        for pid in pids {
+            wait_until(
+                "the process tree outlived the EOF grace",
+                CLAUDE_EOF_GRACE + END_REAP_BUDGET + std::time::Duration::from_secs(5),
+                || !process_alive(pid),
+            )
+            .await;
+        }
     }
 
     #[cfg(unix)]
@@ -6328,6 +7629,44 @@ cat >/dev/null
         assert!(
             tail.contains("gpt-bogus is not available"),
             "the captured tail must carry the base's idle reason: {tail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_after_early_exit_reports_stderr_reason() {
+        // Claude refusing a flag at startup (e.g. the bypass flag as root) prints
+        // its reason on stderr and exits before the first turn is sent.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\necho 'fatal: X cannot be used here' 1>&2\nexit 1\n",
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-early-exit",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while session.try_exit_status().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let error = session
+            .send_turn("hello".to_string())
+            .await
+            .expect_err("the base already exited");
+        let SessionError::Send(message) = error else {
+            panic!("expected a send error, got {error:?}");
+        };
+        assert!(
+            message.contains("ended before send")
+                && message.contains("fatal: X cannot be used here"),
+            "the base's own reason must reach the user: {message}"
         );
     }
 

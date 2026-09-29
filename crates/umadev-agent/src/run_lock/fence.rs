@@ -306,6 +306,15 @@ fn unsafe_legacy_migration_error(path: &Path) -> io::Error {
 }
 
 pub(super) fn ensure_v2_fence(path: &Path) -> io::Result<()> {
+    ensure_v2_fence_with(path, write_new_fence)
+}
+
+/// [`ensure_v2_fence`] with the first write of a new fence supplied by the
+/// caller, so a failed write can be exercised.
+pub(super) fn ensure_v2_fence_with(
+    path: &Path,
+    write_new: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     match umadev_state::fs::read_bounded(path, 4 * 1024) {
         Ok(bytes) if bytes == V2_FENCE => return Ok(()),
         Ok(_) => return Err(legacy_fence_error(path)),
@@ -330,12 +339,18 @@ pub(super) fn ensure_v2_fence(path: &Path) -> io::Result<()> {
     }
     match umadev_state::fs::retry_transient(|| options.open(path)) {
         Ok(mut file) => {
-            use std::io::Write;
-            // A partial fence is intentionally left fail-closed after a crash;
-            // doctor/manual migration may repair it, but no later run guesses.
-            file.write_all(V2_FENCE)?;
-            file.flush()?;
-            file.sync_all()?;
+            if let Err(error) = write_new(&mut file) {
+                // A full disk or quota must not leave an empty or partial fence:
+                // every later run would refuse it, and doctor cannot tell an
+                // empty file from an old client still writing its row. This
+                // call created the file and still holds both kernel guards, so
+                // no other v2 client has seen it; take it back. A crash in this
+                // window still leaves the fence fail-closed for doctor.
+                let created = file.metadata().ok();
+                drop(file);
+                remove_created_fence(path, created.as_ref());
+                return Err(error);
+            }
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let bytes = umadev_state::fs::read_bounded(path, 4 * 1024)
@@ -347,6 +362,26 @@ pub(super) fn ensure_v2_fence(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+fn write_new_fence(file: &mut std::fs::File) -> io::Result<()> {
+    use std::io::Write;
+    file.write_all(V2_FENCE)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+/// Remove the fence this call created after its first write failed, but only
+/// while the path still names that same regular file.
+fn remove_created_fence(path: &Path, created: Option<&std::fs::Metadata>) {
+    let Some(created) = created else {
+        return;
+    };
+    let still_ours = std::fs::symlink_metadata(path)
+        .is_ok_and(|current| current.is_file() && same_file_identity(created, &current));
+    if still_ours {
+        let _ = umadev_state::fs::remove_regular_file(path);
+    }
 }
 
 fn legacy_fence_error(path: &Path) -> io::Error {

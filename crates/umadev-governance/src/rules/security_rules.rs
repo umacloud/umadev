@@ -64,8 +64,13 @@ fn weak_crypto_regex() -> &'static Regex {
     })
 }
 
-/// **UD-SEC-018** (extends the cryptographic-storage family): ban broken hash
-/// and cipher primitives — MD5, SHA-1, DES, RC4.
+/// **UD-SEC-032**: ban broken hash and cipher primitives — MD5, SHA-1, DES, RC4.
+///
+/// A fixable finding for the post-write QC loop, never the irreversible write
+/// floor: MD5 / SHA-1 also have legitimate non-security uses (a Gravatar URL,
+/// an S3 `Content-MD5` header, WeChat Pay v2 signing, content addressing), and
+/// `.umadev/rules.toml` can disable this clause without touching the
+/// plaintext-password floor (UD-SEC-018).
 ///
 /// MD5 and SHA-1 are collision-broken and must never be used for integrity,
 /// signatures, password hashing, or any security purpose; DES/3DES/RC4 are
@@ -97,9 +102,9 @@ pub fn check_weak_crypto(file_path: &str, content: &str) -> Decision {
         }
         if re.is_match(line) {
             return Decision::block(
-                "UD-SEC-018",
+                "UD-SEC-032",
                 format!(
-                    "UmaDev: broken crypto primitive (UD-SEC-018). \
+                    "UmaDev: broken crypto primitive (UD-SEC-032). \
                      `{file_path}` uses a collision-broken hash (MD5/SHA-1) or a \
                      broken legacy cipher. These primitives offer no real security. \
                      Use SHA-256/SHA-3 for integrity, AES-GCM for encryption, and \

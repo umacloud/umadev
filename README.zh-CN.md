@@ -307,7 +307,7 @@ umadev 用一个协调者按任务深度模拟八种专业角色。它们是隔�
 | 角色 | 它产出什么（黑板上的产物） |
 |---|---|
 | 产品经理 | 拆需求、用户故事、EARS 验收标准 — `*-prd.md` |
-| 架构师 | 分层、数据模型、API 契约 — `*-architecture.md` + `openapi.*` |
+| 架构师 | 分层、数据模型、API 契约 — `*-architecture.md`（其中的 API 表即契约；`umadev adopt` 还会写出 `openapi.*`） |
 | UI/UX 设计师 | 设计系统：令牌、字体、组件状态、页面骨架 — `*-uiux.md` |
 | 前端工程师 | 导入令牌、调契约 URL 的组件 / 页面 |
 | 后端工程师 | 数据模型、端点、对齐契约的业务逻辑 |
@@ -369,7 +369,7 @@ flowchart TB
 umadev 的可信来自把"模型说了什么"和"硬信号是什么"严格分开：
 
 - **fail-open 治理**：底座每写一个文件，都实时拦截 emoji 当图标、硬编码颜色、AI 模板痕迹、无障碍缺失、前后端契约不符等。治理函数**永远 fail-open**——治理自身出 bug 时放行而非阻断，绝不让一个治理缺陷卡死底座。
-- **确定性控环**：底座和评审角色都是 advisory。真正决定"过门 / 返工 / 硬停"的是确定性信号：FR→任务覆盖、前后端契约对照、真跑 verify 的退出码、质量门阈值，以及**零代码硬门**（计划要产出代码却没有真实源码 = 判失败，绝不把空骨架伪装成"完成"）。
+- **确定性控环**：底座和评审角色都是 advisory。真正决定"过门 / 返工 / 硬停"的是确定性信号：FR→任务覆盖（默认只提示，设置 `UMADEV_STRICT_COVERAGE=1` 后阻断）、前后端契约对照、真跑 verify 的退出码、质量门阈值，以及**零代码硬门**（计划要产出代码却没有真实源码 = 判失败，绝不把空骨架伪装成"完成"）。
 - **不持有模型端点**：umadev 用你已登录的底座，不自带模型、不接第三方 API、不存你的 key。底座用谁的模型、什么思考强度，umadev 只读出来显示、绝不覆盖。
 - **审计证据**：每次工具调用、每份角色裁决、每道门的状态都落盘（`.umadev/audit/*`、`team-ledger.jsonl`）；交付时打包成 proof-pack + 成绩单 + 合规映射（SOC 2 / ISO 27001 / EU AI Act），可直接发给团队、客户或审计方。
 - **可审计的踩坑学习 + 项目事实**：具体事故先记到本地；同一精确问题在独立 episode 中复发可形成待验证规则，只有对应修复后同一验证器通过才会验证。证据用于降低重复犯错，不承诺概率型底座永不再犯。稳定事实由独立只读验证器从显式证据包提取，Rust 主机只接受可核验的用户陈述、仓库文件或文件系统证据，并把来源写入 `.umadev/memory/facts.jsonl`；纯聊天不注入，过期或矛盾事实会降级/墓碑化。旧版没有可验证来源的记录仍保留供迁移审计，但不会注入模型上下文，直到新证据重新确认。停车场/未决项默认只按当前请求相关性召回，只有明确查看清单时才召回全部未决项。
@@ -528,6 +528,8 @@ flowchart LR
     C["MCP server<br/>给其他 AI 工具调用"] --> G
     D["quality gate<br/>交付前补扫"] --> G
 ```
+
+其中 Claude Code / Kimi Code 钩子只在 UmaDev 驱动的会话里生效；你自己直接启动的 `claude` 或 Kimi Code 会话不会被它检查或记录。
 
 项目可以通过 `.umadev/rules.toml` 调整：
 
@@ -751,14 +753,14 @@ umadev 有两套入口，一一对应：
 | `umadev adopt [path]` | 接管现有仓库：识别技术栈、索引源码、反推 API 契约 |
 | `umadev`（无子命令） | 启动聊天 TUI |
 | `umadev doctor` | 自检 |
-| `umadev verify` | 工作区合规 + 证据链状态（`--runtime` 启动应用并探测路由） |
+| `umadev verify` | 工作区合规 + 证据链状态，并实际运行项目的安装 / lint / 类型检查 / 测试 / 构建步骤（会执行项目代码、可能改写锁文件，任一步失败即以非零退出；`--runtime` 另外启动应用并探测路由） |
 | `umadev report` | 合规映射（SOC 2 / ISO 27001 / EU AI Act）；`--review` 生成 PR 级评审报告 + 跑 pre-PR 安全扫描 |
 | `umadev usage` | 按运行 / 阶段的 token 用量 + 粗略成本估算 |
 | `umadev lessons` | 查看由复发事故或机械验证结果形成的可复用规则及其 pending / validated / needs-revision 状态；具体事故看 TUI `/pitfalls` |
 | `umadev history` | 列出回滚快照 |
 | `umadev rollback latest` | 回滚到某快照 |
 | `umadev update` | 通过实际所属包管理器（npm / pnpm / yarn / bun）升级；原生 / 独立安装则从 GitHub Release 校验并原子更新 |
-| `umadev uninstall` | 完整卸载：确认后删 `~/.umadev` + 本项目治理钩子 + 二进制（加 `--base <claude-code\|pre-commit>` 则仅卸钩子） |
+| `umadev uninstall` | 完整卸载：确认后删 `~/.umadev` + 本项目治理钩子 + 二进制；通过 npm/pnpm/yarn/bun 安装的，用当初安装它的包管理器卸载 `@umatech/umadev` 包（加 `--base <claude-code\|pre-commit>` 则仅卸钩子） |
 
 **脚本 / CI 运行（外层命令非交互）**
 
@@ -784,7 +786,7 @@ umadev 有两套入口，一一对应：
 | 命令 | 作用 |
 |---|---|
 | `umadev ci [--changed-only] [--report-only]` | 对工作区每个源文件跑治理（CI 模式） |
-| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安装项目作用域的原生 pre/post-tool 治理钩子，或 git 兜底 |
+| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安装项目作用域的原生 pre/post-tool 治理钩子（只作用于 UmaDev 驱动的底座会话），或 git 兜底（检查每次提交） |
 
 **平台扩展**
 
@@ -810,14 +812,15 @@ umadev 有两套入口，一一对应：
 | `UMADEV_GROK_BIN` | 覆盖 Grok Build 可执行文件 | `grok` |
 | `UMADEV_KIMI_BIN` | 覆盖 Kimi Code 可执行文件 | `kimi` |
 | `UMADEV_WORKER_TIMEOUT` | 单次 worker 超时（秒） | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | verify 循环单次超时（秒） | `120` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | 每个 verify 步骤（安装、lint、测试、构建）的超时（秒）；未设置时各步骤使用自己的预算 | `120`（安装 / 测试 / 构建为 `600`） |
 | `UMADEV_NO_GOAL_MODE` | 置 `1` 关闭 `/goal` 模式 | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | 预置底座实时进程日志可见性（也可在 App 内用 `/logs` 切换） | 关 |
 | `UMADEV_CONTINUOUS` | 置 `0`（或 `UMADEV_LEGACY_RUN=1`）退出持续单会话路径 | 开 |
 | `OPENAI_EMBED_KEY` | 远程向量专用 key；没有下面的显式上传开关时不生效 | — |
 | `UMADEV_ALLOW_CLOUD_EMBED` | 与专用 key 同时设为 `1` 才允许远程 embedding 上传 | 关 |
 | `OPENAI_EMBED_BASE` | 远程 embedding 服务基址；只在双重云端 opt-in 后读取 | `https://api.openai.com` |
-| `UMADEV_EMBED_MODEL_DIR` | 放置兼容 `config.json`、`tokenizer.json`、`model.safetensors` 的本地目录 | `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | 放置兼容 `config.json`、`tokenizer.json`、`model.safetensors` 的本地目录；指向一个目录时 npm 启动器不会再下载模型 | `~/.umadev/embed-model` |
+| `UMADEV_NO_MODEL_DOWNLOAD` | 置 `1` 后 npm 启动器不再下载向量模型（检索改用 BM25）。未设置时，下载失败或按 Ctrl+C 跳过后，24 小时后才会重试，而不是每次启动都重下 | 关 |
 | `XDG_CONFIG_HOME` | `config.toml` 的基目录 | `$HOME` |
 
 ## 配置

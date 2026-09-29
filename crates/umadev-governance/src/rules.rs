@@ -25,6 +25,15 @@ mod var_declarations;
 pub use var_declarations::check_var_declarations;
 mod sensitive_path;
 pub use sensitive_path::check_sensitive_path;
+mod bash_guard;
+pub use bash_guard::check_dangerous_bash;
+mod test_paths;
+use test_paths::looks_like_secret_test_path;
+mod password_rules;
+pub use password_rules::{check_plaintext_password, check_unhashed_password_storage};
+mod client_secret;
+pub use client_secret::check_client_secret_leak;
+mod secret_values;
 
 /// Outcome of a governance rule.
 ///
@@ -459,6 +468,7 @@ const CONTENT_CHECKS: &[fn(&str, &str) -> Decision] = &[
     check_unreliable_sources,
     check_hardcoded_config,
     check_plaintext_password,
+    check_unhashed_password_storage,
     check_file_upload_validation,
     check_open_redirect,
     check_sensitive_logging,
@@ -657,7 +667,8 @@ fn sast_severity(clause: &str) -> SastSeverity {
         | "UD-SEC-013" // XXE
         | "UD-SEC-014" // command injection (string-built shell)
         | "UD-SEC-015" // JWT defects (alg:none / hardcoded secret)
-        | "UD-SEC-018" // plaintext password / weak crypto over secrets
+        | "UD-SEC-018" // plaintext password comparison
+        | "UD-SEC-033" // password stored without a visible hash
         | "UD-SEC-020" // path traversal
         | "UD-ARCH-023" // OS command injection (shell exec of input)
         | "UD-ARCH-025" // ruby eval/send metaprogramming injection
@@ -669,6 +680,7 @@ fn sast_severity(clause: &str) -> SastSeverity {
         | "UD-SEC-010" // insecure CORS (reflected/wildcard origin)
         | "UD-SEC-019" // open redirect
         | "UD-ARCH-061" // client-side redirect injection
+        | "UD-SEC-032" // broken hash / cipher primitive
         | "UD-ARCH-043" // insecure RNG in a token/secret context
         => Medium,
         // Hardening gaps.
@@ -704,6 +716,7 @@ const SAST_CHECKS: &[fn(&str, &str) -> Decision] = &[
     check_insecure_cors,
     check_insecure_cookie,
     check_plaintext_password,
+    check_unhashed_password_storage,
     check_path_traversal,
     check_open_redirect,
     check_client_redirect_injection,
@@ -1457,459 +1470,6 @@ pub fn check_ai_slop_with_intent(
     Decision::block("UD-CODE-002", reason)
 }
 
-/// **UD-SEC-002**: block destructive shell commands before the host runs them.
-///
-/// This is the real-time guard for `Bash` tool calls (the hook also intercepts
-/// `Write`/`Edit` via UD-SEC-001/UD-CODE-*). It pattern-matches the command
-/// string against known catastrophic patterns and denies them with a concrete
-/// reason the host can act on. Like UD-SEC-001 it is bypass-immune and runs
-/// before any "skip governance" toggle could apply.
-///
-/// Fail-open: unparseable / non-string commands pass. We only block what we
-/// can confidently identify as dangerous.
-#[must_use]
-pub fn check_dangerous_bash(command: &str) -> Decision {
-    // Equivalent-form-robust structured floor FIRST. The fixed substring table
-    // below only matches ONE spelling of each verb, so alternate flag
-    // orders/spellings (`rm -fr /`, `rm -rf -- /`, `rm --recursive --force /`),
-    // a `git -C <dir>` global-option prefix before `push`, or `git clean -fdx`
-    // slip straight past it. Tokenize + match on intent so those equivalents
-    // can't bypass the floor. Fail-open: `None` → fall through to the table.
-    if let Some(decision) = check_dangerous_bash_structured(command) {
-        return decision;
-    }
-
-    // Normalize: collapse runs of whitespace so `rm  -rf` and `rm\t-rf` match.
-    let collapsed: String = command.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lower = collapsed.to_ascii_lowercase();
-
-    for pattern in DESTRUCTIVE_BASH_PATTERNS {
-        if lower.contains(pattern.trigger) {
-            // Precision for the root-delete patterns: `rm -rf /` / `rm -rf ~`
-            // are substrings of perfectly legitimate `rm -rf /tmp/foo` and
-            // `rm -rf ~/.cache/x`. Only fire when the target really IS the root
-            // / whole home, not a subpath under it.
-            if (pattern.trigger == "rm -rf /" || pattern.trigger == "rm -rf ~")
-                && !rm_target_is_catastrophic(&lower, pattern.trigger)
-            {
-                continue;
-            }
-            // Precision for command-NAME triggers (`shutdown`, `mkfs`, `halt`,
-            // …): fire only when the word is actually INVOKED as a command, not
-            // when it merely appears inside an argument or a quoted string — e.g.
-            // `echo shutdown`, or a `git commit -m "… shutdown …"`. Only applies
-            // to clean alphanumeric command words; path / multi-word triggers
-            // (`/dev/sd`, `rm -rf /`, `dd if=`, `| sh`) keep matching as
-            // substrings (they legitimately appear as arguments).
-            if pattern.trigger.bytes().all(|b| b.is_ascii_alphanumeric())
-                && !appears_as_command(&lower, pattern.trigger)
-            {
-                continue;
-            }
-            // Allow explicit "dry-run" for git commands (e.g. --dry-run).
-            if pattern.git_only && !lower.contains("git ") && !lower.starts_with("git") {
-                continue;
-            }
-            if pattern.allow_if.iter().any(|a| lower.contains(a)) {
-                continue;
-            }
-            return Decision::block(
-                "UD-SEC-002",
-                format!(
-                    "UmaDev: destructive command blocked (UD-SEC-002). \
-                     The command matches a known catastrophic pattern (`{trigger}`). \
-                     {why} {fix}",
-                    trigger = pattern.trigger,
-                    why = pattern.why,
-                    fix = pattern.fix,
-                ),
-            );
-        }
-    }
-    Decision::pass()
-}
-
-/// Does `word` appear as an actual command invocation in `lower` — at a command
-/// position — rather than merely as a substring inside an argument or a quoted
-/// string? A bare command-name trigger (`shutdown`, `mkfs`, …) should fire on
-/// `shutdown -h`, `sudo shutdown`, `… ; shutdown`, but NOT on `echo shutdown`
-/// or a `git commit -m "… shutdown …"`.
-fn appears_as_command(lower: &str, word: &str) -> bool {
-    let mut from = 0;
-    while let Some(rel) = lower[from..].find(word) {
-        let start = from + rel;
-        let end = start + word.len();
-        // Whole word: the char after the name (if any) must not CONTINUE a word
-        // — so `shutdownify` / `mkfstool` don't match, but `mkfs.ext4`,
-        // `shutdown -h`, `halt;` do (`.`/`-`/`;`/space are all non-alphanumeric).
-        let after_ok = lower[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_ascii_alphanumeric());
-        // Command position: preceded by nothing, a separator, or a privilege /
-        // exec wrapper — not by another command's name or an opening quote
-        // (which would make it an argument).
-        let before = lower[..start].trim_end();
-        let before_ok = before.is_empty()
-            || before.ends_with([';', '|', '&', '\n', '('])
-            || matches!(
-                before.rsplit(char::is_whitespace).next().unwrap_or(""),
-                "sudo" | "doas" | "exec" | "nohup" | "env" | "xargs" | "time" | "command"
-            );
-        if after_ok && before_ok {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-/// For an `rm -rf /` / `rm -rf ~` trigger match: is the deletion target the
-/// actual root / whole home (catastrophic), or merely a subpath under it
-/// (`/tmp/foo`, `~/.cache`) that should be allowed? Looks at the char that
-/// FOLLOWS the trigger's `/` or `~`.
-fn rm_target_is_catastrophic(lower: &str, trigger: &str) -> bool {
-    let Some(pos) = lower.find(trigger) else {
-        return true;
-    };
-    let after = &lower[pos + trigger.len()..];
-    match after.chars().next() {
-        // `rm -rf /` / `rm -rf ~` exactly, or followed by a separator/glob.
-        None => true,
-        Some(c) if c.is_whitespace() => true,
-        Some(';' | '&' | '|' | '*') => true,
-        // `~/` then nothing more = the whole home; `~/foo` = a subpath.
-        Some('/') => {
-            let rest = &after[1..];
-            rest.is_empty() || rest.starts_with(char::is_whitespace)
-        }
-        // A continuing path char (`/tmp`, `~bar`) — a subpath, not root.
-        _ => false,
-    }
-}
-
-/// **UD-SEC-002** (equivalent-form-robust floor): match destructive INTENT for
-/// the highest-risk verbs so alternate spellings/flag orders can't bypass the
-/// fixed [`DESTRUCTIVE_BASH_PATTERNS`] substring table. Tokenizes each shell
-/// segment and matches:
-/// - a recursive+force `rm` at a catastrophic root — any flag order/spelling
-///   (`-rf`, `-fr`, `-r -f`, `-f -r`, `--recursive --force`), a `--`
-///   end-of-options separator, targeting `/`, `~`, `$HOME`, or a wildcard
-///   directly under one;
-/// - `git push` even behind a `git -C <dir>` / `-c k=v` / `--git-dir=…`
-///   global-option prefix that the `git push` substring can't see;
-/// - a forced `git clean` (`-fd`/`-fdx`/`-xdf`/`--force -d`) in any flag order.
-///
-/// In-tree targets (`./build`, `target/`) stay allowed — this only closes the
-/// ROOT / equivalent-form bypass, preserving the existing in-tree-vs-root
-/// policy. Returns `Some(block)` on a catastrophic match, else `None` (fall
-/// through to the substring table). Fail-open: any parse ambiguity yields
-/// `None` and never blocks a benign command.
-fn check_dangerous_bash_structured(command: &str) -> Option<Decision> {
-    // Track whether an earlier pipeline segment was a NETWORK DOWNLOADER so a later segment
-    // that is a bare shell interpreter is caught as a pipe-to-shell RCE (`curl ... | sh`)
-    // regardless of the spacing around `|` - the literal-substring "| sh" trigger missed
-    // `curl x|sh`, `curl x |sh`, and `curl x | sudo bash`.
-    // A downloader → shell RCE lives inside ONE pipeline. `saw_downloader` therefore resets
-    // at every SEQUENCE boundary (`&&` / `||` / `;` / `&` / newline / subshell) and only
-    // persists across PIPE (`|`) stages WITHIN a statement. This is the fix for a false-BLOCK:
-    // `curl -fsSL <url> -o s.sh && less s.sh && sh s.sh` (download → inspect → run — the exact
-    // remediation the block message recommends) and `curl ... -o data.json && bash deploy.sh`
-    // (fetch data, then run a PRE-EXISTING local script) are SAFE — the shell is sequenced
-    // AFTER the download, not piped from it. Only `curl <url> | sh` (bytes piped straight into
-    // an interpreter) is the RCE, and that pipe keeps `saw_downloader` set across the stage.
-    for statement in shell_statements(command) {
-        let mut saw_downloader = false;
-        for segment in pipe_stages(&statement) {
-            let tokens = tokenize_segment(&segment);
-            if tokens.is_empty() {
-                continue;
-            }
-            // Read the real command name past a sudo/env prefix or `VAR=val` assignment.
-            let cmd0 = tokens.iter().find(|t| {
-                let s = t.as_str();
-                !matches!(
-                    s,
-                    "sudo" | "doas" | "env" | "command" | "exec" | "nohup" | "time" | "xargs"
-                ) && !s.contains('=')
-            });
-            if let Some(cmd0) = cmd0 {
-                let base = cmd0.rsplit(['/', '\\']).next().unwrap_or(cmd0);
-                if matches!(base, "curl" | "wget" | "fetch") {
-                    saw_downloader = true;
-                } else if saw_downloader
-                    && matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "ash")
-                {
-                    return Some(Decision::block(
-                        "UD-SEC-002",
-                        "UmaDev: remote-code-execution blocked (UD-SEC-002). This pipes a                          network download straight into a shell interpreter (`curl ... | sh`),                          which runs untrusted code with no integrity check - caught for every                          spelling (`|sh`, `| sh`, `| sudo bash`). fix: download to a file,                          inspect it, then run it: `curl -fsSL <url> -o s.sh && less s.sh && sh                          s.sh`.",
-                    ));
-                }
-            }
-            if catastrophic_rm(&tokens) {
-                return Some(Decision::block(
-                    "UD-SEC-002",
-                    "UmaDev: destructive command blocked (UD-SEC-002). This is a \
-                     recursive, forced `rm` targeting the filesystem root or the \
-                     home directory — every equivalent form is caught (`-rf`, \
-                     `-fr`, `-r -f`, `--recursive --force`, and `--` separators). \
-                     fix: scope the deletion to a project-local directory, e.g. \
-                     `rm -rf ./build` or `rm -rf target/`.",
-                ));
-            }
-            if git_push_behind_globals(&tokens) {
-                return Some(Decision::block(
-                    "UD-SEC-002",
-                    "UmaDev: destructive command blocked (UD-SEC-002). `git push` \
-                     reaches a remote and (per UmaDev's trust contract) UmaDev never \
-                     auto-pushes — this holds even behind a `git -C <dir>` or other \
-                     global-option prefix. fix: let the user run the push, or use \
-                     `git push --dry-run` to inspect.",
-                ));
-            }
-            if git_force_clean(&tokens) {
-                return Some(Decision::block(
-                    "UD-SEC-002",
-                    "UmaDev: destructive command blocked (UD-SEC-002). `git clean \
-                     -f…` irreversibly deletes untracked files (and with `-d`/`-x`, \
-                     whole untracked directories and ignored files) in any flag \
-                     order. fix: inspect first with `git clean -n` (dry run), then \
-                     remove only what you mean to.",
-                ));
-            }
-        }
-    }
-    None
-}
-
-/// Split a command line into top-level STATEMENTS on the SEQUENCE separators
-/// (`;`, `&&`, `||`, `&`, newline, and `(`/`)` subshell boundaries) — but NOT on
-/// the PIPE `|`, which stays inside a statement so [`pipe_stages`] can walk it.
-/// Keeping the pipe intra-statement is what lets `curl … | sh` (one pipeline) be
-/// told apart from `curl … -o s.sh && sh s.sh` (two sequenced statements: the
-/// SAFE download → inspect → run pattern). Lightweight: it does not fully honour
-/// quoting, which is fine for the intent match — the substring table backstops
-/// any odd split.
-fn shell_statements(command: &str) -> Vec<String> {
-    let mut normalized = command.replace("&&", "\n").replace("||", "\n");
-    for sep in [';', '&', '(', ')'] {
-        normalized = normalized.replace(sep, "\n");
-    }
-    normalized
-        .split('\n')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// Split ONE statement into its pipeline stages on `|`. Stages within a statement
-/// are connected by the pipe, so a network download in an earlier stage feeding a
-/// shell interpreter in a later stage is the `curl … | sh` RCE. A statement with
-/// no pipe yields a single stage (itself).
-fn pipe_stages(statement: &str) -> Vec<String> {
-    statement
-        .split('|')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-/// Whitespace-tokenize a single shell segment, stripping a pair of matching
-/// surrounding quotes from each token. Enough to read a command name, its
-/// flags, and its path arguments for the intent match.
-fn tokenize_segment(segment: &str) -> Vec<String> {
-    segment
-        .split_whitespace()
-        .map(|tok| {
-            let bytes = tok.as_bytes();
-            if bytes.len() >= 2
-                && (bytes[0] == b'"' || bytes[0] == b'\'')
-                && bytes[bytes.len() - 1] == bytes[0]
-            {
-                tok[1..tok.len() - 1].to_string()
-            } else {
-                tok.to_string()
-            }
-        })
-        .collect()
-}
-
-/// Drop leading privilege/exec wrappers (`sudo`, `env FOO=bar`, `nohup`, …) so
-/// the intent matcher sees the real command (`sudo rm -rf /` → `rm -rf /`).
-fn strip_command_wrappers(tokens: &[String]) -> &[String] {
-    let mut i = 0;
-    while i < tokens.len() {
-        let word = tokens[i].to_ascii_lowercase();
-        let base = word.rsplit('/').next().unwrap_or(word.as_str());
-        match base {
-            "sudo" | "doas" | "nohup" | "exec" | "command" | "time" | "stdbuf" | "nice" => i += 1,
-            "env" | "xargs" => {
-                i += 1;
-                // Skip any `VAR=value` assignments before the real command.
-                while i < tokens.len() && tokens[i].contains('=') && !tokens[i].starts_with('-') {
-                    i += 1;
-                }
-            }
-            _ => break,
-        }
-    }
-    &tokens[i..]
-}
-
-/// Is this segment a recursive+force `rm` aimed at a catastrophic root? Accepts
-/// every flag order/spelling — combined (`-rf`/`-fr`), separated (`-r -f`),
-/// long (`--recursive --force`), and a `--` end-of-options separator — and
-/// treats `/`, `~`, `$HOME`, or a wildcard directly under one as catastrophic.
-fn catastrophic_rm(tokens: &[String]) -> bool {
-    let tokens = strip_command_wrappers(tokens);
-    let Some((cmd, rest)) = tokens.split_first() else {
-        return false;
-    };
-    let cmd = cmd.to_ascii_lowercase();
-    if cmd.rsplit('/').next().unwrap_or(cmd.as_str()) != "rm" {
-        return false;
-    }
-    let mut recursive = false;
-    let mut force = false;
-    let mut end_of_opts = false;
-    let mut dangerous_target = false;
-    for tok in rest {
-        if !end_of_opts && tok == "--" {
-            end_of_opts = true;
-            continue;
-        }
-        if !end_of_opts && tok.len() > 1 && tok.starts_with('-') {
-            if let Some(long) = tok.strip_prefix("--") {
-                match long {
-                    "recursive" => recursive = true,
-                    "force" => force = true,
-                    _ => {}
-                }
-            } else {
-                for c in tok.chars().skip(1) {
-                    match c {
-                        'r' | 'R' => recursive = true,
-                        'f' => force = true,
-                        _ => {}
-                    }
-                }
-            }
-            continue;
-        }
-        if is_dangerous_rm_target(tok) {
-            dangerous_target = true;
-        }
-    }
-    recursive && force && dangerous_target
-}
-
-/// A deletion target that means "the whole filesystem root or home dir", which
-/// makes a recursive+force `rm` catastrophic. In-tree targets (`./build`,
-/// `target/`, `node_modules`) are deliberately NOT dangerous — that preserves
-/// the existing in-tree-vs-root policy; only the root / equivalent forms fire.
-fn is_dangerous_rm_target(target: &str) -> bool {
-    let trimmed = target.trim_matches(|c| c == '"' || c == '\'');
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "/" | "/*"
-            | "/."
-            | "~"
-            | "~/"
-            | "~/*"
-            | "$home"
-            | "$home/"
-            | "$home/*"
-            | "${home}"
-            | "${home}/"
-            | "${home}/*"
-    )
-}
-
-/// Extract `(subcommand, args_after_it)` from a `git …` segment, skipping any
-/// global options between `git` and the subcommand — including the ones that
-/// consume a following argument (`-C <dir>`, `-c <k=v>`, `--git-dir <p>`, …).
-/// Returns `None` when the segment is not a git invocation. This is what lets
-/// the floor see the real subcommand behind a `git -C <dir>` prefix.
-fn git_subcommand(tokens: &[String]) -> Option<(String, Vec<String>)> {
-    let tokens = strip_command_wrappers(tokens);
-    let (cmd, rest) = tokens.split_first()?;
-    let cmd = cmd.to_ascii_lowercase();
-    if cmd.rsplit('/').next().unwrap_or(cmd.as_str()) != "git" {
-        return None;
-    }
-    let mut i = 0;
-    while i < rest.len() {
-        let tok = &rest[i];
-        if tok.starts_with('-') {
-            // Global options taking a SEPARATE argument (space-form) must skip
-            // that argument too, so we don't mistake it for the subcommand.
-            let takes_arg = matches!(
-                tok.as_str(),
-                "-C" | "-c"
-                    | "--git-dir"
-                    | "--work-tree"
-                    | "--namespace"
-                    | "--super-prefix"
-                    | "--config-env"
-            );
-            i += if takes_arg { 2 } else { 1 };
-            continue;
-        }
-        return Some((tok.to_ascii_lowercase(), rest[i + 1..].to_vec()));
-    }
-    None
-}
-
-/// Is this segment a `git push` — even behind a global-option prefix the fixed
-/// `git push` substring can't see? Mirrors the substring table's allow-list:
-/// `--dry-run` (inspection) and `--force-with-lease` still pass.
-fn git_push_behind_globals(tokens: &[String]) -> bool {
-    let Some((sub, args)) = git_subcommand(tokens) else {
-        return false;
-    };
-    if sub != "push" {
-        return false;
-    }
-    let allowed = args.iter().any(|a| {
-        a == "--dry-run" || a == "--force-with-lease" || a.starts_with("--force-with-lease=")
-    });
-    !allowed
-}
-
-/// Is this segment a forced `git clean` (irreversible untracked-file wipe) in
-/// any flag order — `-fd`, `-fdx`, `-xdf`, `--force -d`? A dry run (`-n` /
-/// `--dry-run`) passes.
-fn git_force_clean(tokens: &[String]) -> bool {
-    let Some((sub, args)) = git_subcommand(tokens) else {
-        return false;
-    };
-    if sub != "clean" {
-        return false;
-    }
-    let mut force = false;
-    let mut dry_run = false;
-    for arg in &args {
-        if let Some(long) = arg.strip_prefix("--") {
-            match long {
-                "force" => force = true,
-                "dry-run" => dry_run = true,
-                _ => {}
-            }
-        } else if arg.len() > 1 && arg.starts_with('-') {
-            for c in arg.chars().skip(1) {
-                match c {
-                    'f' => force = true,
-                    'n' => dry_run = true,
-                    _ => {}
-                }
-            }
-        }
-    }
-    force && !dry_run
-}
-
 /// **UD-SEC-003**: block hardcoded secrets in source files.
 ///
 /// Catches API keys, tokens, private keys, and passwords embedded directly in
@@ -1978,7 +1538,7 @@ pub(crate) fn check_hardcoded_secret_ungated(file_path: &str, content: &str) -> 
     // 1. Named key + separator + quoted value: `const API_KEY = "…"`,
     //    `"apiKey": "…"`, `password: "…"` — the spaced / JSON-key forms the
     //    contiguous `SECRET_PREFIXES` scan cannot see.
-    if let Some((name, len)) = named_secret_match(heuristic_content) {
+    if let Some((name, len)) = secret_values::named_secret_match(heuristic_content) {
         return Decision::block(
             "UD-SEC-003",
             format!(
@@ -1991,36 +1551,27 @@ pub(crate) fn check_hardcoded_secret_ungated(file_path: &str, content: &str) -> 
         );
     }
 
-    // 2. Contiguous assignment-style prefixes (`api_key=value`, env files).
+    // 2. Contiguous assignment-style prefixes (`api_key=value`, env files). Only an
+    //    opaque credential token counts: code reading the secret from settings /
+    //    env, a URL-template placeholder, or a type annotation does not.
     for prefix in SECRET_PREFIXES {
-        // Look for `prefix=...` or `prefix: ...` followed by a value that
-        // looks like a real key (length > 20, not a placeholder).
-        if let Some(idx) = lower.find(prefix) {
-            let after = &heuristic_content[idx + prefix.len()..];
-            let value: String = after
-                .trim_start_matches(['=', ':', ' ', '"', '\''])
-                .chars()
-                .take_while(|c| !matches!(c, '"' | '\'' | '\n' | '\r'))
-                .collect();
-            // Skip obvious placeholders / examples.
-            if value.chars().count() > 20 && !is_placeholder_value(&value) {
-                return Decision::block(
-                    "UD-SEC-003",
-                    format!(
-                        "UmaDev: hardcoded secret detected (UD-SEC-003). \
-                         `{file_path}` embeds what looks like a real `{}` (value length {}). \
-                         Secrets must come from environment variables, never source code. \
-                         Replace with `process.env.{}` / `std::env::var(...)` and move the \
-                         value to `.env` (gitignored).",
-                        prefix.trim_end_matches(['=', ':']).to_uppercase(),
-                        value.chars().count(),
-                        prefix
-                            .trim_end_matches(['=', ':'])
-                            .replace(' ', "_")
-                            .to_uppercase(),
-                    ),
-                );
-            }
+        if let Some(value) = secret_values::prefix_secret(&lower, heuristic_content, prefix) {
+            return Decision::block(
+                "UD-SEC-003",
+                format!(
+                    "UmaDev: hardcoded secret detected (UD-SEC-003). \
+                     `{file_path}` embeds what looks like a real `{}` (value length {}). \
+                     Secrets must come from environment variables, never source code. \
+                     Replace with `process.env.{}` / `std::env::var(...)` and move the \
+                     value to `.env` (gitignored).",
+                    prefix.trim_end_matches(['=', ':']).to_uppercase(),
+                    value.len(),
+                    prefix
+                        .trim_end_matches(['=', ':'])
+                        .replace(' ', "_")
+                        .to_uppercase(),
+                ),
+            );
         }
     }
     // 3. Bare key-shape prefixes carry no `=`/`:` separator, so a raw substring
@@ -2145,55 +1696,6 @@ fn file_name_of(file_path: &str) -> &str {
     file_path.rsplit(['/', '\\']).next().unwrap_or(file_path)
 }
 
-/// `true` for a path where the NOISIEST secret detectors (the entropy + JWT
-/// fallback) must be suppressed to avoid flooding: a test / fixture / example /
-/// sample / template path (realistic-but-fake secrets), a generated LOCKFILE
-/// (full of SRI integrity hashes), or a minified bundle (one giant high-entropy
-/// line). The high-signal detectors (PEM, named keys, provider shapes) still fire
-/// on these, so a REAL key here is not a free pass.
-fn looks_like_secret_test_path(file_path: &str) -> bool {
-    let l = file_path.to_ascii_lowercase();
-    if l.contains(".test.")
-        || l.contains(".spec.")
-        || l.contains("_test.")
-        || l.contains("_tests.")
-        || l.ends_with("tests.rs")
-        || l.contains("test_")
-        || l.starts_with("tests/")
-        || l.starts_with("test/")
-        || l.contains("/tests/")
-        || l.contains("/test/")
-        || l.contains("/__tests__/")
-        || l.contains("/testdata/")
-        || l.contains("/fixtures/")
-        || l.contains("/fixture/")
-        || l.contains("/mocks/")
-        || l.contains("/examples/")
-        || l.contains("/example/")
-        || l.contains(".example")
-        || l.contains(".sample")
-        || l.contains(".template")
-        || l.contains(".dist")
-        || l.contains(".mock")
-        || l.contains(".min.")
-    {
-        return true;
-    }
-    // Generated lockfiles: high-entropy integrity hashes everywhere, no secrets.
-    // (`*.lock` covers Cargo.lock / yarn.lock / poetry.lock / composer.lock / …)
-    let name = file_name_of(&l);
-    if matches!(name, "test.rs" | "tests.rs") {
-        return true;
-    }
-    extension_of(name) == "lock"
-        || name == "package-lock.json"
-        || name == "npm-shrinkwrap.json"
-        || name == "pnpm-lock.yaml"
-        || name == "go.sum"
-        || name.ends_with("-lock.json")
-        || name.ends_with("-lock.yaml")
-}
-
 /// Scan `content` for a bare key-shape secret (a Stripe-style `sk_`/`pk_` key,
 /// an AWS `AKIA` id, a GitHub `ghp_`/`gho_` token, a Slack `xoxb-` token, or a
 /// `stripe_`-prefixed key) that carries no `=`/`:` separator.
@@ -2306,39 +1808,6 @@ fn bare_secret_regex() -> &'static Regex {
     })
 }
 
-/// Match a NAMED secret assignment: a key NAME (`api_key`/`secret`/`token`/
-/// `password`/…) followed by `=`/`:` (with any spacing, and optionally a quoted
-/// name as in JSON) and a QUOTED value. This is the form a contiguous
-/// `name=value` prefix scan misses: `const API_KEY = "…"` (spaces) and
-/// `"apiKey": "…"` (quote-colon). Returns `(matched_name, value_char_len)` for
-/// the first non-placeholder hit. The quoted-value requirement keeps it off
-/// `process.env.X` references and bare code expressions.
-fn named_secret_match(content: &str) -> Option<(String, usize)> {
-    for caps in named_secret_regex().captures_iter(content) {
-        let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
-            continue;
-        };
-        let value = value.as_str();
-        if is_placeholder_value(value) {
-            continue;
-        }
-        // Same guards the entropy fallback already applies (see
-        // [`is_high_entropy_secret`]): a value that is a URL / data-URI /
-        // filesystem path, or a low-entropy lowercase kebab-/snake-case slug
-        // (a design token like `color-primary-strong`, an identifier, a
-        // pagination cursor) is NOT a credential — it must not hard-block on
-        // the un-overridable secret floor merely because it sits under a
-        // `token`/`auth`/`secret` name. A genuine secret-shaped value
-        // (`sk-ant-…`, `AKIA…`, a mixed-case / high-entropy base64 or hex blob)
-        // has no `://`/`/` and mixes case or entropy, so it still blocks here.
-        if looks_like_url_or_path(value) || looks_like_low_entropy_slug(value) {
-            continue;
-        }
-        return Some((name.as_str().to_string(), value.chars().count()));
-    }
-    None
-}
-
 /// `true` when `s` is a low-entropy lowercase kebab-/snake-case slug — a design
 /// token / identifier / cursor (`color-primary-strong`, `pagination-cursor-abc`,
 /// `page_size_default`), NOT a credential.
@@ -2363,28 +1832,6 @@ fn looks_like_low_entropy_slug(s: &str) -> bool {
         return false;
     }
     shannon_entropy(s) < 4.0
-}
-
-/// Compiled detector for a named secret key assigned a quoted literal value.
-///
-/// `["']?` around the name allows a JSON quoted key (`"apiKey":`); `\s*[:=]\s*`
-/// allows any spacing (`const API_KEY = "…"`); the value class excludes
-/// whitespace and structural punctuation so it stops at the literal's end and
-/// never runs into surrounding code. The 12-char value floor keeps it off short,
-/// low-signal values. The NAME (`\b`-bounded) is the high-signal part — `secret`
-/// will not match inside `secret_key`, which forces the longer alternative.
-fn named_secret_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(concat!(
-            r#"(?i)["']?\b("#,
-            r"api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token",
-            r"|access[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd",
-            r"|secret|token|auth",
-            r#")\b["']?\s*[:=]\s*["']([^\s"',;(){}]{12,})["']"#,
-        ))
-        .expect("named-secret regex is well-formed")
-    })
 }
 
 /// Compiled detector for a PEM private-key block — an unambiguous leaked key.
@@ -5734,86 +5181,6 @@ pub fn check_dart_dynamic(file_path: &str, content: &str) -> Decision {
     }
 }
 
-/// **UD-SEC-018**: ban plaintext password handling — insecure storage/comparison.
-///
-/// Passwords must be hashed with bcrypt/argon2/scrypt — never stored in plain
-/// text or compared with `==`. Flags: (1) password assignment to a string
-/// literal or DB column without hashing; (2) `==` comparison of a password
-/// variable; (3) `password` field in a DB insert without a hash function.
-/// Runs on backend source.
-///
-/// Persistence is correlated inside one logical statement or an adjacent
-/// `owner.password = value; owner.save()` pair. An unrelated `HashMap::insert`,
-/// plan save, or API example elsewhere in the file is not evidence of password
-/// storage. Multi-line call arguments stay in one statement. A direct hash call,
-/// a hash-named password value, or a value assigned from a supported hasher is
-/// treated as hashed. This is intentionally lexical and fail-open: uncertain
-/// cross-function data flow is left to a semantic analyzer.
-/// Distant keywords are never combined into a synthetic finding.
-#[must_use]
-pub fn check_plaintext_password(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(
-        ext.as_str(),
-        "ts" | "js" | "py" | "rb" | "go" | "java" | "rs"
-    ) || looks_like_secret_test_path(file_path)
-    {
-        return Decision::pass();
-    }
-    let content = if ext == "rs" {
-        rust_shipping_prefix(content)
-    } else {
-        content
-    };
-    let mut issues: Vec<&str> = Vec::new();
-
-    // 1. Password compared with == / === (should use bcrypt.compare).
-    for line in content.lines() {
-        let ll = line.to_ascii_lowercase();
-        let trimmed = ll.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
-            continue;
-        }
-        let no_str = strip_string_literals(line);
-        // `password ==` or `== password` or `password ===`
-        if (no_str.to_ascii_lowercase().contains("password ==")
-            || no_str.to_ascii_lowercase().contains("password ===")
-            || no_str.to_ascii_lowercase().contains("== password")
-            || no_str.to_ascii_lowercase().contains("=== password"))
-            && !no_str.to_ascii_lowercase().contains("bcrypt")
-            && !no_str.to_ascii_lowercase().contains("compare")
-        {
-            issues.push("password compared with == (use bcrypt.compare)");
-        }
-    }
-
-    // 2. Password storage and its hash proof must share local data-flow context.
-    if crate::security_context::contains_unhashed_password_storage(content) {
-        issues.push("stores/creates a password without a hashing function (bcrypt/argon2)");
-    }
-
-    if issues.is_empty() {
-        return Decision::pass();
-    }
-    let labels: Vec<&str> = issues
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    Decision::block(
-        "UD-SEC-018",
-        format!(
-            "UmaDev: insecure password handling (UD-SEC-018). \
-             `{file_path}` — {}. Passwords must be hashed with bcrypt/argon2 \
-             before storage, and verified with `bcrypt.compare(input, hash)`, \
-             never `==`. Plaintext storage or comparison is a credential-breach \
-             vector.",
-            labels.join("; "),
-        ),
-    )
-}
-
 /// **UD-ARCH-041**: require file-upload validation (type + size checks).
 ///
 /// A file-upload endpoint that doesn't validate type and size is a vector for
@@ -6813,50 +6180,6 @@ pub fn check_websocket_auth(file_path: &str, content: &str) -> Decision {
                  that checks the auth token before accepting the connection.",
             ),
         );
-    }
-    Decision::pass()
-}
-
-/// **UD-SEC-026**: ban server-side env secrets leaked into client bundles.
-///
-/// `process.env.SECRET_KEY` / `process.env.DATABASE_URL` in frontend code
-/// (`.tsx`/`.jsx`/`.vue`) gets bundled into the client-side JS — anyone can
-/// read it from the browser. Only `NEXT_PUBLIC_*` / `VITE_*` prefixed vars
-/// are safe for client. Flags sensitive env var access in frontend files.
-#[must_use]
-pub fn check_client_secret_leak(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(ext.as_str(), "jsx" | "tsx" | "vue" | "svelte" | "html") {
-        return Decision::pass();
-    }
-    let lower = content.to_ascii_lowercase();
-    // Sensitive env var names that must never reach the client.
-    let sensitive_env = [
-        "process.env.secret",
-        "process.env.database_url",
-        "process.env.db_url",
-        "process.env.private_key",
-        "process.env.api_key",
-        "process.env.jwt_secret",
-        "process.env.stripe",
-        "process.env.aws_secret",
-        "process.env.password",
-        "process.env.token",
-        "process.env.redis",
-    ];
-    for pattern in sensitive_env {
-        if lower.contains(pattern) {
-            return Decision::block(
-                "UD-SEC-026",
-                format!(
-                    "UmaDev: server secret leaked into client bundle (UD-SEC-026). \
-                     `{file_path}` accesses `{pattern}` in frontend code — this \
-                     gets bundled into the browser JS where anyone can read it. \
-                     Only `NEXT_PUBLIC_*` / `VITE_*` prefixed vars are safe for \
-                     client. Move the secret to a server-side API route.",
-                ),
-            );
-        }
     }
     Decision::pass()
 }
@@ -8485,230 +7808,6 @@ const FRONTEND_DB_DRIVERS: &[&str] = &[
     "require('redis')",
     "createconnection",
     "createclient(\"pg",
-];
-
-/// One catastrophic-shell pattern. `allow_if` lists substrings that, if
-/// present, downgrade the match to a pass (e.g. `--dry-run`).
-struct BashPattern {
-    /// Lowercase substring that triggers the block.
-    trigger: &'static str,
-    /// Why this is dangerous (shown to the host so it can correct course).
-    why: &'static str,
-    /// Concrete fix suggestion (the actionable half of the deny reason).
-    fix: &'static str,
-    /// If true, only block when the command is a git command.
-    git_only: bool,
-    /// Allow-list substrings that downgrade to pass.
-    allow_if: &'static [&'static str],
-}
-
-/// The catastrophic-pattern catalogue. Conservative by design: only patterns
-/// that cause irreversible damage (data loss, credential exfiltration,
-/// system compromise). False negatives are acceptable here (the quality gate
-/// still runs); false positives that block legitimate work are not.
-const DESTRUCTIVE_BASH_PATTERNS: &[BashPattern] = &[
-    // rm -rf /  —  root wipe. The classic.
-    BashPattern {
-        trigger: "rm -rf /",
-        why: "`rm -rf /` (or variants like `rm -rf ~`) deletes the entire filesystem or home directory.",
-        fix: "If you meant to clean a build dir, target it explicitly, e.g. `rm -rf target/` or `rm -rf node_modules/`.",
-        git_only: false,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "rm -rf ~",
-        why: "`rm -rf ~` wipes the user's home directory.",
-        fix: "Target a specific subdirectory, e.g. `rm -rf ~/.cache/umadev`.",
-        git_only: false,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "rm -rf /*",
-        why: "`rm -rf /*` attempts to delete every top-level filesystem entry.",
-        fix: "Scope the deletion to a project-local directory.",
-        git_only: false,
-        allow_if: &[],
-    },
-    // curl | sh / wget | sh  —  remote code execution.
-    BashPattern {
-        trigger: "| sh",
-        why: "Piping a remote download straight into a shell (`curl … | sh`) runs untrusted code with no integrity check.",
-        fix: "Download to a file first, inspect it, then run: `curl -fsSL <url> -o install.sh && less install.sh && sh install.sh`.",
-        git_only: false,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "| bash",
-        why: "Piping a remote download straight into bash (`curl … | bash`) runs untrusted code with no integrity check.",
-        fix: "Download to a file first, inspect it, then run: `curl -fsSL <url> -o install.sh && less install.sh && bash install.sh`.",
-        git_only: false,
-        allow_if: &[],
-    },
-    // chmod 777  —  world-writable security hole.
-    BashPattern {
-        trigger: "chmod 777",
-        why: "`chmod 777` makes a file world-readable/writable/executable — a security hole.",
-        fix: "Grant only the needed bits, e.g. `chmod 755` (owner rwx, others rx) or `chmod +x`.",
-        git_only: false,
-        allow_if: &[],
-    },
-    // git push --force to main/master  —  history rewrite on protected branches.
-    BashPattern {
-        trigger: "push --force",
-        why: "`git push --force` rewrites remote history and can clobber teammates' work.",
-        fix: "Use `git push --force-with-lease` (it aborts if the remote moved) and never force-push to main/master.",
-        git_only: true,
-        allow_if: &["--force-with-lease"],
-    },
-    BashPattern {
-        trigger: "push -f",
-        why: "`git push -f` is a force-push that rewrites remote history.",
-        fix: "Use `git push --force-with-lease` instead.",
-        git_only: true,
-        allow_if: &["--force-with-lease"],
-    },
-    // git reset --hard (no ref)  —  discards uncommitted work silently.
-    BashPattern {
-        trigger: "reset --hard",
-        why: "`git reset --hard` discards all uncommitted changes with no recovery.",
-        fix: "Stash first (`git stash`) or target a specific file. If you truly mean it, this is expected — but UmaDev flags it so the decision is conscious.",
-        git_only: true,
-        allow_if: &[],
-    },
-    // --- Irreversible / network VCS verbs the trust floor catches on the
-    // NeedApproval path but a hook-less base (codex/opencode `approvalPolicy=never`)
-    // would otherwise run directly via Bash. These mirror `trust::path_touches_vcs`
-    // + `NETWORK_TOKENS` so the pre-bash floor protects BOTH the claude PreToolUse
-    // hook AND the codex/opencode `govern_tool_call` path. All `git_only` so they
-    // never fire outside a git invocation; triggers carry a trailing space (or the
-    // explicit verb) so read-only neighbours are NOT caught:
-    //   `git push`     → blocked   |  `git push --dry-run` → allowed (allow_if)
-    //   `git merge `   → blocked   |  `git merge-base …`    → NOT caught (no space)
-    //   `git rm `      → blocked
-    //   `git branch -d`/`-D`/`--delete` → blocked (a branch drop loses commits)
-    //   `git stash drop`/`clear`        → blocked (stashed work lost)
-    //   `git update-ref -d`/`reflog delete`/`worktree remove` → blocked (history)
-    // A plain `git push` reaches the network and rewrites the remote, so it
-    // escalates even though it's not a `--force`.
-    BashPattern {
-        trigger: "git push",
-        why: "`git push` sends commits to a remote and (per UmaDev's trust contract) UmaDev never auto-pushes — the customer reviews and pushes themselves.",
-        fix: "Let the user run the push, or confirm the branch + remote explicitly. `git push --dry-run` is allowed for inspection.",
-        git_only: true,
-        // `--dry-run` is inspection-only; `--force-with-lease` stays consistent
-        // with the dedicated `push --force` pattern above (which already allows it).
-        allow_if: &["--dry-run", "--force-with-lease"],
-    },
-    BashPattern {
-        trigger: "git merge ",
-        why: "`git merge` mutates the current branch's history — UmaDev isolates work on `umadev/<slug>` and never auto-merges into the user's branch.",
-        fix: "Leave the merge to the user after they review the diff. (Read-only `git merge-base` is not affected.)",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git rm ",
-        why: "`git rm` deletes tracked files from the working tree and the index.",
-        fix: "If a file must go, delete it in a reviewed change; UmaDev flags `git rm` so the removal is conscious.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git branch -d",
-        why: "`git branch -d`/`-D` deletes a branch; `-D` force-deletes even unmerged commits, losing work.",
-        fix: "Confirm the branch is fully merged/pushed before deleting it.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git branch --delete",
-        why: "`git branch --delete` (the long form of `-d`/`-D`) deletes a branch and can drop unmerged commits.",
-        fix: "Confirm the branch is fully merged/pushed before deleting it.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git stash drop",
-        why: "`git stash drop` permanently discards a stashed change with no recovery.",
-        fix: "Apply or inspect the stash first (`git stash show -p`); drop only when you're sure.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git stash clear",
-        why: "`git stash clear` deletes ALL stashed changes irreversibly.",
-        fix: "Review each stash entry before clearing; this loses every stash at once.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git update-ref -d",
-        why: "`git update-ref -d` deletes a ref directly, bypassing the usual branch/tag safety — history can become unreachable.",
-        fix: "Delete branches/tags via `git branch`/`git tag` instead, or confirm the ref is recoverable from a reflog.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git reflog delete",
-        why: "`git reflog delete` removes reflog entries, the last safety net for recovering rewritten/lost commits.",
-        fix: "Avoid pruning the reflog; it's what lets you undo a bad reset/rebase.",
-        git_only: true,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "git worktree remove",
-        why: "`git worktree remove` deletes a linked worktree and any uncommitted changes inside it.",
-        fix: "Commit or stash inside the worktree first; UmaDev flags the removal so it's conscious.",
-        git_only: true,
-        allow_if: &[],
-    },
-    // dd of=/dev/...  —  raw disk write, can brick the system. Match on
-    // `of=/dev/` (not `dd of=`) since flags interleave (`dd if=… of=/dev/sda`).
-    BashPattern {
-        trigger: "of=/dev/",
-        why: "Writing to a device node (`of=/dev/…`) can overwrite a disk, partition, or memory device — `dd` makes this destructive and silent.",
-        fix: "Confirm the `of=` target is correct and intended. This is flagged so a typo doesn't brick the machine.",
-        git_only: false,
-        allow_if: &[],
-    },
-    // mkfs on a real device  —  formats a disk/partition.
-    BashPattern {
-        trigger: "mkfs",
-        why: "`mkfs` formats a filesystem — running it on the wrong device destroys data.",
-        fix: "Triple-check the device path. UmaDev flags any `mkfs` so it's a conscious decision.",
-        git_only: false,
-        allow_if: &[],
-    },
-    // Drop / delete database / table (destructive SQL via psql/mysql inline).
-    BashPattern {
-        trigger: "drop database",
-        why: "`DROP DATABASE` is irreversible in most engines.",
-        fix: "Back up first (`pg_dump`/`mysqldump`). UmaDev flags this so it's intentional.",
-        git_only: false,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "drop table",
-        why: "`DROP TABLE` deletes the table and all its rows irreversibly.",
-        fix: "Use `DROP TABLE IF EXISTS` in a migration, or back up first. UmaDev flags raw `drop table`.",
-        git_only: false,
-        allow_if: &[],
-    },
-    // Shutdown / reboot  —  not appropriate inside a dev agent.
-    BashPattern {
-        trigger: "shutdown",
-        why: "`shutdown` powers off the machine — not something a dev agent should do.",
-        fix: "Remove the shutdown command; it halts the user's machine.",
-        git_only: false,
-        allow_if: &[],
-    },
-    BashPattern {
-        trigger: "init 0",
-        why: "`init 0` halts the system.",
-        fix: "Remove the command; it powers off the user's machine.",
-        git_only: false,
-        allow_if: &[],
-    },
 ];
 
 #[cfg(test)]

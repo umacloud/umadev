@@ -204,7 +204,7 @@
 "gate.artifacts_header" = "工件摘要:"
 "gate.quality_warn_header" = "[warn] 质量提醒:"
 "gate.scaffold_warn" = "{}: offline scaffold — worker 超时或未配置, 用 /revise 重新生成"
-"gate.short_warn" = "{}: only {} lines — may be incomplete"
+"gate.short_warn" = "{}: 仅 {} 行 — 可能不完整"
 "gate.suggest_revise" = "建议: 用 /revise '重新生成 architecture' 让 worker 补充"
 "gate.quality_line" = "质量: {} CSS tokens · dark mode: {}"
 "gate.detail.missing" = "[warn] 缺失"
@@ -265,6 +265,12 @@
 "intent.quick_edit" = "小修改（{}）——直接做 + 定向校验。"
 "intent.explain" = "讲解/答疑（{}）——只读理解,不动工作区。"
 "intent.chat" = "这是对话（{}）——直接回应,不进开发流程。"
+"intent.rationale.chat" = "这是对话,直接回应,不进开发流程。"
+"intent.rationale.explain" = "这是一次讲解/答疑,只读理解,不改动工作区。"
+"intent.rationale.quick_edit" = "这是一个小修改,快速单写 + 定向校验即可。"
+"intent.rationale.debug_fast" = "这是一个小排障,快速定位并修复。"
+"intent.rationale.debug_deep" = "这是一个排障任务,影响面待定,进研发流程定位+修复+回归。"
+"intent.rationale.build" = "判定为完整构建:需求规模较大、涉及多个环节,交由多角色团队分阶段交付更稳妥。"
 "intent.depth.fast" = "快速"
 "intent.depth.standard" = "标准"
 "intent.depth.deep" = "深度"
@@ -273,6 +279,7 @@
 "intent.writer_lock_blocked" = "[blocked] 意图 · 写入任务无法取得工作区单写者锁：{}"
 "intent.targeted_verification_missing" = "[blocked] 定向代码修改已经落盘，但没有观察到成功的定向测试/构建/lint 证据。本轮不会标记为完成；请运行最小相关校验后重试。"
 "intent.git_commit_host_boundary" = "[blocked] Git 提交是宿主独占事务，绝不交给 AI 底座执行。请先单独发送普通提交请求（例如“提交git记录”）；测试、修改、推送、amend 或其他动作请在提交完成后另发一条请求。"
+"intent.git_commit_done" = "[ok] 已创建本地提交 {}\n提交的文件：{}"
 "intent.git_commit_cancelled" = "Git 提交已取消；原项目流程与会话暂停状态保持不变。请核对 git status 确认工作区。"
 "intent.git_commit_worker_failed" = "Git 提交事务异常终止，未发布结果；原项目流程与会话暂停状态保持不变。请核对 git status 确认工作区。"
 
@@ -294,11 +301,11 @@
 "input.kind.text" = "文本"
 "input.kind.image" = "图片"
 "input.kind.file" = "文件"
-"input.delivery.native" = "Native"
-"input.delivery.materialized_text" = "MaterializedText"
-"input.delivery.reference_only" = "ReferenceOnly"
-"input.delivery.unsupported" = "Unsupported"
-"input.delivery.invalid" = "Invalid"
+"input.delivery.native" = "原生"
+"input.delivery.materialized_text" = "转为文本"
+"input.delivery.reference_only" = "仅引用"
+"input.delivery.unsupported" = "不支持"
+"input.delivery.invalid" = "无效"
 "input.delivery.receipt" = "底座传输写入回执 · {}"
 "input.delivery.protocol_acknowledged" = "底座协议确认（不代表模型已处理） · {}"
 "input.delivery.rejected" = "输入块 #{}（{}）= {}：{}。请移除或替换该附件后重发；没有记录本地路径。"
@@ -314,6 +321,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode 在当前传输上不保证同一轮 steer；已原样排到下一轮。"
 "input.steer.grok_acp_unsupported" = "Grok Build 当前协商出的 ACP 会话不支持 steer；已原样排到下一轮。"
 "input.steer.kimi_acp_unsupported" = "Kimi Code 当前协商出的 ACP 会话不支持同一轮 steer；已原样排到下一轮。"
+"input.steer.returned" = "本轮结束前，这条消息未确认送达底座，已放回输入框；如仍需要，请重新发送。"
 "input.steer.not_active_queued" = "常驻会话尚未进入可接收实时输入的状态；已原样排到下一轮。"
 "input.steer.backpressure_queued" = "同一轮输入通道正忙；已完整、可见地排到下一轮。"
 "input.steer.safe_point_backpressure_queued" = "实时 steer 通道正忙，本条尚未提交到底座；已完整、可见地排到下一普通回合。"
@@ -377,7 +385,7 @@
 "plan.panel.collapsed" = "计划 {}/{} — /plan 展开"
 "plan.panel.active_step" = "步骤 {}/{} · 进行中"
 "plan.panel.interrupted" = "计划(已中断 —— /continue 继续)"
-"run.transient_resume_hint" = "底座限流或临时中断 —— 本轮计划已保存,输入 `/continue` 继续未完成的步骤"
+"run.transient_resume_hint" = "底座限流、额度用完或临时中断 —— 本轮计划已保存,输入 `/continue` 继续未完成的步骤"
 "run.budget_pause_resume_hint" = "已到时间上限,本轮已暂停在第 {}/{} 步 —— 输入 `/continue` 续跑剩余步骤"
 "run.operational_pause_resume_hint" = "所需评审服务暂时不可用（{}）—— 本轮已暂停在第 {}/{} 步，没有改动源码或判定计划失败；输入 `/continue` 重试当前步骤"
 "plan.summary.header" = "任务总结 — {} 完成 · {} 进行中 · {} 堵塞 · {} 未完成"
@@ -518,6 +526,7 @@
 # Shared config write error
 "config.write_failed" = "(无法写入 {}: {})"
 "config.save_failed_note" = "[warn] 设置已对本会话生效,但未能持久化保存(下次启动会回退):{}"
+"config.unreadable" = "[warn] 无法读取设置文件 {}（{}）。UmaDev 已使用默认设置启动，未改动该文件。请修正后重启；如果在此之前修改了设置，原文件会先以 .bak 副本保存在同一目录。"
 
 # Chitchat replies (offline keyword heuristic)
 "chitchat.greeting" = "你好!我是 UmaDev — 你的 AI 编码项目总监 Agent。\n\n直接输入你要做的产品需求,我会启动 9 阶段流水线:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\n例如:\n  做一个带邮箱登录的 SaaS 落地页\n  做一个 TODO 待办应用\n  做一个博客系统"
@@ -629,6 +638,18 @@
 "continue.chat_directive" = "继续完成我们上次未完成的工作。"
 "continue.resuming_plan" = "团队 · 续跑已保存的计划(已完成 {}/{} 步)— 只跑剩下的部分"
 "continue.unowned_run" = ".umadev 里保存的任务不是本机 UmaDev 写入的(可能随仓库一起带来),因此没有续跑。请先查看:\n{}\n确认要按上面的计划执行,请发送 /continue adopt;要重新开始,直接输入新需求。"
+"plan.stranded_skipped" = "团队 · {} 个计划步骤因前置被阻塞而跳过(标记为已阻塞,未执行)"
+"team.post_build_qc_started" = "团队 · 构建执行已结束，尚未验收 — 正在运行设计/质量扫描 + 团队评审(和 /run 同一套验收)"
+"qc.floor_input_unreadable" = "无法完整读取 {}：{}"
+"qc.acceptance_scan_incomplete" = "源码扫描未能读完全部源文件：最多读取 {} 个文件、共 {} MB、单个 UTF-8 文件 {} MB、{} 层目录，且不会跟随指向源码的符号链接"
+"qc.acceptance_unavailable" = "底线 · 未能核对计划中的 API 接口是否已实现（{}）— 此项不阻断交付，交付前请自行核对"
+"qc.coverage_nothing_to_trace" = "还没有可用来追踪 PRD 需求的计划、任务清单或架构文档"
+"qc.coverage_advisory" = "底线 · {} 条 PRD 需求没有出现在任何计划步骤、任务清单或架构文档中：{} — 仅作提示，不阻断交付；设置 UMADEV_STRICT_COVERAGE=1 可让未追踪的需求阻断交付"
+"qc.coverage_unavailable" = "底线 · 未检查需求覆盖（{}）— 此项不阻断交付"
+"qc.scope_not_judged" = "底线 · 未检查改动范围：已完成的计划步骤 {} 没有声明文件范围，本次改动无法归属到计划步骤 — 此项不阻断交付"
+"signal.first_pass_low" = "信号 · 这一类需求的一次过验收率偏低({}%)— 轻量路径历史上不太可靠,建议多校验 / 降低自动化档位(仅供参考,确定性底线不变)"
+"signal.sizing_heavier" = "信号 · 这一类需求历史上常被低估体量(轻量路径多次升级成真实多步构建)— 以后默认体量可更重一档(仅供参考,不改变本次处理与确定性底线)"
+"signal.sizing_lighter" = "信号 · 这一类需求历史上常被高估体量(重型路径多次只产出微小结果)— 以后默认体量可更轻一档(仅供参考,不改变本次处理与确定性底线)"
 "revise.usage" = "用法:/revise <修订说明>。\n  示例:/revise 去掉社交登录,只留邮箱密码"
 "revise.no_gate" = "目前没有打开的检查点,无法修订 — 要修改产出需要先等运行停在检查点(确认核心文档 / 确认前端预览)。"
 
@@ -707,6 +728,7 @@
 "template.switched" = "种子模板切换为 `{}` — 下一个 run 的 frontend 阶段将参考此模板的页面结构和质量标准。"
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[模式] 这次运行保存时处于 {} 模式，而本会话当前为 {} 模式，因此将按本会话的权限继续。如需按保存时的权限继续，请先用 /mode {} 切换。"
 "run.busy_reopen" = "流水线正在跑 — 先 /cancel 停掉再重开,避免两个流水线同时写同一个工作区。"
 "run.usage" = "用法:/run [--slug <slug>] <需求>\n  示例:/run --slug my-project 做一个登录系统\n  示例:/run 构建端到端测试套件 (slug 自动用目录名)"
 "goal.busy_reopen" = "已经有任务在跑 — 先 /cancel 停掉再 /goal,避免两个任务同时写同一个工作区。"
@@ -781,7 +803,7 @@
 "deploy.starting" = "开始部署,执行:`{}`\n  (这可能需要登录平台 CLI,按提示操作)"
 
 # /auto and /manual
-"review.auto_on" = "[ok] 自主模式:已开启。文档与预览检查点将自动通过,直接交付。\n  (想逐步审核 -> /manual · 永久设置 -> .umadevrc 的 auto_approve_gates)"
+"review.auto_on" = "[ok] 自主模式:已开启。文档与预览检查点将自动通过,直接交付。\n  (想逐步审核 -> /manual · 只对本次会话有效,新会话默认逐门审核)"
 "review.manual_on" = "[ok] 审核模式:已开启。每个检查点都会停下,展示产出,等你输入 c 通过或打字修改。\n  (想全自动 -> /auto · 澄清问题始终会先问你)"
 
 # /animations
@@ -830,6 +852,8 @@
 
 # /deploy 确认前自检
 "deploy.confirm_preflight" = "准备部署(尚未执行)。将运行:\n  {}\n\n部署前自检:1) 构建/测试已过  2) 环境变量与密钥已在目标平台配好  3) 目标环境(prod/preview)正确  4) 数据库迁移/回滚预案就绪。\n确认无误后输入 /deploy confirm 才真正部署。"
+"deploy.cli_preflight" = "准备部署(尚未执行)。将运行:\n  {}\n\n部署前自检:1) 构建/测试已过  2) 环境变量与密钥已在目标平台配好  3) 目标环境(prod/preview)正确  4) 数据库迁移/回滚预案就绪。"
+"deploy.cli_run_hint" = "确认无误后运行 `{}` 才真正部署(在脚本中可加 `--yes` 跳过确认)。"
 
 # Worker / 底座 spawn 错误提示(后台任务里发出,走进程级当前语言)
 "worker.init_failed" = "[warn] 无法初始化 worker `{}`: {}\n  请检查: 自定义 provider 的 kind/base_url/key 是否正确? 或用 /backend 选一个已登录的 CLI; /offline 切离线模板。"
@@ -852,6 +876,7 @@
 "base.fail.auth.grok" = "Grok Build 未登录 — 请在终端运行 `grok login`,然后用 /continue 续上;UmaDev 不会自动打开登录浏览器"
 "base.fail.auth.generic" = "底座未登录或鉴权失败 — 运行底座的登录命令(或检查 API key),然后用 /continue 续上"
 "base.fail.ratelimit" = "底座触发限流 — 等待其重置(见下方底座的原始信息),或用 /model 切换模型,或换个底座"
+"base.fail.quota" = "底座的用量额度或账户余额已用完 — 等额度重置(见下方底座的原始信息)、充值,或用 /model 切换模型;重试不会解决"
 "base.fail.overloaded" = "底座过载(忙)— 稍后重试,或用 /model 切到更轻量的模型,或换个底座"
 "base.fail.network" = "连不上底座的模型端点 — 检查网络或代理设置"
 "base.fail.network.ssl" = "SSL / 证书校验失败 — 检查代理或企业证书(NODE_EXTRA_CA_CERTS)"
@@ -1223,6 +1248,8 @@
 "tui.bang.spawn_failed" = "无法执行:{}"
 "tui.bang.timeout" = "命令超时"
 "tui.bang.no_output" = "(无输出)"
+"tui.local.cancelled" = "[已取消] 已按你的要求停止：该命令及其启动的所有进程均已终止。"
+"tui.local.busy" = "本地命令仍在运行。请等待它结束，或先用 Esc Esc、Ctrl+C 或 /cancel 停止它。"
 "tui.local.output_truncated" = "[较早的命令输出已截断]"
 # 帮助浮层 + 命令面板共享的斜杠命令描述(单一来源)。
 # 多数命令复用上面的 tui.help.* 文案;以下覆盖此前只有英文面板提示(或没有提示)、
@@ -1338,7 +1365,7 @@
 "gate.name.clarify" = "澄清提问检查点"
 "gate.name.docs" = "核心文档确认检查点"
 "gate.name.preview" = "前端预览确认检查点"
-"continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}(放宽:/mode auto;claude 底座要完全放行可设 UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
+"continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}(放宽:/mode auto 后,安装依赖、拉取代码等常规联网操作不再询问;不可逆动作在任何档位都需要你确认,请在交互式 TUI 中批准,或自行执行)"
 "continuous.dangerous_action_denied_plan" = "[plan] 当前是只读(计划)模式,底座想执行的写入/命令按只读拒绝(非你的决定):{} -> {}。要让它真正动手,请 /mode guarded(每步确认)或 /mode auto(自动过门)后重试。"
 "continuous.tool_call_blocked" = "[gov] {} 阶段:底座工具调用触发 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 阶段被截断(底座到达回合上限),保留已产出,继续。"
@@ -1352,6 +1379,8 @@
 "continuous.team.cross_review_header" = "[team] {} 角色团队交叉评审(只读分叉,并行):{} 名 critic 各从本职审一遍…"
 "continuous.team.seat_passed" = "[team] {}:通过,无阻塞项。"
 "continuous.team.seat_blocking" = "[team] {}:提出 {} 个阻塞项。"
+"continuous.team.review_reduced_files" = "[team] {} 评审按缩减范围进行:{} / {} 个必审变更文件完整送审,其余以已声明的抽样或省略送审(见评审清单)。"
+"continuous.team.review_reduced_scope" = "[team] {} 评审按缩减范围进行:无法完整读取本次运行改动的文件集,评审看到的是已声明的优先级抽样。"
 "continuous.verify_failed" = "[verify] 真实构建/测试/lint 有失败步骤(已记入审计,质量门会据此打分)。"
 "continuous.quality_gate_result" = "质量门结果:{}/100 · {}(确定性硬信号)"
 "continuous.quality_gate_advisory" = "质量评分:{}/100 —— 建议改进(轻量任务,不阻断)"
@@ -1473,6 +1502,6 @@
 "design.picker.heading" = "设计体系\n==============\n\n"
 "design.picker.none" = "未找到设计体系。\n运行 /init 将其生成到 knowledge/design-systems/\n"
 "design.picker.usage" = "用法: /design <name>\n\n"
-"design.picker.pending" = "[pending]"
+"design.picker.pending" = "[待选]"
 "design.preview.unreadable" = "  (文件不可读)"
 "design.preview.use" = "  适用: {}\n"

@@ -1,8 +1,8 @@
-#[cfg(not(unix))]
-use super::git_stage_zero_entry;
 use super::{
-    git_command_failed, git_commit_blocked, git_mutating_output, git_mutating_output_with_input,
-    git_output, GitCommitBaseline, GitTransactionGuard, ResidentExecutionBlocked,
+    bounded_git_command_output, configured_git_bool, configured_git_overrides, git_command_failed,
+    git_commit_blocked, git_content_probe_command, git_mutating_output,
+    git_mutating_output_with_input, git_output, git_stage_zero_entry, BTreeSet, GitCommandLimits,
+    GitCommitBaseline, GitTransactionGuard, ResidentExecutionBlocked,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -15,10 +15,34 @@ pub(crate) async fn stage_paths_without_filters(
     transaction: &mut GitTransactionGuard,
 ) -> Result<(), ResidentExecutionBlocked> {
     reject_index_info_paths(paths)?;
-    reject_content_transforming_attributes(root, paths)?;
+    let overrides = configured_git_overrides(root)?;
+    let unconverted =
+        reject_content_transforming_attributes(root, paths, overrides.attributes_file.as_deref())?;
+    // Like native Git, trust the working tree's executable bit only when
+    // `core.fileMode` allows it (it is `false` on WSL `/mnt/c`, exFAT, SMB).
+    let trust_executable_bit =
+        cfg!(unix) && configured_git_bool(root, "core.fileMode")?.unwrap_or(true);
+    // Like native `git add`, store text with the user's own line-ending
+    // settings. Git's built-in CRLF conversion is the only transformation left:
+    // content attributes were refused above and every filter program is blanked.
+    let converted = if overrides.line_endings.normalizes_stored_text() {
+        let stored_crlf = paths_stored_with_crlf(root, paths)?;
+        paths
+            .iter()
+            .filter(|path| !unconverted.contains(**path) && !stored_crlf.contains(**path))
+            .map(|path| (*path).to_string())
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let override_args = overrides
+        .args()
+        .into_iter()
+        .flat_map(|value| ["-c".to_string(), value])
+        .collect::<Vec<_>>();
     let mut index_info = Vec::new();
     for path in paths {
-        let Some(mode) = raw_index_mode(root, path)? else {
+        let Some(mode) = raw_index_mode(root, path, trust_executable_bit)? else {
             let zero = deletion_object_id(transaction)?;
             append_index_info_record(&mut index_info, "0", &zero, path);
             continue;
@@ -30,6 +54,20 @@ pub(crate) async fn stage_paths_without_filters(
                 root,
                 &["hash-object", "-w", "--stdin"],
                 &target,
+                timeout,
+                "git-hash-object-timeout",
+                "git hash-object",
+                transaction,
+            )
+            .await?
+        } else if converted.contains(*path) {
+            let hash_path = format!("--path={path}");
+            let mut args = override_args.iter().map(String::as_str).collect::<Vec<_>>();
+            args.extend(["hash-object", "-w", hash_path.as_str(), "--"]);
+            git_mutating_output(
+                root,
+                &args,
+                &[*path],
                 timeout,
                 "git-hash-object-timeout",
                 "git hash-object",
@@ -243,7 +281,11 @@ fn symlink_target_bytes(root: &Path, path: &str) -> Result<Vec<u8>, ResidentExec
     }
 }
 
-fn raw_index_mode(root: &Path, path: &str) -> Result<Option<String>, ResidentExecutionBlocked> {
+fn raw_index_mode(
+    root: &Path,
+    path: &str,
+    trust_executable_bit: bool,
+) -> Result<Option<String>, ResidentExecutionBlocked> {
     let metadata = match std::fs::symlink_metadata(root.join(path)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -264,43 +306,109 @@ fn raw_index_mode(root: &Path, path: &str) -> Result<Option<String>, ResidentExe
         ));
     }
     #[cfg(unix)]
-    {
+    if trust_executable_bit {
         use std::os::unix::fs::PermissionsExt as _;
-        Ok(Some(
-            if metadata.permissions().mode() & 0o111 == 0 {
+        // Git records only the owner's executable bit.
+        return Ok(Some(
+            if metadata.permissions().mode() & 0o100 == 0 {
                 "100644"
             } else {
                 "100755"
             }
             .to_string(),
-        ))
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        let executable =
-            git_stage_zero_entry(root, path)?.is_some_and(|(mode, _)| mode == "100755");
-        Ok(Some(
-            if executable { "100755" } else { "100644" }.to_string(),
-        ))
-    }
+    // Without a trusted executable bit Git keeps a regular file's recorded
+    // mode and gives new files 100644.
+    let executable = !trust_executable_bit
+        && git_stage_zero_entry(root, path)?.is_some_and(|(mode, _)| mode == "100755");
+    Ok(Some(
+        if executable { "100755" } else { "100644" }.to_string(),
+    ))
 }
 
+/// Paths whose staged blob already has CRLF line endings. Native `git add`
+/// stores such a file unchanged instead of converting it ("safer autocrlf"),
+/// but `hash-object` never consults the index, so ask Git with `ls-files
+/// --eol`, which classifies the staged blob with the same text test.
+fn paths_stored_with_crlf(
+    root: &Path,
+    paths: &[&str],
+) -> Result<BTreeSet<String>, ResidentExecutionBlocked> {
+    let mut args = vec!["ls-files", "--eol", "-z", "--"];
+    args.extend_from_slice(paths);
+    let output = git_output(root, &args)?;
+    if !output.status.success() {
+        return Err(git_command_failed(
+            "git-line-endings-unverifiable",
+            "git ls-files --eol",
+            &output,
+        ));
+    }
+    let mut stored_crlf = BTreeSet::new();
+    for record in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let (info, path) = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .map(|tab| (&record[..tab], &record[tab + 1..]))
+            .ok_or_else(|| {
+                git_commit_blocked(
+                    "git-line-endings-unverifiable",
+                    "Git 返回了无法解析的换行信息 / Git returned malformed line-ending information",
+                )
+            })?;
+        let staged = info
+            .split(u8::is_ascii_whitespace)
+            .next()
+            .unwrap_or_default();
+        if matches!(staged, b"i/crlf" | b"i/mixed") {
+            let path = std::str::from_utf8(path).map_err(|_| {
+                git_commit_blocked(
+                    "git-line-endings-unverifiable",
+                    "Git 返回了非 UTF-8 路径 / Git returned a non-UTF-8 path",
+                )
+            })?;
+            stored_crlf.insert(path.to_string());
+        }
+    }
+    Ok(stored_crlf)
+}
+
+/// Refuse a path whose attributes make Git transform its content, reading
+/// every attribute file native Git reads, including the user's global and the
+/// system file, which the isolated children skip: a global `* text=auto` would
+/// otherwise convert only in the user's own Git. Returns the paths whose
+/// attributes turn line-ending conversion off (`-text`, `binary`, a legacy
+/// `-crlf`); native `git add` stores those byte for byte.
 fn reject_content_transforming_attributes(
     root: &Path,
     paths: &[&str],
-) -> Result<(), ResidentExecutionBlocked> {
-    let mut args = vec![
-        "check-attr",
-        "-z",
-        "filter",
-        "ident",
-        "text",
-        "eol",
-        "working-tree-encoding",
-        "--",
-    ];
-    args.extend_from_slice(paths);
-    let output = git_output(root, &args)?;
+    attributes_file: Option<&Path>,
+) -> Result<BTreeSet<String>, ResidentExecutionBlocked> {
+    let mut command = git_content_probe_command(root, attributes_file);
+    command
+        .args([
+            "check-attr",
+            "-z",
+            "filter",
+            "ident",
+            "text",
+            "crlf",
+            "eol",
+            "working-tree-encoding",
+            "--",
+        ])
+        .args(paths);
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits::default(),
+        "git-attributes-unverifiable",
+        "git check-attr",
+    )?;
     if !output.status.success() {
         return Err(git_command_failed(
             "git-attributes-unverifiable",
@@ -308,21 +416,32 @@ fn reject_content_transforming_attributes(
             &output,
         ));
     }
+    let mut unconverted = BTreeSet::new();
     let records = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
     for fields in records.chunks_exact(3) {
+        let path = String::from_utf8_lossy(fields[0]);
+        let attribute = String::from_utf8_lossy(fields[1]);
         let value = String::from_utf8_lossy(fields[2]);
-        if !value.is_empty() && value != "unspecified" && value != "unset" {
-            let path = String::from_utf8_lossy(fields[0]);
-            let attribute = String::from_utf8_lossy(fields[1]);
-            return Err(git_commit_blocked(
-                "git-content-transformation-blocked",
-                &format!(
-                    "`{path}` 启用了 `{attribute}={value}`,普通仅提交事务拒绝隐式内容转换 / content-transforming attributes require native Git"
-                ),
-            ));
+        match value.as_ref() {
+            "" | "unspecified" => {}
+            // `text` wins over the legacy `crlf`, and any other `text` value
+            // is refused below, so either one unset means "no conversion".
+            "unset" => {
+                if matches!(attribute.as_ref(), "text" | "crlf") {
+                    unconverted.insert(path.into_owned());
+                }
+            }
+            _ => {
+                return Err(git_commit_blocked(
+                    "git-content-transformation-blocked",
+                    &format!(
+                        "`{path}` 启用了 `{attribute}={value}`,普通仅提交事务拒绝隐式内容转换 / content-transforming attributes require native Git"
+                    ),
+                ));
+            }
         }
     }
-    Ok(())
+    Ok(unconverted)
 }
 
 fn parse_object_id(bytes: &[u8], code: &'static str) -> Result<String, ResidentExecutionBlocked> {

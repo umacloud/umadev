@@ -990,6 +990,29 @@ fn doctor_completes_a_nonempty_interrupted_v2_fence() {
 }
 
 #[test]
+fn failed_first_fence_write_leaves_no_empty_fence() {
+    // A full disk (or quota) while the first fence is written must not leave
+    // an empty `run.lock`: no run and no doctor could ever clear that file.
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root = tmp.path();
+    let dir = root.join(".umadev");
+    std::fs::create_dir(&dir).unwrap();
+    let fence = dir.join("run.lock");
+
+    let error = super::fence::ensure_v2_fence_with(&fence, |_| {
+        Err(io::Error::other("No space left on device"))
+    })
+    .expect_err("the failed write is reported");
+    assert!(error.to_string().contains("No space left"), "{error}");
+    assert!(!fence.exists(), "the half-created fence is removed");
+
+    let lock = RunLock::acquire_for_run(root).expect("the next run creates the fence");
+    assert!(lock.is_owned());
+    drop(lock);
+    assert_eq!(std::fs::read(&fence).unwrap(), V2_FENCE);
+}
+
+#[test]
 fn doctor_refuses_to_race_an_active_v2_run() {
     let tmp = tempfile::TempDir::new().expect("tmp");
     let root = tmp.path();

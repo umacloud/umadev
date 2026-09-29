@@ -240,10 +240,11 @@ impl ClaudeCodeDriver {
     /// AND a pinned `session_id`, the first `complete` creates the session
     /// (`--session-id`) and every later call on this instance resumes it
     /// (`--resume`). Off (the default) keeps the literal session matrix the TUI
-    /// relies on. No-op without a pinned id. Builder form (mainly for tests).
+    /// relies on. No-op without a pinned id. Builder form of
+    /// [`HostDriver::set_session_autoresume`] (mainly for tests).
     #[must_use]
     pub fn with_session_autoresume(mut self, on: bool) -> Self {
-        self.session_started = on.then(|| Arc::new(AtomicBool::new(false)));
+        self.set_session_autoresume(on);
         self
     }
 
@@ -322,7 +323,10 @@ impl ClaudeCodeDriver {
     ///   development posture. `--allowedTools` only pre-approves named tools
     ///   without a prompt; it is not a deny-list or a second sandbox.
     /// - `--dangerously-skip-permissions`: Auto only. It is never emitted by
-    ///   Plan/Guarded and is removed when `UMADEV_NO_SKIP_PERMS=1`.
+    ///   Plan/Guarded and is removed when `UMADEV_NO_SKIP_PERMS=1`. Claude
+    ///   refuses it as root outside a declared sandbox (`IS_SANDBOX=1` or
+    ///   `CLAUDE_CODE_BUBBLEWRAP=1`), so there Auto runs `acceptEdits` with the
+    ///   same tools instead of a flag that would end the call.
     /// - `--output-format text`: explicit text output — no JSON envelope
     ///   so the existing `clean_output` pipeline gets plain markdown.
     ///
@@ -349,16 +353,34 @@ impl ClaudeCodeDriver {
         self.base_args_with_format_for(
             output_format,
             std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1"),
+            claude_refuses_bypass(
+                running_as_root(),
+                std::env::var("IS_SANDBOX").ok().as_deref(),
+                std::env::var("CLAUDE_CODE_BUBBLEWRAP").ok().as_deref(),
+            ),
         )
     }
 
-    fn base_args_with_format_for(&self, output_format: &str, no_skip: bool) -> Vec<String> {
+    fn base_args_with_format_for(
+        &self,
+        output_format: &str,
+        no_skip: bool,
+        bypass_refused: bool,
+    ) -> Vec<String> {
         // The environment switch is a one-way safety latch. It never upgrades a
         // less-trusted profile and is sampled when the subprocess args are built.
         let permissions = if self.permissions.auto_approve() && no_skip {
             BasePermissionProfile::Guarded
         } else {
             self.permissions
+        };
+        // A one-shot call sends its prompt as plain text, so Claude has no
+        // channel to ask UmaDev and Auto keeps its full working set here. It
+        // runs `bypassPermissions` unless Claude would refuse that and exit.
+        let auto_mode = if bypass_refused {
+            "acceptEdits"
+        } else {
+            "bypassPermissions"
         };
         let (permission_mode, allowed_tools) = match permissions {
             // Plan and Guarded pre-approve no web tool: they confirm every network
@@ -370,7 +392,7 @@ impl ClaudeCodeDriver {
                 "Read,Grep,Glob,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
             ),
             BasePermissionProfile::Auto => (
-                "bypassPermissions",
+                auto_mode,
                 "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookEdit,Agent,Task,TaskOutput,BashOutput,AgentOutput",
             ),
         };
@@ -380,13 +402,41 @@ impl ClaudeCodeDriver {
             output_format.to_string(),
             "--permission-mode".to_string(),
             permission_mode.to_string(),
-            "--allowedTools".to_string(),
-            allowed_tools.to_string(),
+            // `--allowedTools <tools...>` is variadic: the space-separated form
+            // would swallow any following bare word — including the prompt the
+            // subprocess layer appends last — as another tool name. `=` binds
+            // exactly one value.
+            format!("--allowedTools={allowed_tools}"),
         ];
-        if permissions.auto_approve() {
+        if permissions.auto_approve() && !bypass_refused {
             args.push("--dangerously-skip-permissions".to_string());
         }
         args
+    }
+}
+
+/// Claude refuses `bypassPermissions` and `--dangerously-skip-permissions` when
+/// it runs as root outside a declared sandbox (`IS_SANDBOX=1` or
+/// `CLAUDE_CODE_BUBBLEWRAP=1`): it prints the reason and exits before doing
+/// anything. Docker, dev containers and cloud VMs often run as root.
+fn claude_refuses_bypass(
+    is_root: bool,
+    is_sandbox: Option<&str>,
+    bubblewrap: Option<&str>,
+) -> bool {
+    is_root && is_sandbox != Some("1") && bubblewrap != Some("1")
+}
+
+/// Whether UmaDev (and so the `claude` it spawns) runs with user id 0.
+/// Claude applies its root check on every platform but Windows.
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::getuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -439,16 +489,24 @@ impl Runtime for ClaudeCodeDriver {
         // claude usage untouched (see `govern_root_env` / `umadev::hook`). Also
         // raises claude's background wind-down ceiling (see `claude_call_env`).
         let govern_env = claude_call_env(&ws);
-        let out = run_subprocess(SubprocessCall {
+        let call = SubprocessCall {
             program: &self.program,
             args: &args,
             prompt: &prompt,
             workspace: &ws,
             timeout: self.timeout,
             env: &govern_env,
-        })
-        .await
-        .map_err(crate::map_subprocess_error)?;
+        };
+        let exit = crate::run_subprocess_to_exit(&call)
+            .await
+            .map_err(crate::map_subprocess_error)?;
+        // Claude reports an API failure (a 429 quota, an auth error) in its
+        // stdout result envelope, exits 1 and leaves stderr empty: name that
+        // cause instead of a bare exit code.
+        if let Some(failure) = result_failure(&String::from_utf8_lossy(&exit.stdout)) {
+            return Err(claude_failure(&failure));
+        }
+        let out = crate::subprocess_output(&call, exit).map_err(crate::map_subprocess_error)?;
 
         // Parse the `result` envelope for the answer + usage. Fall back to raw
         // stdout if extraction yields nothing (an error envelope or an
@@ -537,6 +595,9 @@ impl Runtime for ClaudeCodeDriver {
 
         match result {
             Ok(out) => {
+                if let Some(failure) = result_failure(&out.stdout) {
+                    return Err(claude_failure(&failure));
+                }
                 // The streaming stdout is all JSON lines. Extract the final
                 // result text from the `{"type":"result","result":"…"}` line.
                 let mut final_text = extract_result_text(&out.stdout).unwrap_or_else(|| {
@@ -573,6 +634,12 @@ impl Runtime for ClaudeCodeDriver {
                 // cold-restart `complete` (worst case another whole timeout).
                 tracing::debug!(error = %e, "streaming failed, falling back to non-streaming");
                 let partial = stream_buf.into_string();
+                // A terminal error result is Claude's own verdict (a 429 quota, an
+                // auth failure): never salvage its synthetic "API Error" text as the
+                // answer, and never pay for the same failure again non-streaming.
+                if let Some(failure) = result_failure(&partial) {
+                    return Err(claude_failure(&failure));
+                }
                 if let Some(text) = salvage_partial_stream(&partial) {
                     let usage = extract_usage(&partial);
                     return Ok(CompletionResponse {
@@ -613,6 +680,62 @@ fn salvage_partial_stream(stdout: &str) -> Option<String> {
     } else {
         Some(text)
     }
+}
+
+/// Result subtypes Claude flags `is_error` although the work so far stands: a
+/// turn / budget / structured-output ceiling was reached. Their partial output
+/// is kept (see [`result_error`]).
+const SOFT_CAP_SUBTYPES: &[&str] = &[
+    "error_max_turns",
+    "error_max_budget_usd",
+    "error_max_structured_output_retries",
+];
+
+/// The failure a terminal `result` frame reports, or `None` when the call
+/// ended cleanly or only hit a soft cap ([`SOFT_CAP_SUBTYPES`]). Claude puts the
+/// cause in `result` (an API error: "API Error: 429 …") or, when that is
+/// absent, in `errors[]` ("No conversation found with session ID …"). Frames
+/// are matched by content, never by key order, which differs across versions.
+fn result_failure(stdout: &str) -> Option<String> {
+    let frame = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("result"))?;
+    if frame.get("is_error").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let subtype = frame
+        .get("subtype")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if SOFT_CAP_SUBTYPES.contains(&subtype) {
+        return None;
+    }
+    let result = frame
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let errors = frame
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(match result {
+        Some(text) => text.to_string(),
+        None if !errors.is_empty() => errors,
+        None => format!("Claude ended the call with `{subtype}`"),
+    })
+}
+
+/// The runtime error for a failure Claude reported in its `result` frame.
+fn claude_failure(failure: &str) -> RuntimeError {
+    RuntimeError::HostProcess(crate::redaction::redact_text(failure))
 }
 
 /// Parse one line of `claude --output-format stream-json` output into a
@@ -980,6 +1103,10 @@ impl HostDriver for ClaudeCodeDriver {
 
     fn set_session_id(&mut self, session_id: Option<String>) {
         self.session_id = session_id;
+    }
+
+    fn set_session_autoresume(&mut self, on: bool) {
+        self.session_started = on.then(|| Arc::new(AtomicBool::new(false)));
     }
 
     fn set_workspace(&mut self, workspace: std::path::PathBuf) {
@@ -1511,7 +1638,7 @@ mod tests {
         for (profile, expected_mode, expected_bypass) in cases {
             let args = ClaudeCodeDriver::default()
                 .with_permissions(profile)
-                .base_args_with_format_for("text", false);
+                .base_args_with_format_for("text", false, false);
             let mode = args
                 .windows(2)
                 .find(|w| w[0] == "--permission-mode")
@@ -1526,7 +1653,7 @@ mod tests {
 
         let tightened = ClaudeCodeDriver::default()
             .with_permissions(BasePermissionProfile::Auto)
-            .base_args_with_format_for("text", true);
+            .base_args_with_format_for("text", true, false);
         assert!(tightened
             .windows(2)
             .any(|w| { w[0] == "--permission-mode" && w[1] == "default" }));
@@ -1536,14 +1663,207 @@ mod tests {
 
         let plan = ClaudeCodeDriver::default()
             .with_permissions(BasePermissionProfile::Plan)
-            .base_args_with_format_for("text", false);
+            .base_args_with_format_for("text", false, false);
         let allowed = plan
-            .windows(2)
-            .find(|w| w[0] == "--allowedTools")
-            .map(|w| w[1].as_str())
+            .iter()
+            .find_map(|a| a.strip_prefix("--allowedTools="))
             .unwrap_or_default();
         for mutating in ["Write", "Edit", "Bash", "NotebookEdit", "Agent", "Task"] {
             assert!(!allowed.split(',').any(|tool| tool == mutating));
+        }
+    }
+
+    #[test]
+    fn auto_profile_avoids_bypass_as_unsandboxed_root() {
+        // As root outside a declared sandbox, Claude exits at once when handed
+        // `bypassPermissions` or `--dangerously-skip-permissions`.
+        assert!(claude_refuses_bypass(true, None, None));
+        assert!(claude_refuses_bypass(true, Some("0"), Some("")));
+        assert!(!claude_refuses_bypass(true, Some("1"), None));
+        assert!(!claude_refuses_bypass(true, None, Some("1")));
+        assert!(!claude_refuses_bypass(false, None, None));
+
+        let args = ClaudeCodeDriver::default()
+            .with_permissions(BasePermissionProfile::Auto)
+            .base_args_with_format_for("text", false, true);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|a| a == "bypassPermissions"));
+        let allowed = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--allowedTools="))
+            .unwrap_or_default();
+        for tool in ["Edit", "Write", "Bash"] {
+            assert!(
+                allowed.split(',').any(|t| t == tool),
+                "Auto keeps its working set: {tool}"
+            );
+        }
+        // Plan and Guarded never used the bypass and are unchanged.
+        for (profile, mode) in [
+            (BasePermissionProfile::Plan, "plan"),
+            (BasePermissionProfile::Guarded, "default"),
+        ] {
+            let args = ClaudeCodeDriver::default()
+                .with_permissions(profile)
+                .base_args_with_format_for("text", false, true);
+            assert!(args
+                .windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == mode));
+        }
+    }
+
+    #[test]
+    fn allowed_tools_value_cannot_swallow_the_trailing_prompt() {
+        // `claude --allowedTools <tools...>` is VARIADIC: with the space-separated
+        // form, every following bare word is taken as another tool name. The
+        // non-streaming `complete` path appends nothing after the base args when
+        // there is no session flag and no model, so the prompt (appended last by
+        // the subprocess layer) was eaten as a tool and claude failed with
+        // "Input must be provided ...". The `=` form binds exactly one value.
+        for profile in [
+            BasePermissionProfile::Plan,
+            BasePermissionProfile::Guarded,
+            BasePermissionProfile::Auto,
+        ] {
+            let args = ClaudeCodeDriver::default()
+                .with_permissions(profile)
+                .call_args_with_format("json");
+            assert!(
+                !args.iter().any(|a| a == "--allowedTools"),
+                "profile {profile:?}: variadic flag must not take a separate value: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a.starts_with("--allowedTools=Read,")),
+                "profile {profile:?}: tools must be bound with `=`: {args:?}"
+            );
+        }
+    }
+
+    /// Claude 2.1.42 answering a one-shot `--output-format json` call with a
+    /// 429 quota error (captured live): exit 1, empty stderr, and the cause only
+    /// in this stdout envelope.
+    const QUOTA_JSON_ENVELOPE: &str = r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":120,"duration_api_ms":0,"num_turns":1,"result":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}","stop_reason":"stop_sequence","session_id":"5524f38c-f60b-4c8b-9e8b-4a3af4284da9","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"c4b84d72-6718-41cc-9186-344be29d6121"}"#;
+    /// The same failure from Claude 2.1.284 after its retries (captured live):
+    /// `type` is no longer the first key.
+    const QUOTA_JSON_ENVELOPE_2_1_284: &str = r#"{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"5fbcd870-72e7-4d74-9e50-891fc4c911d1","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","api_error_status":429,"result":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota","type":"result","duration_ms":179160,"uuid":"4495a4c5-10f6-4586-a153-0d72224edac5","queued_turn_count":0,"result_index":0}"#;
+
+    /// The same failure in `--output-format stream-json` (captured live): a
+    /// synthetic assistant message carrying the error text, then the error result.
+    #[cfg(unix)]
+    const QUOTA_STREAM_ASSISTANT: &str = r#"{"type":"assistant","message":{"id":"f963d6e6-fdbf-4603-8949-81b6fedabdf2","container":null,"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}"}],"context_management":null},"parent_tool_use_id":null,"session_id":"f8d4626b-a0b3-4729-a522-b1592b723e58","uuid":"323df042-c949-4eb1-8c92-006242d272be","error":"unknown"}"#;
+    #[cfg(unix)]
+    const QUOTA_STREAM_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":117,"duration_api_ms":0,"num_turns":1,"result":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}","stop_reason":"stop_sequence","session_id":"f8d4626b-a0b3-4729-a522-b1592b723e58","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"38b0d228-9918-465b-87c2-56a38ef03054"}"#;
+    /// The stream-json pair from Claude 2.1.284 (captured live).
+    #[cfg(unix)]
+    const QUOTA_STREAM_ASSISTANT_2_1_284: &str = r#"{"type":"assistant","message":{"diagnostics":null,"id":"590dc3a4-889b-4119-ace4-068950009f36","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"output_tokens_details":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota"}],"context_management":null},"parent_tool_use_id":null,"session_id":"d2500074-829c-4808-a9b1-24f30e77dd79","uuid":"5366cabe-6726-4119-be48-344b75937912","timestamp":"2026-09-29T11:19:45.507Z","error":"rate_limit","is_api_error_message":true}"#;
+    #[cfg(unix)]
+    const QUOTA_STREAM_RESULT_2_1_284: &str = r#"{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"d2500074-829c-4808-a9b1-24f30e77dd79","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","api_error_status":429,"result":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota","type":"result","duration_ms":182057,"uuid":"31217b3b-7176-4bd1-85f8-fcc98de58228","queued_turn_count":0,"result_index":0}"#;
+
+    #[test]
+    fn result_failure_names_the_cause_and_keeps_soft_caps() {
+        assert!(result_failure(QUOTA_JSON_ENVELOPE)
+            .is_some_and(|failure| failure.starts_with("API Error: 429")));
+        assert_eq!(
+            result_failure(QUOTA_JSON_ENVELOPE_2_1_284).as_deref(),
+            Some("API Error: Request rejected (429) · You have exceeded the 5-hour usage quota")
+        );
+        assert_eq!(
+            result_failure(
+                r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: x"]}"#
+            )
+            .as_deref(),
+            Some("No conversation found with session ID: x")
+        );
+        for kept in [
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"the answer"}"#,
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Reached max turns (50)"}"#,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":false,"errors":[]}"#,
+            "no result frame",
+        ] {
+            assert_eq!(result_failure(kept), None, "{kept}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn ping(content: &str) -> CompletionRequest {
+        CompletionRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: content.into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        }
+    }
+
+    /// A fake `claude` that prints `lines` on stdout, nothing on stderr, and
+    /// exits 1.
+    #[cfg(unix)]
+    fn failing_fake_claude(dir: &std::path::Path, lines: &[&str]) -> String {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-claude");
+        let mut body = "#!/bin/sh\ncat >/dev/null\n".to_string();
+        for line in lines {
+            let _ = writeln!(body, "printf '%s\\n' '{line}'");
+        }
+        body.push_str("exit 1\n");
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script.to_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_surfaces_stdout_error_envelope_on_nonzero_exit() {
+        for (envelope, cause) in [
+            (QUOTA_JSON_ENVELOPE, "API Error: 429"),
+            (
+                QUOTA_JSON_ENVELOPE_2_1_284,
+                "API Error: Request rejected (429)",
+            ),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let error =
+                ClaudeCodeDriver::with_program(failing_fake_claude(dir.path(), &[envelope]))
+                    .complete(ping("ping"))
+                    .await
+                    .unwrap_err();
+            let message = error.to_string();
+            assert!(matches!(error, RuntimeError::HostProcess(_)), "{message}");
+            assert!(
+                message.contains(cause) && message.contains("5-hour usage quota"),
+                "the cause Claude printed on stdout must reach the caller: {message}"
+            );
+            assert!(
+                !message.contains("session_id"),
+                "the cause is named, not the raw envelope quoted: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_api_error_is_not_salvaged_as_success() {
+        for frames in [
+            [QUOTA_STREAM_ASSISTANT, QUOTA_STREAM_RESULT],
+            [QUOTA_STREAM_ASSISTANT_2_1_284, QUOTA_STREAM_RESULT_2_1_284],
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let outcome = ClaudeCodeDriver::with_program(failing_fake_claude(dir.path(), &frames))
+                .complete_streaming(ping("plan the change"), &|_| {})
+                .await;
+            let Err(error) = outcome else {
+                panic!("a 429 must fail the call, not become its answer: {outcome:?}");
+            };
+            assert!(error.to_string().contains("429"), "{error}");
         }
     }
 
@@ -1652,6 +1972,33 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--resume", uuid.as_str()]));
         assert!(!args.contains(&"--continue".to_string()));
         assert!(!args.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn pinned_trait_session_first_call_creates_then_resumes() {
+        // `umadev quick` / `redo` / the legacy run configure this driver only
+        // through `HostDriver`, exactly like this. The first call must CREATE the
+        // fresh id: `--resume` of a conversation Claude never saw fails every call.
+        let id = "11111111-2222-4333-8444-555555555555".to_string();
+        let mut driver = ClaudeCodeDriver::default();
+        HostDriver::set_session_id(&mut driver, Some(id.clone()));
+        HostDriver::set_continue_session(&mut driver, true);
+        HostDriver::set_session_autoresume(&mut driver, true);
+
+        let first = driver.call_args_with_format("stream-json");
+        assert!(
+            first.windows(2).any(|w| w == ["--session-id", id.as_str()]),
+            "the first call creates the pinned session: {first:?}"
+        );
+        assert!(!first.iter().any(|arg| arg == "--resume"), "{first:?}");
+
+        driver.mark_session_started();
+        let later = driver.call_args_with_format("json");
+        assert!(
+            later.windows(2).any(|w| w == ["--resume", id.as_str()]),
+            "later calls resume the same session: {later:?}"
+        );
+        assert!(!later.iter().any(|arg| arg == "--session-id"), "{later:?}");
     }
 
     #[test]

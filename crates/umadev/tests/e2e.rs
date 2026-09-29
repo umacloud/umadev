@@ -22,6 +22,11 @@ fn bin() -> PathBuf {
 /// directory; production defaults remain covered by unit tests, while these CLI
 /// flow tests stay focused on orchestration and artifacts.
 fn hermetic_command(cwd: &Path) -> Command {
+    hermetic_command_for(&bin(), cwd)
+}
+
+/// [`hermetic_command`] for a given copy of the binary.
+fn hermetic_command_for(program: &Path, cwd: &Path) -> Command {
     // Keep the sandbox under UmaDev's own ignored state tree. A top-level
     // `.e2e-home` would make the `init` E2E fixture look brownfield before the
     // command even starts, weakening its empty-project coverage.
@@ -29,7 +34,7 @@ fn hermetic_command(cwd: &Path) -> Command {
     let empty_model = home.join("empty-embed-model");
     std::fs::create_dir_all(&empty_model).expect("create hermetic E2E home");
 
-    let mut command = Command::new(bin());
+    let mut command = Command::new(program);
     command
         .current_dir(cwd)
         .env("HOME", &home)
@@ -318,6 +323,80 @@ fn run_with_backend_drives_a_fake_host_cli() {
     );
 }
 
+/// `umadev quick --backend claude-code` pins one fresh session id for the run.
+/// The fake `claude` keeps Claude's real rule: `--resume` of an id it never
+/// created fails with "No conversation found". So the first model call must
+/// create the pinned id and every later call must resume that same id.
+#[test]
+#[cfg(unix)]
+fn quick_with_claude_creates_its_pinned_session_before_resuming_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let fake = root.join("fake-claude");
+    let created = root.join("created-sessions.log");
+    let calls = root.join("session-calls.log");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         case \"$1\" in --version) echo '2.1.42 (Claude Code)'; exit 0 ;; auth) echo '{\"loggedIn\":true}'; exit 0 ;; esac\n\
+         cat >/dev/null\n\
+         prev=''; mode=none; id=''\n\
+         for arg in \"$@\"; do\n\
+           [ \"$prev\" = --session-id ] && { mode=create; id=\"$arg\"; }\n\
+           [ \"$prev\" = --resume ] && { mode=resume; id=\"$arg\"; }\n\
+           prev=\"$arg\"\n\
+         done\n\
+         printf '%s %s\\n' \"$mode\" \"$id\" >> \"$FAKE_SESSION_CALLS\"\n\
+         if [ \"$mode\" = resume ] && ! grep -qx \"$id\" \"$FAKE_CREATED_SESSIONS\" 2>/dev/null; then\n\
+           printf '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"errors\":[\"No conversation found with session ID: %s\"]}\\n' \"$id\"\n\
+           exit 1\n\
+         fi\n\
+         [ \"$mode\" = create ] && printf '%s\\n' \"$id\" >> \"$FAKE_CREATED_SESSIONS\"\n\
+         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"Changed the header text.\"}'\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake, perms).unwrap();
+
+    let output = hermetic_command(root)
+        .args(["quick", "tweak the header text", "--backend", "claude-code"])
+        .env("UMADEV_CLAUDE_BIN", &fake)
+        .env("FAKE_CREATED_SESSIONS", &created)
+        .env("FAKE_SESSION_CALLS", &calls)
+        .output()
+        .expect("umadev quick --backend should be invocable");
+    let log = std::fs::read_to_string(&calls).unwrap_or_default();
+    // A concurrent fork runs on its own fresh conversation ("none"); only the
+    // calls that carry the run's pinned id are ordered.
+    let model_calls: Vec<(&str, &str)> = log
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(mode, _)| *mode != "none")
+        .collect();
+    assert!(
+        model_calls.len() >= 2,
+        "quick made fewer than two pinned model calls ({}): {log}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (first_mode, pinned) = model_calls[0];
+    assert_eq!(
+        first_mode, "create",
+        "the first call must create the pinned id: {log}"
+    );
+    assert!(!pinned.is_empty(), "the run pinned no session id: {log}");
+    for (mode, id) in &model_calls[1..] {
+        assert_eq!(
+            (*mode, *id),
+            ("resume", pinned),
+            "every later call resumes the created session: {log}"
+        );
+    }
+}
+
 /// Full-chain fake-host e2e: drive run → continue → continue with a fake
 /// `claude` so the real subprocess path (not offline templates) executes for
 /// EVERY phase. Asserts the host's output threads through multiple artifacts
@@ -550,8 +629,8 @@ fn hook_pre_write_blocks_the_irreversible_floor_but_defers_craft() {
     let emoji = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
     let s = run_hook_pre_write(emoji, Some(tmp.path()));
     assert!(
-        s.contains("allow"),
-        "emoji craft nit must be deferred, not denied: {s}"
+        s.trim().is_empty(),
+        "emoji craft nit must be deferred (no decision), not denied: {s}"
     );
     // A leaked secret is irreversible-if-written — it MUST be denied at the write.
     let secret = format!(
@@ -567,24 +646,28 @@ fn hook_pre_write_blocks_the_irreversible_floor_but_defers_craft() {
 
 /// Self-limit: with NO governance scope (the user is driving the base directly,
 /// e.g. plain claude / spec-kit), the hook passes EVERYTHING — UmaDev does not
-/// touch the user's other tools/projects.
+/// touch the user's other tools/projects. Passing prints nothing: an explicit
+/// `"allow"` would approve the call and skip the user's own permission prompt.
 #[test]
 fn hook_pre_write_passes_when_not_driving() {
     let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
     let s = run_hook_pre_write(payload, None);
     assert!(
-        s.contains("allow"),
-        "not-driving → UmaDev must not interfere, even with an emoji: {s}"
+        s.trim().is_empty(),
+        "not-driving → UmaDev must not interfere or approve, even with an emoji: {s}"
     );
 }
 
-/// `umadev hook pre-write` allows clean code (when driving).
+/// `umadev hook pre-write` passes clean code (when driving) without approving it.
 #[test]
 fn hook_pre_write_allows_clean() {
     let tmp = TempDir::new().unwrap();
     let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>Search</button>"}}"#;
     let s = run_hook_pre_write(payload, Some(tmp.path()));
-    assert!(s.contains("allow"), "clean code must be allowed: {s}");
+    assert!(
+        s.trim().is_empty(),
+        "clean code passes with no decision: {s}"
+    );
 }
 
 /// `umadev install` writes the PreToolUse hook into machine-local Claude settings.
@@ -610,6 +693,46 @@ fn install_writes_claude_hook() {
     assert!(
         settings.contains("Write|Edit|MultiEdit"),
         "must match write tools: {settings}"
+    );
+}
+
+/// REGRESSION: the install output promised that every Write/Edit is checked
+/// and every call audited, but the hooks only act in sessions UmaDev drives (it
+/// sets UMADEV_GOVERN_ROOT on the base it spawns); a Claude Code or Kimi Code
+/// session the user starts in the same project passes untouched.
+#[test]
+fn install_and_init_scope_the_hook_to_sessions_umadev_drives() {
+    let tmp = TempDir::new().unwrap();
+    let kimi_config = tmp.path().join(".umadev/e2e-home/.kimi-code");
+    std::fs::create_dir_all(kimi_config).unwrap();
+    for base in ["claude-code", "kimi-code"] {
+        let out = hermetic_command(tmp.path())
+            .args(["install", "--base", base, "--project-root"])
+            .arg(tmp.path())
+            .output()
+            .expect("install should run");
+        assert!(out.status.success(), "{base} install failed: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("sessions UmaDev drives") && stdout.contains("start yourself"),
+            "{base}: the install output must state the hook's scope: {stdout}"
+        );
+        assert!(
+            !stdout.contains("\nEvery Write/Edit tool call is checked"),
+            "{base}: {stdout}"
+        );
+    }
+    let init = hermetic_command(tmp.path())
+        .args(["init", "--project-root"])
+        .arg(tmp.path())
+        .output()
+        .expect("init should run");
+    assert!(init.status.success(), "init failed: {init:?}");
+    // The CLAUDE.md `init` writes must not promise governance of every call.
+    let claude_md = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        !claude_md.contains("\nYour Write/Edit/Bash calls pass through"),
+        "{claude_md}"
     );
 }
 
@@ -679,8 +802,8 @@ fn kimi_user_level_hook_row_fails_open_outside_its_project_scope() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("allow"),
-        "another project's global Kimi hook row must be a no-op"
+        output.stdout.is_empty(),
+        "another project's global Kimi hook row must be a silent no-op"
     );
 }
 
@@ -765,6 +888,133 @@ fn uninstall_pre_commit_removes_our_own_hook() {
         !tmp.path().join(".git/hooks/pre-commit").exists(),
         "a hook we created should be removed entirely"
     );
+}
+
+/// A workspace for a full `umadev uninstall` of a package-manager install: the
+/// built binary placed inside `node_modules` (a hard link where possible, so
+/// the real test binary is never at stake), a project with its own `.git` so
+/// hook removal cannot walk up into a real checkout, and an `npm` first on
+/// PATH that records every call.
+struct PackageInstall {
+    _tmp: TempDir,
+    exe: PathBuf,
+    project: PathBuf,
+    npm_calls: PathBuf,
+    path: std::ffi::OsString,
+}
+
+fn package_install() -> PackageInstall {
+    // CARGO_TARGET_TMPDIR shares the target directory's file system, so the
+    // hard link below works on CI runners whose system temp is another drive.
+    let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bin_dir = tmp.path().join("lib/node_modules/@umatech/cli-test/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let exe = bin_dir.join(format!("umadev{}", std::env::consts::EXE_SUFFIX));
+    if std::fs::hard_link(bin(), &exe).is_err() {
+        std::fs::copy(bin(), &exe).unwrap();
+    }
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let fake_bin = tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let npm_calls = tmp.path().join("npm-calls.txt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let npm = fake_bin.join("npm");
+        std::fs::write(
+            &npm,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", npm_calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    std::fs::write(
+        fake_bin.join("npm.cmd"),
+        format!("@echo off\r\necho %*>>\"{}\"\r\n", npm_calls.display()),
+    )
+    .unwrap();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    PackageInstall {
+        _tmp: tmp,
+        exe,
+        project,
+        npm_calls,
+        path,
+    }
+}
+
+/// REGRESSION: a full uninstall of an npm install ran `npm uninstall -g umadev`
+/// (the retired unscoped name, a no-op that exits 0), claimed success, and left
+/// `@umatech/umadev` installed. The npm launcher now removes the scoped package
+/// with the manager that owns it once this process has exited; the binary only
+/// signals that its own half (hooks, global state) finished.
+#[test]
+fn full_uninstall_of_a_package_install_hands_the_package_to_the_launcher() {
+    let install = package_install();
+    let handoff = install.project.join("handoff");
+    let out = hermetic_command_for(&install.exe, &install.project)
+        .env("PATH", &install.path)
+        .env("UMADEV_UNINSTALL_HANDOFF", &handoff)
+        .env(
+            "UMADEV_UNINSTALL_PACKAGE_COMMAND",
+            "npm uninstall -g @umatech/umadev",
+        )
+        .args(["uninstall", "--yes"])
+        .output()
+        .expect("uninstall");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "uninstall failed: {out:?}");
+    assert!(
+        stdout.contains("npm uninstall -g @umatech/umadev"),
+        "the plan must name the scoped package command: {stdout}"
+    );
+    assert!(
+        !install.npm_calls.exists(),
+        "the binary ran npm itself: {}",
+        std::fs::read_to_string(&install.npm_calls).unwrap_or_default()
+    );
+    assert!(
+        handoff.exists(),
+        "the launcher was not told to remove the package"
+    );
+    assert!(install.exe.exists(), "the running binary deleted itself");
+    assert!(
+        !stdout.contains("UmaDev uninstalled"),
+        "success is the launcher's to report once the package is gone: {stdout}"
+    );
+}
+
+/// Without the launcher (the platform binary run directly) the binary cannot
+/// know which manager owns the install, so it prints the scoped commands and
+/// exits non-zero instead of claiming an uninstall it did not finish.
+#[test]
+fn full_uninstall_of_a_package_install_without_the_launcher_does_not_claim_success() {
+    let install = package_install();
+    let out = hermetic_command_for(&install.exe, &install.project)
+        .env("PATH", &install.path)
+        .env_remove("UMADEV_UNINSTALL_HANDOFF")
+        .args(["uninstall", "--yes"])
+        .output()
+        .expect("uninstall");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "an unfinished uninstall exited 0: {out:?}"
+    );
+    assert!(
+        stdout.contains("npm uninstall -g @umatech/umadev"),
+        "the scoped removal command is missing: {stdout}"
+    );
+    assert!(!stdout.contains("npm uninstall -g umadev"), "{stdout}");
+    assert!(!stdout.contains("UmaDev uninstalled"), "{stdout}");
+    assert!(!install.npm_calls.exists(), "the binary ran npm itself");
+    assert!(install.exe.exists());
 }
 
 /// `umadev report` outputs project health even on an empty workspace.
@@ -874,6 +1124,141 @@ fn unknown_subcommand_suggests_a_correction() {
         lower.contains("did you mean") || lower.contains("similar") || lower.contains("'run'"),
         "expected a did-you-mean hint, got:\n{s}"
     );
+}
+
+/// REGRESSION: a mistyped `--mode` (asking for the read-only `plan` tier)
+/// silently became Guarded, which writes project state and drives the base.
+/// It must be a usage error, listing the tiers, before anything is written.
+#[test]
+fn run_and_quick_reject_an_unknown_mode_before_writing() {
+    for verb in ["run", "quick"] {
+        let tmp = TempDir::new().unwrap();
+        let out = hermetic_command(tmp.path())
+            .args([verb, "做一个登录页", "--mode", "pln"])
+            .output()
+            .expect("umadev should run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{verb} accepted --mode pln: {out:?}");
+        for tier in ["plan", "guarded", "auto"] {
+            assert!(
+                stderr.contains(tier),
+                "{verb}: the error must list `{tier}`: {stderr}"
+            );
+        }
+        assert!(!tmp.path().join("output").exists(), "{verb} wrote output/");
+        let state: Vec<_> = std::fs::read_dir(tmp.path().join(".umadev"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            state,
+            vec![std::ffi::OsString::from("e2e-home")],
+            "{verb} wrote project state"
+        );
+    }
+}
+
+/// REGRESSION: `umadev verify` installs dependencies and runs the project's
+/// lint / test / build steps (and fails on a failing step), but its help
+/// described a read-only conformance report and reserved execution for
+/// `--runtime`.
+#[test]
+fn verify_help_says_it_runs_the_projects_install_and_checks() {
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
+        .args(["verify", "--help"])
+        .output()
+        .expect("verify --help should run");
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for step in ["install", "lint", "test", "build", "lockfile", "non-zero"] {
+        assert!(
+            help.contains(step),
+            "verify --help must mention `{step}`: {help}"
+        );
+    }
+}
+
+/// Han ideographs and CJK / full-width punctuation.
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| {
+        ('\u{4e00}'..='\u{9fff}').contains(&c)
+            || ('\u{3000}'..='\u{303f}').contains(&c)
+            || ('\u{ff00}'..='\u{ffef}').contains(&c)
+    })
+}
+
+/// REGRESSION: only init / adopt / usage / lessons / memory resolved the saved
+/// UI language, so every other verb printed catalog text in the Simplified
+/// Chinese default even with `lang = "en"` saved (deploy, report, pr, run
+/// outcome lines, doctor rows).
+#[test]
+fn cli_verbs_follow_the_configured_language() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("vercel.json"), "{}\n").unwrap();
+    // hermetic_command points XDG_CONFIG_HOME here, so this is the user config.
+    let config = tmp
+        .path()
+        .join(".umadev/e2e-home/.config/umadev/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "lang = \"en\"\n").unwrap();
+
+    let deploy = hermetic_command(tmp.path())
+        .env("LANG", "zh_CN.UTF-8")
+        .arg("deploy")
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&deploy.stdout);
+    assert!(
+        stdout.contains("Detected deploy target: Vercel"),
+        "deploy ignored lang = \"en\": {stdout}"
+    );
+    assert!(!has_cjk(&stdout), "deploy printed Chinese: {stdout}");
+
+    let doctor = hermetic_command(tmp.path())
+        .env("LANG", "zh_CN.UTF-8")
+        .arg("doctor")
+        .output()
+        .expect("doctor should run");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(!has_cjk(&stdout), "doctor printed Chinese rows: {stdout}");
+}
+
+/// REGRESSION: `umadev deploy` ended with the TUI instruction "type /deploy
+/// confirm", which does not exist in the CLI. It must name the CLI step, keep
+/// an explicit --command, and not repeat the step when --run was given.
+#[test]
+fn deploy_names_the_cli_step_to_actually_deploy() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("vercel.json"), "{}\n").unwrap();
+    let detect = hermetic_command(tmp.path())
+        .arg("deploy")
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&detect.stdout);
+    assert!(stdout.contains("`umadev deploy --run`"), "{stdout}");
+    assert!(!stdout.contains("/deploy confirm"), "{stdout}");
+
+    let custom = hermetic_command(tmp.path())
+        .args(["deploy", "--command", "npx vercel deploy"])
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&custom.stdout);
+    assert!(
+        stdout.contains("umadev deploy --run --command \"npx vercel deploy\""),
+        "{stdout}"
+    );
+
+    // With --run the confirmation prompt follows; declining it (closed stdin)
+    // must not tell the user to run the command they just ran.
+    let declined = hermetic_command(tmp.path())
+        .args(["deploy", "--run"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&declined.stdout);
+    assert!(!stdout.contains("umadev deploy --run"), "{stdout}");
+    assert!(!stdout.contains("/deploy confirm"), "{stdout}");
 }
 
 /// Helper: run `umadev run` to the docs gate in a fresh workspace.

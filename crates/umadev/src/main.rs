@@ -200,8 +200,8 @@ enum Command {
         /// (fully autonomous; only in a project you trust, see `umadev trust`).
         /// Irreversible actions (.git / network / destructive shell) are
         /// always confirmed, even in `auto`.
-        #[arg(long, default_value = "guarded")]
-        mode: String,
+        #[arg(long, default_value = "guarded", value_parser = parse_mode_arg)]
+        mode: umadev_agent::TrustMode,
         /// Force the continuous long-session path (one base session for the whole
         /// run — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`). This is now the
         /// DEFAULT for a host-CLI run, so the flag is rarely needed; it only
@@ -249,8 +249,8 @@ enum Command {
         /// Trust / autonomy tier: `plan` / `guarded` (default) / `auto` (only in
         /// a trusted project). See `umadev run --help`. Irreversible actions
         /// always confirm.
-        #[arg(long, default_value = "guarded")]
-        mode: String,
+        #[arg(long, default_value = "guarded", value_parser = parse_mode_arg)]
+        mode: umadev_agent::TrustMode,
     },
     /// Re-run a single named phase (reuses the prior run's context).
     #[command(
@@ -444,12 +444,26 @@ enum Command {
         #[arg(long)]
         clauses: bool,
     },
-    /// Verify spec conformance of a workspace.
+    /// Report workspace conformance and run the project's install / lint /
+    /// test / build steps.
     #[command(
         hide = true,
         long_about = "Print a structured conformance report for the workspace:\n\
                       spec manifest health, workflow state, evidence chain row counts,\n\
                       latest quality-gate score, and proof-pack zips.\n\
+                      \n\
+                      It also RUNS the project's own checks for the detected stack, in\n\
+                      the workspace, and records each result for the quality gate:\n  \
+                      Node    install with its package manager (this can rewrite the\n          \
+                      lockfile), then the lint / typecheck / test / build scripts\n          \
+                      it declares\n  \
+                      Rust    cargo fmt --check, clippy, test, build --release\n  \
+                      Python  install the project into the active environment (uv or\n          \
+                      pip), then ruff, mypy when configured, pytest\n  \
+                      Go      go vet, test, build\n  \
+                      Deno    deno lint, test, check\n\
+                      This executes project code and can change files. The command exits\n\
+                      non-zero when a step fails, so it works as a CI gate.\n\
                       \n\
                       With --runtime, additionally PROVE the app runs: boot the\n\
                       detected dev server, wait for it to answer, probe the documented\n\
@@ -672,7 +686,9 @@ enum Command {
                       kimi-code     merge-writes scoped Pre/PostToolUse hooks into Kimi config.toml\n  \
                       pre-commit    writes .git/hooks/pre-commit (runs `umadev ci --changed-only`)\n\
                       \n\
-                      The hook checks every Write/Edit tool call, but HARD-BLOCKS only the\n\
+                      The hooks govern the base sessions UmaDev drives in this project (a\n\
+                      session you start yourself is not checked). There the hook checks every\n\
+                      Write/Edit tool call, but HARD-BLOCKS only the\n\
                       irreversible-if-written floor: hardcoded secrets/credentials in source\n\
                       (UD-SEC-003) and sensitive-path writes to .git/.env/.ssh (UD-SEC-001,\n\
                       bypass-immune). Craft/quality findings — emoji-as-icon (UD-CODE-001),\n\
@@ -705,7 +721,9 @@ enum Command {
     ///
     /// With NO `--base`: a full clean uninstall — removes `~/.umadev` (global
     /// config + data), this project's governance hooks, and the `umadev` binary
-    /// itself (asks for confirmation first).
+    /// itself (asks for confirmation first). An npm/pnpm/yarn/bun install is
+    /// removed as the `@umatech/umadev` package, by the package manager that
+    /// installed it.
     ///
     /// With `--base <claude-code|pre-commit>`: removes ONLY that base's
     /// governance hook and leaves everything else in place.
@@ -981,6 +999,15 @@ impl From<MemoryCacheArg> for umadev_agent::memory_control::MemoryStore {
     }
 }
 
+/// Parse `--mode` for `run` / `quick`. An unknown value is a usage error, never
+/// a silent fall back to `guarded`: a mistyped read-only `plan` must not start a
+/// pipeline that writes project state. The tier aliases are
+/// [`umadev_agent::TrustMode::parse`]'s.
+fn parse_mode_arg(raw: &str) -> std::result::Result<umadev_agent::TrustMode, String> {
+    umadev_agent::TrustMode::parse(raw)
+        .ok_or_else(|| "expected one of: plan, guarded, auto".to_string())
+}
+
 /// Host CLI backend selector for `umadev run --backend`.
 ///
 /// UmaDev drives five first-class base CLIs. A unit test
@@ -1232,6 +1259,14 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
+    // Every CLI verb prints in the configured UI language (`lang` in the user
+    // config, else the system locale), as the TUI does. The governance hook and
+    // the MCP server run inside a base's tool loop and print no catalog text, so
+    // they skip reading the config.
+    if !matches!(command, Command::Hook { .. } | Command::Mcp { .. }) {
+        cli_lang();
+    }
+
     match command {
         Command::Init {
             slug,
@@ -1398,11 +1433,8 @@ fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
         if !actual_cwd.starts_with(&project_root) {
             // Kimi's hook registry is user-level. Every row installed by
             // UmaDev carries its project root, and an unrelated workspace
-            // must pay only this bounded no-op. Pre hooks need an explicit
-            // allow object; observation-only post hooks can return silently.
-            if check != "tool-audit" && check != "post-tool" {
-                hook::print_decision(&umadev_governance::Decision::pass());
-            }
+            // must pay only this bounded no-op: exit 0 with no output leaves
+            // the call to the host's own permission flow.
             return Ok(());
         }
     }
@@ -1425,21 +1457,20 @@ fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
     // ── P0-1: fail-open is a HARD CONTRACT, not a hope ────────────────────
     // The whole rule book (≈110 `check_*` content scanners) runs on arbitrary
     // base-authored content INSIDE this hook subprocess. If ANY rule panics on
-    // a pathological input, an unwinding hook process produces empty stdout +
-    // a non-zero exit — which Claude Code interprets as a hard DENY, turning
-    // governance fail-CLOSED and wedging the base on every write. We refuse to
-    // let that happen: the entire decision computation (policy load + scan) is
-    // wrapped in `catch_unwind`; a panic collapses to `Decision::pass()`
-    // (allow). The `AssertUnwindSafe` is sound here — on the panic path we
-    // discard all of `compute`'s captured state and emit a fresh `pass()`, so
-    // no logically-inconsistent value can escape.
+    // a pathological input, an unwinding hook process exits non-zero, which
+    // both hosts report as a hook error on every write (only exit 2 blocks).
+    // We refuse to let that happen: the entire decision computation (policy
+    // load + scan) is wrapped in `catch_unwind`; a panic collapses to
+    // `Decision::pass()` (no output). The `AssertUnwindSafe` is sound here — on
+    // the panic path we discard all of `compute`'s captured state and emit a
+    // fresh `pass()`, so no logically-inconsistent value can escape.
     let check_for_panic = check.clone();
     let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         compute_hook_decision(&check_for_panic, &stdin, &project_root)
     }))
     .unwrap_or_else(|_| {
         eprintln!(
-            "umadev: hook `{check}` panicked while scanning content — failing OPEN (allow). \
+            "umadev: hook `{check}` panicked while scanning content — failing OPEN (no decision). \
              Governance must never block the base on a rule bug."
         );
         umadev_governance::Decision::pass()
@@ -1464,20 +1495,11 @@ fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
             )
         }));
     }
-    // Printing the decision must also never unwind: a serialization/IO panic
-    // here would otherwise exit non-zero with no `allow` on stdout. Catch it
-    // and, on the block-less path, still try to emit a bare allow so the base
-    // is never silently denied. (`print_decision` already uses
-    // `to_string(...).unwrap_or_default()`, so this is belt-and-braces.)
-    let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Printing the decision must also never unwind: an IO panic here (a closed
+    // stdout) would otherwise exit non-zero. A pass prints nothing anyway.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hook::print_decision(&decision);
     }));
-    if printed.is_err() && !decision.block {
-        // Last-resort allow so a print panic can't read as a deny.
-        println!(
-            r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-        );
-    }
     Ok(())
 }
 
@@ -1520,8 +1542,17 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("[ok] Installed UmaDev PreToolUse hook for Claude Code.");
                 println!("  → {}", path.display());
                 println!();
-                println!("Every Write/Edit tool call is checked. Only the irreversible-if-written");
-                println!("floor is HARD-BLOCKED at write time:");
+                // The hook acts only when UmaDev set UMADEV_GOVERN_ROOT on the
+                // base it spawned (see hook.rs); say so, rather than promise
+                // governance for a `claude` the user starts themselves.
+                println!("The hook governs only the Claude Code sessions UmaDev drives in this");
+                println!(
+                    "project (the `umadev` TUI, `umadev run` / `continue`). A `claude` session"
+                );
+                println!("you start yourself is neither checked nor recorded.");
+                println!();
+                println!("In those sessions every Write/Edit tool call is checked. Only the");
+                println!("irreversible-if-written floor is HARD-BLOCKED at write time:");
                 println!("  • hardcoded secrets / credentials in source  (UD-SEC-003)");
                 println!(
                     "  • sensitive-path writes (.git/.env/.ssh)     (UD-SEC-001) — bypass-immune"
@@ -1535,10 +1566,9 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("  • hardcoded color literals   (UD-CODE-002)");
                 println!("  • AI-slop / placeholders     (UD-CODE-002)");
                 println!();
-                println!("A PostToolUse audit hook also records every executed Write/Edit/Bash");
-                println!(
-                    "to .umadev/audit/tool-calls.jsonl (UD-EVID-002 — audit only, never blocks)."
-                );
+                println!("A PostToolUse audit hook also records every Write/Edit/Bash those");
+                println!("sessions execute to .umadev/audit/tool-calls.jsonl (UD-EVID-002 — audit");
+                println!("only, never blocks).");
                 println!();
                 println!("To remove: umadev uninstall --host claude-code");
             } else {
@@ -1559,11 +1589,13 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("[ok] Installed project-scoped UmaDev hooks for Kimi Code.");
                 println!("  → {}", path.display());
                 println!();
+                println!("The hooks govern only the Kimi Code sessions UmaDev drives in this");
+                println!("project; a Kimi Code session you start yourself is neither checked nor");
+                println!("recorded. In those sessions PreToolUse governs Write/Edit/Bash and");
+                println!("PostToolUse records the audit trail.");
+                println!();
                 println!("Kimi's hook registry is user-level, but every UmaDev command is scoped");
                 println!("to this exact project root and fails open immediately elsewhere.");
-                println!(
-                    "PreToolUse governs Write/Edit/Bash; PostToolUse records the audit trail."
-                );
                 println!();
                 println!("To remove: umadev uninstall --base kimi-code");
             } else {
@@ -1630,14 +1662,32 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
         .into_iter()
         .filter(|d| d.exists())
         .collect();
-    let exe = std::env::current_exe().ok();
+    let removal = binary_removal(
+        std::env::current_exe().ok(),
+        std::env::var_os(UNINSTALL_HANDOFF_ENV),
+        std::env::var(UNINSTALL_PACKAGE_COMMAND_ENV).ok(),
+    );
     println!("This will completely uninstall UmaDev and remove:");
     for d in &state_dirs {
         println!("  - global config + data:  {}", d.display());
     }
     println!("  - this project's governance hooks (Claude Code, Kimi Code, git pre-commit)");
-    if let Some(e) = &exe {
-        println!("  - the umadev binary:     {}", e.display());
+    match &removal {
+        BinaryRemoval::Launcher {
+            command: Some(command),
+            ..
+        } => println!(
+            "  - the @umatech/umadev package:  {}",
+            safe_command_detail(command.as_bytes())
+        ),
+        BinaryRemoval::Launcher { command: None, .. } => {
+            println!("  - the @umatech/umadev package, through the package manager that owns it");
+        }
+        BinaryRemoval::PackageManager => println!(
+            "  - the @umatech/umadev package: you finish this step with the package manager that installed it"
+        ),
+        BinaryRemoval::Unlink(e) => println!("  - the umadev binary:     {}", e.display()),
+        BinaryRemoval::Unknown => {}
     }
     if !yes && !confirm("Continue?") {
         println!("Aborted. Nothing was removed.");
@@ -1671,45 +1721,91 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
             Err(e) => println!("[!] Could not remove {} ({e}).", d.display()),
         }
     }
-    // 3. The binary LAST (so the steps above ran on a live binary). An npm
-    //    install is removed via npm so the package metadata is cleaned too; a
-    //    manual/dev binary is unlinked directly (safe while running on Unix).
-    let npm_managed = exe
-        .as_ref()
-        .is_some_and(|p| p.to_string_lossy().contains("node_modules"));
-    if npm_managed {
-        let mut command = umadev_host::std_command("npm");
-        command
-            .args(["uninstall", "-g", "umadev"])
-            .env("CI", "1")
-            .env("NO_COLOR", "1")
-            .env("NPM_CONFIG_AUDIT", "false")
-            .env("NPM_CONFIG_FUND", "false")
-            .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
-            .env("NPM_CONFIG_YES", "true");
-        match bounded_cli_output(
-            command,
-            Duration::from_secs(120),
-            1024 * 1024,
-            256 * 1024,
-        ) {
-            Ok(output) if output.status.success() => println!("[ok] npm uninstall -g umadev"),
-            Ok(output) => println!(
-                "[!] npm uninstall failed: {}. Run `npm uninstall -g umadev` to remove the binary.",
-                safe_command_detail(&output.stderr)
-            ),
-            Err(error) => println!(
-                "[!] npm uninstall could not complete safely: {error}. Run `npm uninstall -g umadev` to verify removal."
-            ),
+    // 3. The binary LAST (so the steps above ran on a live binary).
+    match removal {
+        BinaryRemoval::Launcher { handoff, .. } => {
+            // The launcher removes the package once this process has exited,
+            // checks that it is gone, and only then reports the uninstall.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&handoff)
+                .with_context(|| {
+                    format!(
+                        "could not hand the package removal to the npm launcher ({})",
+                        handoff.display()
+                    )
+                })?;
+            return Ok(());
         }
-    } else if let Some(e) = exe {
-        match std::fs::remove_file(&e) {
+        BinaryRemoval::PackageManager => {
+            println!(
+                "[!] UmaDev was installed by a package manager. Remove the package with the one that installed it:"
+            );
+            println!("      npm uninstall -g @umatech/umadev");
+            println!("      pnpm remove -g @umatech/umadev");
+            println!("      yarn global remove @umatech/umadev");
+            println!("      bun remove -g @umatech/umadev");
+            anyhow::bail!("the @umatech/umadev package is still installed");
+        }
+        BinaryRemoval::Unlink(e) => match std::fs::remove_file(&e) {
             Ok(()) => println!("[ok] Removed {}", e.display()),
             Err(err) => println!("[!] Delete the binary manually: {} ({err})", e.display()),
-        }
+        },
+        BinaryRemoval::Unknown => {}
     }
     println!("\nUmaDev uninstalled. Thanks for trying it.");
     Ok(())
+}
+
+/// Set by the npm launcher (`bin/cli-main.js`) when it runs a full `umadev
+/// uninstall` of a package-manager install: a file this binary creates once its
+/// half (hooks, global state) has finished. The launcher then removes the
+/// `@umatech/umadev` package with the manager that owns it, after this process
+/// has exited, because Windows cannot delete a running `umadev.exe`.
+const UNINSTALL_HANDOFF_ENV: &str = "UMADEV_UNINSTALL_HANDOFF";
+/// The removal command the launcher will run, shown in the uninstall plan.
+const UNINSTALL_PACKAGE_COMMAND_ENV: &str = "UMADEV_UNINSTALL_PACKAGE_COMMAND";
+
+/// How a full uninstall removes UmaDev's own executable.
+#[derive(Debug, PartialEq, Eq)]
+enum BinaryRemoval {
+    /// A package-manager install launched through the npm launcher, which
+    /// removes the package once this process has exited.
+    Launcher {
+        handoff: PathBuf,
+        command: Option<String>,
+    },
+    /// A package-manager install run without the launcher: which manager owns
+    /// it is unknown here, so the user removes the package.
+    PackageManager,
+    /// A standalone binary (`cargo install`, a release download), unlinked
+    /// directly (safe while running on Unix).
+    Unlink(PathBuf),
+    /// The executable's path is unknown.
+    Unknown,
+}
+
+/// Decide how [`cmd_uninstall`] removes the executable at `exe`, given the
+/// launcher's [`UNINSTALL_HANDOFF_ENV`] and [`UNINSTALL_PACKAGE_COMMAND_ENV`].
+fn binary_removal(
+    exe: Option<PathBuf>,
+    handoff: Option<std::ffi::OsString>,
+    command: Option<String>,
+) -> BinaryRemoval {
+    let Some(exe) = exe else {
+        return BinaryRemoval::Unknown;
+    };
+    if !exe.to_string_lossy().contains("node_modules") {
+        return BinaryRemoval::Unlink(exe);
+    }
+    match handoff.filter(|handoff| !handoff.is_empty()) {
+        Some(handoff) => BinaryRemoval::Launcher {
+            handoff: PathBuf::from(handoff),
+            command: command.filter(|command| !command.trim().is_empty()),
+        },
+        None => BinaryRemoval::PackageManager,
+    }
 }
 
 /// Candidate directories holding UmaDev's global config + data — `~/.umadev`
@@ -2106,6 +2202,41 @@ const PRE_COMMIT_HOOK: &str = ".git/hooks/pre-commit";
 /// script that bailed early silence UmaDev entirely — governance that never
 /// runs is worse than no promise of it.
 fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
+    let bin = std::env::current_exe().map_or_else(
+        |_| "umadev".to_string(),
+        |p| p.to_string_lossy().to_string(),
+    );
+    install_pre_commit_hook_with_bin(project_root, &bin)
+}
+
+/// Quote `value` as one POSIX-shell word. The binary path comes from
+/// `current_exe()`, so it can hold spaces (`/Users/Jane Doe/...`) or Windows
+/// backslashes; unquoted, `sh` would split or unescape it and the hook would
+/// fail with "not found" on every commit.
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Whether a hook's shebang runs a POSIX-compatible shell, so our block (shell
+/// syntax) can be spliced into it. A `python3`/`node` hook would hit a syntax
+/// error on our line and then block every commit.
+fn shebang_is_posix_shell(shebang: &str) -> bool {
+    const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "busybox"];
+    let mut words = shebang.trim_start_matches("#!").split_whitespace();
+    let Some(interpreter) = words.next() else {
+        return false;
+    };
+    let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+    let mut program = name(interpreter);
+    if program == "env" {
+        program = words
+            .find(|word| !word.starts_with('-'))
+            .map_or_else(String::new, name);
+    }
+    SHELLS.contains(&program.as_str())
+}
+
+fn install_pre_commit_hook_with_bin(project_root: &Path, bin: &str) -> Result<PathBuf> {
     let root = umadev_state::fs::RootedDir::open(project_root)?;
     // `.git` must be a real directory: a repository delivered with `.git` as a
     // symlink (or a gitfile) must not get the hook written wherever it points.
@@ -2117,26 +2248,31 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     }
     root.ensure_dir(Path::new(".git/hooks"), false)?;
     let hook_path = project_root.join(PRE_COMMIT_HOOK);
-    let bin = std::env::current_exe().map_or_else(
-        |_| "umadev".to_string(),
-        |p| p.to_string_lossy().to_string(),
-    );
-    // If the hook exists and already has our marker, it's idempotent.
-    if let Ok(existing) = read_pre_commit_hook(&root) {
-        if existing.contains(PRE_COMMIT_MARKER) {
-            return Ok(hook_path);
-        }
-    }
+    // `|| exit $?` is load-bearing: a shell script's status is its LAST
+    // command's, so without it a user hook below our block would swallow a
+    // governance failure and let the commit through.
     let our_block = format!(
         "{marker}\n\
          # Runs `umadev ci --changed-only` on staged files before commit.\n\
          # A governance violation aborts the commit. Remove with:\n\
          #   umadev uninstall --host pre-commit\n\
-         {bin} ci --changed-only\n\
+         {bin} ci --changed-only || exit $?\n\
          {end}\n",
         marker = PRE_COMMIT_MARKER,
+        bin = sh_single_quote(bin),
         end = PRE_COMMIT_END_MARKER,
     );
+    if let Ok(existing) = read_pre_commit_hook(&root) {
+        // Already current: idempotent no-op.
+        if existing.contains(&our_block) {
+            return Ok(hook_path);
+        }
+        // An older UmaDev block (unquoted path, no `|| exit $?`): replace it so
+        // re-running install repairs hooks written by earlier versions.
+        if existing.contains(PRE_COMMIT_MARKER) {
+            uninstall_pre_commit_hook(project_root)?;
+        }
+    }
     // Preserve a pre-existing user hook but run our check FIRST. If the file has
     // a shebang, insert our block immediately after it (keeping the user's
     // interpreter line); otherwise prepend a fresh shebang + our block above the
@@ -2146,6 +2282,14 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     let script = match read_pre_commit_hook(&root) {
         Ok(existing) if existing.starts_with("#!") => {
             let (shebang, body) = existing.split_once('\n').unwrap_or((existing.as_str(), ""));
+            if !shebang_is_posix_shell(shebang) {
+                anyhow::bail!(
+                    "{} is not a shell script ({}); add `{} ci --changed-only` to it by hand",
+                    hook_path.display(),
+                    shebang.trim(),
+                    sh_single_quote(bin),
+                );
+            }
             format!("{shebang}\n{our_block}\n{body}")
         }
         Ok(existing) => format!("#!/bin/sh\n{our_block}\n{existing}"),
@@ -2374,6 +2518,37 @@ fn restrict_to_owner(dir: &Path, mode: u32) {
     }
 }
 
+/// The CLAUDE.md `init` writes when the project initializer has not already
+/// created one.
+fn claude_md_template() -> String {
+    format!(
+        "# CLAUDE.md — UmaDev managed project\n\n\
+         This project is managed by **UmaDev** ({version}), an AI coding project-director Agent.\n\n\
+         ## How this works\n\n\
+         1. UmaDev orchestrates a 9-phase pipeline (clarify → research → docs → spec → frontend → backend → quality → delivery).\n\
+         2. During an active pipeline, UmaDev writes the dispatched phase's **coach prompt** to `.umadev/coach/CURRENT.md`.\n\
+         3. The latest user message is the current objective. Read `CURRENT.md` only when the current turn explicitly dispatches that active phase (or the user explicitly asks to continue); the file's mere presence never authorizes resuming old work.\n\
+         4. Existing plans, run notes, output documents, and earlier conversation are context only. Do not widen scope or fix adjacent issues unless the user asks.\n\
+         5. After completing an explicitly active pipeline phase, run `umadev continue` to advance.\n\n\
+         ## Rules (non-negotiable)\n\n\
+         - **No emoji as functional icons** — use Lucide / Heroicons / Tabler icon libraries.\n\
+         - **No hardcoded colors** — use CSS design tokens (Tailwind config).\n\
+         - **No secrets in source code** — use environment variables.\n\
+         - **Follow the spec preamble** in each coach prompt.\n\n\
+         ## Governance\n\n\
+         When UmaDev drives this session (the `umadev` TUI, `umadev run` /\n\
+         `continue`), your Write/Edit/Bash calls pass through UmaDev's governance\n\
+         hook; a `claude` session started directly is not checked by it. The hook is\n\
+         fail-open: only the irreversible-if-written floor (hardcoded secrets /\n\
+         credentials, sensitive-path writes to .git/.env/.ssh, destructive shell)\n\
+         is HARD-BLOCKED at write time. Craft / quality findings (emoji-as-icons,\n\
+         hardcoded colors, AI-slop) are FLAGGED and repaired by the post-write QC\n\
+         loop — never hard-blocked mid-write, so a single nit can't stop you from\n\
+         finishing the file. Configure: `.umadev/rules.toml`.\n",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
     let workspace = resolve_root(project_root)?;
     let slug = match slug {
@@ -2410,30 +2585,7 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
     // host doesn't know to follow UmaDev's pipeline instructions.
     let claude_md = workspace.join("CLAUDE.md");
     if !claude_md.is_file() {
-        let claude_content = format!(
-            "# CLAUDE.md — UmaDev managed project\n\n\
-             This project is managed by **UmaDev** ({version}), an AI coding project-director Agent.\n\n\
-             ## How this works\n\n\
-             1. UmaDev orchestrates a 9-phase pipeline (clarify → research → docs → spec → frontend → backend → quality → delivery).\n\
-             2. During an active pipeline, UmaDev writes the dispatched phase's **coach prompt** to `.umadev/coach/CURRENT.md`.\n\
-             3. The latest user message is the current objective. Read `CURRENT.md` only when the current turn explicitly dispatches that active phase (or the user explicitly asks to continue); the file's mere presence never authorizes resuming old work.\n\
-             4. Existing plans, run notes, output documents, and earlier conversation are context only. Do not widen scope or fix adjacent issues unless the user asks.\n\
-             5. After completing an explicitly active pipeline phase, run `umadev continue` to advance.\n\n\
-             ## Rules (non-negotiable)\n\n\
-             - **No emoji as functional icons** — use Lucide / Heroicons / Tabler icon libraries.\n\
-             - **No hardcoded colors** — use CSS design tokens (Tailwind config).\n\
-             - **No secrets in source code** — use environment variables.\n\
-             - **Follow the spec preamble** in each coach prompt.\n\n\
-             ## Governance\n\n\
-             Your Write/Edit/Bash calls pass through UmaDev's governance hook. It is\n\
-             fail-open: only the irreversible-if-written floor (hardcoded secrets /\n\
-             credentials, sensitive-path writes to .git/.env/.ssh, destructive shell)\n\
-             is HARD-BLOCKED at write time. Craft / quality findings (emoji-as-icons,\n\
-             hardcoded colors, AI-slop) are FLAGGED and repaired by the post-write QC\n\
-             loop — never hard-blocked mid-write, so a single nit can't stop you from\n\
-             finishing the file. Configure: `.umadev/rules.toml`.\n",
-            version = env!("CARGO_PKG_VERSION"),
-        );
+        let claude_content = claude_md_template();
         umadev_state::fs::atomic_write(&claude_md, claude_content.as_bytes())
             .with_context(|| format!("write {}", claude_md.display()))?;
         println!("  claude:  {}", claude_md.display());
@@ -2459,7 +2611,7 @@ opencode.json
     }
 
     println!("UmaDev workspace initialised with project-aware analysis.");
-    println!("{}", init_report.render_summary(cli_lang()));
+    println!("{}", init_report.render_summary(umadev_i18n::current()));
     println!("  manifest: {}", path.display());
     println!(
         "  spec: {} | level: {} | profile: {} | slug: {}",
@@ -2485,7 +2637,7 @@ opencode.json
 /// underlying `run_adopt` never errors, so this prints a summary even on a
 /// sparse / empty workspace.
 fn cmd_adopt(path: Option<PathBuf>, project_root: Option<PathBuf>) -> Result<()> {
-    let lang = cli_lang();
+    let lang = umadev_i18n::current();
     // `--project-root` wins over the positional `path`; else the positional;
     // else cwd.
     let workspace = resolve_root(project_root.or(path))?;
@@ -2584,9 +2736,8 @@ struct RunArgs {
     backend: Option<BackendArg>,
     project_root: Option<PathBuf>,
     slug: String,
-    /// Trust / autonomy tier string (`plan` / `guarded` / `auto`); parsed into
-    /// [`umadev_agent::TrustMode`] at the boundary, fail-open to `guarded`.
-    mode: String,
+    /// Trust / autonomy tier, validated by clap (see [`parse_mode_arg`]).
+    mode: umadev_agent::TrustMode,
     /// Force the continuous long-session run path (one base session for the whole
     /// run). The continuous path is now the DEFAULT for a host-CLI run via
     /// [`umadev_agent::continuous_enabled_from_env`]; this flag only OR's in a
@@ -3439,10 +3590,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = workspace_trust::cap_mode(
-        &project_root,
-        umadev_agent::TrustMode::parse_or_default(&args.mode),
-    );
+    let mode = workspace_trust::cap_mode(&project_root, args.mode);
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -3513,6 +3661,8 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
             driver.set_session_id(Some(new_run_session_id()));
         }
         driver.set_continue_session(true);
+        // Without this the first call would already `--resume` the fresh id.
+        driver.set_session_autoresume(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -3767,10 +3917,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = workspace_trust::cap_mode(
-        &project_root,
-        umadev_agent::TrustMode::parse_or_default(&args.mode),
-    );
+    let mode = workspace_trust::cap_mode(&project_root, args.mode);
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -3818,6 +3965,8 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
             driver.set_session_id(Some(new_run_session_id()));
         }
         driver.set_continue_session(true);
+        // Without this the first call would already `--resume` the fresh id.
+        driver.set_session_autoresume(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -4015,6 +4164,8 @@ async fn cmd_redo(
             driver.set_session_id(Some(new_run_session_id()));
         }
         driver.set_continue_session(true);
+        // Without this the first call would already `--resume` the fresh id.
+        driver.set_session_autoresume(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -4694,7 +4845,9 @@ async fn drive_director_continue(
         mode: trust,
         strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
-    let route = umadev_agent::router::for_run(&opts.requirement);
+    // Resume under the route the paused run was planned under (saved beside its
+    // plan), not one re-derived from the requirement text.
+    let route = umadev_agent::resume_route(project_root, &opts.requirement);
     let firmware = umadev_agent::compose_firmware(project_root, &route, &opts.requirement).await;
     let firmware = (!firmware.trim().is_empty()).then_some(firmware);
 
@@ -5031,8 +5184,9 @@ fn cmd_history(project_root: Option<PathBuf>) -> Result<()> {
 
 /// Resolve + set the process-wide UI language for CLI output, from the saved
 /// `~/.umadev/config.toml` (falling back to system-locale detection). Mirrors
-/// what the TUI does on launch so `umadev usage` / `umadev lessons` speak the
-/// same language as the chat. Returns the resolved language for `t`/`tf`.
+/// what the TUI does on launch; `main` calls it once before dispatching a verb,
+/// so every verb speaks the same language as the chat and reads it back with
+/// [`umadev_i18n::current`]. Returns the resolved language.
 fn cli_lang() -> umadev_i18n::Lang {
     let lang = umadev_tui::config::load().resolved_lang();
     umadev_i18n::set_lang(lang);
@@ -5042,7 +5196,7 @@ fn cli_lang() -> umadev_i18n::Lang {
 /// `umadev usage` — print quality-aware worker usage without inventing token
 /// precision or provider cost. Pure read of the bounded durable ledger.
 fn cmd_usage() -> Result<()> {
-    let lang = cli_lang();
+    let lang = umadev_i18n::current();
     let report = umadev_agent::runner::usage_report();
     println!(
         "{}",
@@ -5055,7 +5209,7 @@ fn cmd_usage() -> Result<()> {
 /// and verified outcomes. Incident rows themselves belong to TUI `/pitfalls`.
 /// Pure read of `.umadev/learned/`; never mutates the KB.
 fn cmd_lessons(project_root: Option<PathBuf>) -> Result<()> {
-    let lang = cli_lang();
+    let lang = umadev_i18n::current();
     let project_root = resolve_root(project_root)?;
     let report = umadev_agent::lessons::lessons_report(&project_root);
     println!("{}", format_lessons_report(lang, &report));
@@ -5172,7 +5326,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
             scope,
             project_root,
         } => {
-            let lang = cli_lang();
+            let lang = umadev_i18n::current();
             let root = resolve_root(project_root)?;
             for (index, scope) in memory_scopes(scope).iter().copied().enumerate() {
                 if index > 0 {
@@ -5195,7 +5349,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
             yes,
             project_root,
         } => {
-            let lang = cli_lang();
+            let lang = umadev_i18n::current();
             let root = resolve_root(project_root)?;
             let selected_store = store
                 .as_deref()
@@ -5377,7 +5531,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_capture_stores(&root, scope, &stores, state.enabled())?;
                 println!(
                     "[ok] capture={} scope={} stores={}",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id(),
                     stores
                         .iter()
@@ -5389,7 +5543,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_capture(&root, scope, None, state.enabled())?;
                 println!(
                     "[ok] capture={} scope={} stores=all-configurable",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id()
                 );
             }
@@ -5413,7 +5567,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_recall_stores(&root, scope, &stores, state.enabled())?;
                 println!(
                     "[ok] recall={} scope={} stores={}",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id(),
                     stores
                         .iter()
@@ -5425,7 +5579,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_recall(&root, scope, None, state.enabled())?;
                 println!(
                     "[ok] recall={} scope={} stores=all-configurable",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id()
                 );
             }
@@ -5726,18 +5880,18 @@ fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> 
             ),
         }
     } else {
-        // Allow partial match (e.g. user passes 20260614T12 to match 20260614T120000.123).
-        let matches: Vec<&String> = snaps.iter().filter(|s| s.starts_with(&timestamp)).collect();
-        match matches.len() {
+        if timestamp.trim().is_empty() {
+            anyhow::bail!("no snapshot id given — run `umadev history` to list them");
+        }
+        match match_snapshot(&snaps, &timestamp) {
             // Not a workflow snapshot — it may be a FILE checkpoint from the shadow repo
             // (a run baseline, a phase rewind point, or the rescue snapshot the workspace
             // heal just handed the user by id).
-            0 => return rollback_file_checkpoint(&project_root, &timestamp),
-            1 => matches[0].clone(),
-            _ => anyhow::bail!(
-                "`{timestamp}` is ambiguous ({} matches). Use more digits.",
-                matches.len()
-            ),
+            SnapshotMatch::None => return rollback_file_checkpoint(&project_root, &timestamp),
+            SnapshotMatch::One(target) => target.clone(),
+            SnapshotMatch::Ambiguous(count) => {
+                anyhow::bail!("`{timestamp}` is ambiguous ({count} matches). Use more digits.")
+            }
         }
     };
     let before = read_workflow_state(&project_root).map_or("none".to_string(), |s| s.phase);
@@ -5749,6 +5903,31 @@ fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> 
     println!("      The pipeline now resumes from phase `{after}` on the next `umadev continue`.");
     println!("      To restore FILES, roll back to a file checkpoint: `umadev history`.");
     Ok(())
+}
+
+/// How a user-typed id resolves against the workflow snapshot names.
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotMatch<'a> {
+    None,
+    One(&'a String),
+    Ambiguous(usize),
+}
+
+/// Resolve `id` to one snapshot. A prefix is accepted (`20260614T12` finds
+/// `20260614T120000.123`), but an EXACT name always wins: chrono's `%.f` prints
+/// 0/3/6/9 fraction digits, so one real snapshot name can be a prefix of
+/// another (`…T120000.123` vs `…T120000.123456`), and typing the full id must
+/// never be "ambiguous".
+fn match_snapshot<'a>(snaps: &'a [String], id: &str) -> SnapshotMatch<'a> {
+    if let Some(exact) = snaps.iter().find(|snap| *snap == id) {
+        return SnapshotMatch::One(exact);
+    }
+    let mut matches = snaps.iter().filter(|snap| snap.starts_with(id));
+    match (matches.next(), matches.count()) {
+        (None, _) => SnapshotMatch::None,
+        (Some(only), 0) => SnapshotMatch::One(only),
+        (Some(_), rest) => SnapshotMatch::Ambiguous(rest + 1),
+    }
 }
 
 /// Restore the SOURCE TREE to a shadow-repo file checkpoint — the second half of
@@ -6065,6 +6244,7 @@ async fn cmd_deploy(
     command: Option<String>,
     yes: bool,
 ) -> Result<()> {
+    let explicit_root = project_root.is_some();
     let project_root = resolve_root(project_root)?;
     let lang = umadev_i18n::current();
     println!("workspace: {}", project_root.display());
@@ -6088,13 +6268,25 @@ async fn cmd_deploy(
     if !recipe.is_empty() {
         println!(
             "{}",
-            umadev_i18n::tf(lang, "deploy.confirm_preflight", &[&recipe])
+            umadev_i18n::tf(lang, "deploy.cli_preflight", &[&recipe])
         );
     }
 
     // Detect-and-print only: stop here unless the user explicitly opts in to a
-    // real deploy. The deploy is the user's outward-facing action.
+    // real deploy. The deploy is the user's outward-facing action. Name the CLI
+    // step that does it (the TUI's `/deploy confirm` does not exist here),
+    // carrying over the options that decide what gets deployed.
     if !run {
+        if !recipe.is_empty() {
+            let mut next = String::from("umadev deploy --run");
+            if let Some(command) = &command {
+                next.push_str(&format!(" --command \"{command}\""));
+            }
+            if explicit_root {
+                next.push_str(&format!(" --project-root \"{}\"", project_root.display()));
+            }
+            println!("{}", umadev_i18n::tf(lang, "deploy.cli_run_hint", &[&next]));
+        }
         return Ok(());
     }
     if recipe.trim().is_empty() {
@@ -7507,6 +7699,50 @@ mod tests {
     }
 
     #[test]
+    fn rollback_id_prefers_an_exact_snapshot_over_longer_prefix_matches() {
+        let snaps = vec![
+            "20260614T120000.123456".to_string(),
+            "20260614T120000.123".to_string(),
+            "20260614T130000".to_string(),
+        ];
+        assert_eq!(
+            match_snapshot(&snaps, "20260614T120000.123"),
+            SnapshotMatch::One(&snaps[1])
+        );
+        assert_eq!(
+            match_snapshot(&snaps, "20260614T13"),
+            SnapshotMatch::One(&snaps[2])
+        );
+        assert_eq!(
+            match_snapshot(&snaps, "20260614T12"),
+            SnapshotMatch::Ambiguous(2)
+        );
+        assert_eq!(match_snapshot(&snaps, "2027"), SnapshotMatch::None);
+    }
+
+    #[test]
+    fn rollback_rejects_an_empty_id_instead_of_matching_every_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        umadev_agent::write_workflow_state(root, &WorkflowState::new(umadev_spec::Phase::Frontend))
+            .unwrap();
+        umadev_agent::write_workflow_state(root, &WorkflowState::new(umadev_spec::Phase::Delivery))
+            .unwrap();
+        assert_eq!(
+            list_snapshots(root).len(),
+            1,
+            "precondition: exactly one snapshot"
+        );
+
+        assert!(cmd_rollback(String::new(), Some(root.to_path_buf())).is_err());
+        assert_eq!(
+            read_workflow_state(root).map(|s| s.phase).as_deref(),
+            Some("delivery"),
+            "an empty id must not restore the only snapshot"
+        );
+    }
+
+    #[test]
     fn the_pre_commit_gate_heals_the_tree_before_it_judges_it() {
         // `umadev ci` is what `.git/hooks/pre-commit` runs, and it was the ONE workspace verb
         // that skipped `resolve_root` (it took the bare cwd). So the gate could scan — and
@@ -7576,6 +7812,88 @@ mod tests {
         // A single launcher (the healthy case) reports exactly one → no shadow warning.
         let single = std::env::join_paths([a.path(), empty.path()]).unwrap();
         assert_eq!(find_all_umadev_in(&single).len(), 1);
+    }
+
+    #[test]
+    fn claude_md_template_scopes_the_hook_to_sessions_umadev_drives() {
+        let template = claude_md_template();
+        assert!(
+            template.contains("When UmaDev drives this session"),
+            "{template}"
+        );
+        assert!(template.contains("not checked by it"), "{template}");
+        assert!(!template.contains("\nYour Write/Edit/Bash calls pass through"));
+    }
+
+    #[test]
+    fn mode_flag_accepts_the_tiers_and_their_aliases_and_rejects_anything_else() {
+        use umadev_agent::TrustMode;
+        let mode_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Run { mode, .. } | Command::Quick { mode, .. }) => mode,
+            other => panic!("unexpected command: {other:?}"),
+        };
+        assert_eq!(mode_of(&["umadev", "run", "x"]), TrustMode::Guarded);
+        assert_eq!(
+            mode_of(&["umadev", "run", "x", "--mode", "plan"]),
+            TrustMode::Plan
+        );
+        assert_eq!(
+            mode_of(&["umadev", "run", "x", "--mode", "read-only"]),
+            TrustMode::Plan
+        );
+        assert_eq!(
+            mode_of(&["umadev", "quick", "x", "--mode", "AUTO"]),
+            TrustMode::Auto
+        );
+        assert_eq!(
+            mode_of(&["umadev", "quick", "x", "--mode", "guarded"]),
+            TrustMode::Guarded
+        );
+        for verb in ["run", "quick"] {
+            for typo in ["pln", "planned", "plan-only", ""] {
+                let error = Cli::try_parse_from(["umadev", verb, "x", "--mode", typo]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                let text = error.to_string();
+                assert!(
+                    text.contains("plan, guarded, auto"),
+                    "{verb} --mode {typo}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_uninstall_leaves_a_package_install_to_its_launcher() {
+        let packaged = PathBuf::from(
+            "/usr/lib/node_modules/@umatech/umadev/node_modules/@umatech/cli-linux-x64/bin/umadev",
+        );
+        assert_eq!(
+            binary_removal(
+                Some(packaged.clone()),
+                Some("/tmp/handoff".into()),
+                Some("pnpm remove -g @umatech/umadev".into()),
+            ),
+            BinaryRemoval::Launcher {
+                handoff: PathBuf::from("/tmp/handoff"),
+                command: Some("pnpm remove -g @umatech/umadev".into()),
+            }
+        );
+        // Without the launcher the owning manager is unknown: never guess one.
+        assert_eq!(
+            binary_removal(Some(packaged.clone()), None, None),
+            BinaryRemoval::PackageManager
+        );
+        assert_eq!(
+            binary_removal(Some(packaged), Some(std::ffi::OsString::new()), None),
+            BinaryRemoval::PackageManager
+        );
+        // A standalone binary is unlinked directly, whatever the environment says.
+        let standalone = PathBuf::from("/home/u/.cargo/bin/umadev");
+        assert_eq!(
+            binary_removal(Some(standalone.clone()), Some("/tmp/handoff".into()), None),
+            BinaryRemoval::Unlink(standalone)
+        );
+        assert_eq!(binary_removal(None, None, None), BinaryRemoval::Unknown);
     }
 
     #[test]
@@ -7705,6 +8023,124 @@ mod tests {
 
         assert!(uninstall_pre_commit_hook(root).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    /// Run a hook script with `sh` and return its exit code.
+    #[cfg(unix)]
+    fn run_hook(path: &Path) -> i32 {
+        std::process::Command::new("sh")
+            .arg(path)
+            .status()
+            .expect("sh runs")
+            .code()
+            .expect("exit code")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_commit_hook_failure_is_not_swallowed_by_a_user_hook_below_it() {
+        // A shell script exits with its LAST command's status, so a user hook
+        // that succeeds after our block used to hide a governance failure.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook_path = hooks.join("pre-commit");
+        std::fs::write(&hook_path, "#!/bin/sh\ntrue\n").unwrap();
+        // `false` stands in for a `umadev ci` run that finds a violation.
+        install_pre_commit_hook_with_bin(root, "false").unwrap();
+
+        assert_ne!(
+            run_hook(&hook_path),
+            0,
+            "a failed check must abort the commit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_commit_hook_quotes_a_binary_path_with_spaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let bin_dir = root.join("Jane Doe's bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("umadev");
+        let ran = root.join("ran");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_path = install_pre_commit_hook_with_bin(root, bin.to_str().unwrap()).unwrap();
+
+        assert_eq!(run_hook(&hook_path), 0);
+        assert_eq!(std::fs::read_to_string(ran).unwrap(), "ci --changed-only\n");
+    }
+
+    #[test]
+    fn pre_commit_install_refuses_to_splice_into_a_non_shell_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook_path = hooks.join("pre-commit");
+        let original = "#!/usr/bin/env python3\nprint('checks')\n";
+        std::fs::write(&hook_path, original).unwrap();
+
+        assert!(install_pre_commit_hook_with_bin(root, "umadev").is_err());
+        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), original);
+    }
+
+    #[test]
+    fn pre_commit_install_upgrades_a_block_from_an_older_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook_path = hooks.join("pre-commit");
+        std::fs::write(
+            &hook_path,
+            format!(
+                "#!/bin/sh\n{PRE_COMMIT_MARKER}\n/old/umadev ci --changed-only\n\
+                 {PRE_COMMIT_END_MARKER}\n\nnpm test\n"
+            ),
+        )
+        .unwrap();
+
+        install_pre_commit_hook_with_bin(root, "/new/umadev").unwrap();
+
+        let body = std::fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(body.matches(PRE_COMMIT_MARKER).count(), 1, "{body}");
+        assert!(!body.contains("/old/umadev"), "{body}");
+        assert!(
+            body.contains("'/new/umadev' ci --changed-only || exit $?"),
+            "{body}"
+        );
+        assert!(body.contains("npm test"), "user hook kept: {body}");
+    }
+
+    #[test]
+    fn shebang_detection_accepts_shells_and_rejects_other_interpreters() {
+        for shell in [
+            "#!/bin/sh",
+            "#!/bin/bash -e",
+            "#!/usr/bin/env bash",
+            "#!/usr/bin/env -S zsh",
+        ] {
+            assert!(shebang_is_posix_shell(shell), "{shell}");
+        }
+        for other in [
+            "#!/usr/bin/env python3",
+            "#!/usr/bin/node",
+            "#!",
+            "#!/usr/bin/env",
+        ] {
+            assert!(!shebang_is_posix_shell(other), "{other}");
+        }
     }
 
     #[test]
@@ -8434,7 +8870,7 @@ mod tests {
             backend: None,
             project_root: Some(tmp.path().to_path_buf()),
             slug: "demo".into(),
-            mode: "plan".into(),
+            mode: umadev_agent::TrustMode::Plan,
             continuous: false,
         }))
         .await
@@ -8484,7 +8920,7 @@ mod tests {
             backend: None,
             project_root: Some(tmp.path().to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -8497,7 +8933,7 @@ mod tests {
             backend: None,
             project_root: Some(tmp.path().to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -8645,6 +9081,9 @@ mod tests {
         git(&["init"]);
         git(&["config", "user.email", "umadev-test@example.invalid"]);
         git(&["config", "user.name", "UmaDev Test"]);
+        // The host lane refuses a commit it would have to sign; model a user who
+        // does not sign, whatever the machine's global git config says.
+        git(&["config", "commit.gpgSign", "false"]);
         std::fs::write(root.join("tracked.txt"), "initial\n").unwrap();
         git(&["add", "tracked.txt"]);
         git(&["commit", "-m", "initial"]);
@@ -8658,7 +9097,7 @@ mod tests {
             backend: None,
             project_root: Some(root.to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -8685,7 +9124,7 @@ mod tests {
             backend: None,
             project_root: Some(root.to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -9849,7 +10288,7 @@ mod tests {
     #[test]
     fn hook_print_decision_never_panics_on_allow_or_block() {
         // print_decision must always be panic-safe so the hook process exits 0
-        // with a valid JSON decision (never empty stdout + non-zero exit).
+        // (a deny object for a block, no output for a pass).
         let allow = umadev_governance::Decision::pass();
         let block = umadev_governance::Decision::block("UD-SEC-001", "leaked secret");
         // Wrapped exactly as cmd_hook wraps it; neither may unwind.

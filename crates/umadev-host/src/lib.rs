@@ -120,7 +120,7 @@ pub fn set_windows_clipboard_text(text: &str) -> bool {
 /// spec-kit / any other project) sees the var UNSET and is completely
 /// unaffected. This is how UmaDev's governance stays scoped to its own runs
 /// instead of leaking into the user's whole environment.
-pub const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
+pub const GOVERN_ROOT_ENV: &str = umadev_process::child_env::GOVERN_ROOT_ENV;
 
 /// Build the `[(key, value)]` env entry that scopes the governance hook to
 /// `workspace`. Spawn the base with this so the `PreToolUse` hook can tell it is
@@ -317,6 +317,18 @@ pub trait HostDriver: umadev_runtime::Runtime {
     /// owns continuity.
     fn set_session_id(&mut self, _session_id: Option<String>) {}
 
+    /// Make a pinned session CREATE its conversation on this driver's first
+    /// call and RESUME it on every later call.
+    ///
+    /// A caller that pins a fresh id ([`Self::set_session_id`]) and continues it
+    /// ([`Self::set_continue_session`]) across a whole run turns this on.
+    /// Without it the very first call already resumes an id the base has never
+    /// seen (`claude --resume <new id>` fails with "No conversation found"),
+    /// and so does every later call. The TUI sequences create and resume itself
+    /// and leaves this off. The default is a no-op for drivers that cannot pin
+    /// a caller-chosen id.
+    fn set_session_autoresume(&mut self, _on: bool) {}
+
     /// Set the working directory the host CLI subprocess runs in — the
     /// pipeline's project root.
     ///
@@ -406,6 +418,25 @@ pub(crate) struct SubprocessOutput {
     pub stdout: String,
 }
 
+/// A subprocess that ran to its exit, whatever the status: the status and the
+/// retained tail of each pipe (see `STDOUT_CAPTURE_CAP`).
+pub(crate) struct SubprocessExit {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    started: Instant,
+}
+
+/// The last `max_bytes` of `s`, moved forward to a UTF-8 char boundary so a
+/// multibyte character straddling the cut is dropped, never split.
+fn tail_on_boundary(s: &str, max_bytes: usize) -> &str {
+    let mut start = s.len().saturating_sub(max_bytes);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// Truncate `s` to at most `max_bytes`, walking back to a UTF-8 char boundary
 /// so it never panics on a multibyte character (CJK / emoji) straddling the
 /// cut. `String::truncate` panics on a non-boundary index — host error
@@ -430,8 +461,8 @@ const STDERR_CAPTURE_CAP: usize = 262_144;
 /// Hard cap on stdout accumulated by [`run_subprocess_streaming`] — mirrors the
 /// 256 KiB post-hoc stdout truncation in [`run_subprocess`]. Without it a chatty
 /// newline-delimited stream (thousands of small JSONL events) grows the
-/// line buffer without bound. Past the cap we stop accumulating and append a
-/// single truncation marker; live streaming to `on_line` is unaffected.
+/// line buffer without bound. Past the cap we keep the head plus a rolling tail
+/// (see [`StreamStdout`]); live streaming to `on_line` is unaffected.
 const STREAM_STDOUT_CAP: usize = 262_144;
 
 /// Hard cap for one newline-delimited streaming record. The reader continues
@@ -584,26 +615,65 @@ fn spawn_stdout_line_capture(
     (rx, task)
 }
 
+/// Stdout accumulated by [`run_subprocess_streaming`], bounded by
+/// [`STREAM_STDOUT_CAP`]. Lines are kept in order until the cap is first hit;
+/// from then on a rolling tail of the newest lines is kept instead, because
+/// every base emits its final answer LAST (claude's `result`, codex's final
+/// `agent_message` / `turn.completed`, opencode's final text). When the tail
+/// needs room it evicts its own oldest lines first, then the newest head lines,
+/// so the terminal record survives even when it is large.
+#[derive(Default)]
+struct StreamStdout {
+    head: Vec<String>,
+    tail: std::collections::VecDeque<String>,
+    retained_bytes: usize,
+    truncated: bool,
+    lines_seen: usize,
+}
+
+impl StreamStdout {
+    fn push(&mut self, line: String) {
+        self.lines_seen += 1;
+        let cost = line.len() + 1;
+        if !self.truncated && self.retained_bytes + cost <= STREAM_STDOUT_CAP {
+            self.retained_bytes += cost;
+            self.head.push(line);
+            return;
+        }
+        self.truncated = true;
+        if cost > STREAM_STDOUT_CAP {
+            return;
+        }
+        while self.retained_bytes + cost > STREAM_STDOUT_CAP {
+            let Some(evicted) = self.tail.pop_front().or_else(|| self.head.pop()) else {
+                break;
+            };
+            self.retained_bytes -= evicted.len() + 1;
+        }
+        self.retained_bytes += cost;
+        self.tail.push_back(line);
+    }
+
+    fn into_string(self) -> String {
+        let mut lines = self.head;
+        if self.truncated {
+            lines
+                .push("...[umadev: stdout truncated at 256 KiB; middle lines omitted]".to_string());
+        }
+        lines.extend(self.tail);
+        lines.join("\n")
+    }
+}
+
 fn record_stream_line(
     line_buf: &[u8],
     on_line: &(dyn Fn(&str) + Send + Sync),
-    all_lines: &mut Vec<String>,
-    acc_bytes: &mut usize,
-    stdout_truncated: &mut bool,
+    stdout: &mut StreamStdout,
 ) {
     let line = String::from_utf8_lossy(line_buf);
     let line = line.trim_end_matches(['\r', '\n']).to_string();
     on_line(&line);
-    if *stdout_truncated {
-        return;
-    }
-    if acc_bytes.saturating_add(line.len() + 1) > STREAM_STDOUT_CAP {
-        *stdout_truncated = true;
-        all_lines.push("...[umadev: stdout truncated at 256 KiB]".to_string());
-    } else {
-        *acc_bytes += line.len() + 1;
-        all_lines.push(line);
-    }
+    stdout.push(line);
 }
 
 /// Spawn a task that drains a child's stderr into a byte buffer, bounded by
@@ -695,54 +765,14 @@ impl<T> Drop for AbortOnDrop<T> {
 /// so `end()` can never block the host.
 const END_REAP_BUDGET: Duration = Duration::from_secs(2);
 
-/// Whether an INHERITED env-var name (already ASCII-uppercased) is a secret UmaDev
-/// must never leak into a base CLI or a base-driven tool subprocess.
-///
-/// This is a conservative DENYLIST of credentials that (a) no base CLI needs to
-/// authenticate and (b) are the exact surface a compromised base / malicious
-/// transitive dependency would exfiltrate — the npm publish-token theft class.
-/// It deliberately does NOT pattern-match `*KEY*`/`*TOKEN*` broadly: a base
-/// self-authenticates through its OWN provider env (`ANTHROPIC_API_KEY`,
-/// `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
-/// `CLAUDE_CODE_OAUTH_TOKEN`, cloud-provider creds under an explicit bedrock/vertex
-/// switch, …), so a broad scrub would break base login — worse than the leak. Only
-/// the names below, none of which any base needs, are removed. `UMADEV_GOVERN_ROOT`
-/// is the ONE deliberate signal UmaDev sets on the base (the governance-hook scope)
-/// and is explicitly preserved.
-fn leaked_secret_env_name(upper: &str) -> bool {
-    if upper == GOVERN_ROOT_ENV {
-        return false;
-    }
-    // UmaDev's own internals (lessons token, telemetry, run knobs) — a base never
-    // needs any UMADEV_*/UMA_* except the governance-root signal preserved above.
-    if upper.starts_with("UMADEV_") || upper.starts_with("UMA_") {
-        return true;
-    }
-    // Publish / CI / signing credentials — no base CLI uses these; they are the
-    // release-pipeline secrets a stolen-token attack targets.
-    if upper.starts_with("APPLE_") || upper.starts_with("WINDOWS_CERTIFICATE") {
-        return true;
-    }
-    matches!(
-        upper,
-        "NPM_TOKEN" | "NODE_AUTH_TOKEN" | "GITHUB_TOKEN" | "GH_TOKEN" | "CARGO_REGISTRY_TOKEN"
-    )
-}
-
 /// Strip inherited secrets from a child command before spawn, so a base CLI (and
 /// any tool subprocess or transitive dependency it runs) can never READ UmaDev's
-/// own publish/CI credentials from the environment it inherits. Iterates only the
-/// parent's INHERITED env and removes the names [`leaked_secret_env_name`] flags;
-/// the base's deliberate governance override (set via `cmd.envs` before this) is a
-/// per-command value, not an inherited one, so it is untouched. Additive and
-/// fail-safe: it can only ever REMOVE a variable, never add or expose one.
+/// own publish/CI credentials from the environment it inherits. The list is
+/// [`umadev_process::child_env::is_leaked_secret_name`], shared with the
+/// commands UmaDev runs itself; it keeps the base's own provider auth and the
+/// governance-scope signal. It can only ever REMOVE a variable.
 pub(crate) fn scrub_leaked_secrets_env(cmd: &mut tokio::process::Command) {
-    for (key, _) in std::env::vars_os() {
-        let upper = key.to_string_lossy().to_ascii_uppercase();
-        if leaked_secret_env_name(&upper) {
-            cmd.env_remove(&key);
-        }
-    }
+    umadev_process::child_env::scrub_leaked_secrets(cmd.as_std_mut());
 }
 
 /// Spawn a one-shot base CLI call or probe as a managed child, scrubbing
@@ -1734,9 +1764,19 @@ fn write_prompt(child: &mut umadev_process::ManagedChild, prompt: &str) -> Optio
 /// Run a host CLI subprocess. Errors carry a human-readable string suitable for
 /// `RuntimeError::HostProcess`.
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
+    let exit = run_subprocess_to_exit(&call).await?;
+    subprocess_output(&call, exit)
+}
+
+/// Run `call` to its exit and keep both pipes. A spawn failure or a timeout is
+/// an error; a non-zero exit is not: [`subprocess_output`] maps it, and a
+/// driver that understands its CLI's own failure report can read that first.
+pub(crate) async fn run_subprocess_to_exit(
+    call: &SubprocessCall<'_>,
+) -> Result<SubprocessExit, String> {
     let started = Instant::now();
     let deadline = started.checked_add(call.timeout).unwrap_or(started);
-    let mut child = spawn_subprocess(&call)?;
+    let mut child = spawn_subprocess(call)?;
     let stdin_writer = write_prompt(&mut child, call.prompt);
 
     // Drain both pipes AND wait for exit under ONE deadline (see
@@ -1749,15 +1789,41 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     if let Some(writer) = stdin_writer {
         let _ = reap_bounded(writer.into_inner()).await;
     }
-    let (status, stdout_buf, stderr_buf) = drained?;
+    let (status, stdout, stderr) = drained?;
+    Ok(SubprocessExit {
+        status,
+        stdout,
+        stderr,
+        started,
+    })
+}
 
+/// The output of a finished subprocess, or the error its exit reports.
+pub(crate) fn subprocess_output(
+    call: &SubprocessCall<'_>,
+    exit: SubprocessExit,
+) -> Result<SubprocessOutput, String> {
+    let SubprocessExit {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        started,
+    } = exit;
     if !status.success() {
         let code = status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+        // A CLI that reports its failure on stdout (Claude's `--output-format
+        // json` result envelope) leaves stderr empty; the end of its stdout is
+        // then the only cause, never a bare "exited with code 1:".
+        let detail = if stderr.trim().is_empty() {
+            let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+            clean_output(tail_on_boundary(&stdout, 2048))
+        } else {
+            truncate_on_boundary(&stderr, 2048).trim().to_string()
+        };
         return Err(format!(
-            "`{}` exited with code {code}: {}",
-            call.program,
-            truncate_on_boundary(&stderr, 2048).trim()
+            "`{}` exited with code {code}: {detail}",
+            call.program
         ));
     }
 
@@ -1932,14 +1998,12 @@ pub(crate) async fn run_subprocess_streaming(
                 .unwrap_or(300),
         ),
     );
-    let mut all_lines = Vec::new();
     // Total-bytes cap on the accumulated stdout, mirroring the non-streaming
     // 256 KiB cap in `run_subprocess` — a chatty JSONL stream (many small
-    // events) would otherwise grow `all_lines` without bound and exhaust memory.
-    // We keep *streaming* every line to `on_line` (the live UI is transient), but
-    // stop ACCUMULATING once past the cap and append a single truncation marker.
-    let mut acc_bytes: usize = 0;
-    let mut stdout_truncated = false;
+    // events) would otherwise grow without bound and exhaust memory. We keep
+    // *streaming* every line to `on_line` (the live UI is transient); the
+    // accumulator keeps the head plus the newest tail (see `StreamStdout`).
+    let mut stdout_acc = StreamStdout::default();
     let mut exited_status = None;
     // **First-line grace.** The idle watchdog measures line-to-line *silence*,
     // which only makes sense once a line has been seen. Some bases (claude /
@@ -2000,13 +2064,9 @@ pub(crate) async fn run_subprocess_streaming(
                     let _ = tokio::time::timeout(STDERR_FLUSH_GRACE, async {
                         while let Some(event) = line_rx.recv().await {
                             match event {
-                                StdoutLineEvent::Line(line_buf) => record_stream_line(
-                                    &line_buf,
-                                    on_line,
-                                    &mut all_lines,
-                                    &mut acc_bytes,
-                                    &mut stdout_truncated,
-                                ),
+                                StdoutLineEvent::Line(line_buf) => {
+                                    record_stream_line(&line_buf, on_line, &mut stdout_acc);
+                                }
                                 StdoutLineEvent::End | StdoutLineEvent::Error(_) => break,
                             }
                         }
@@ -2021,13 +2081,7 @@ pub(crate) async fn run_subprocess_streaming(
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::End))) => break,
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::Line(line_buf)))) => {
                     seen_first_line = true;
-                    record_stream_line(
-                        &line_buf,
-                        on_line,
-                        &mut all_lines,
-                        &mut acc_bytes,
-                        &mut stdout_truncated,
-                    );
+                    record_stream_line(&line_buf, on_line, &mut stdout_acc);
                 }
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::Error(e)))) => {
                     terminate_and_reap_subprocess(&mut child).await;
@@ -2058,7 +2112,7 @@ pub(crate) async fn run_subprocess_streaming(
                     // #53584). Kill + return a distinguishable error so callers
                     // can retry.
                     terminate_and_reap_subprocess(&mut child).await;
-                    let lines_so_far = all_lines.len();
+                    let lines_so_far = stdout_acc.lines_seen;
                     return Err(format!(
                         "`{}` idle timeout: no stdout for {}s (stream-json hang? lines so far: {lines_so_far}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
                         call.program,
@@ -2122,7 +2176,8 @@ pub(crate) async fn run_subprocess_streaming(
         ));
     }
 
-    let stdout = all_lines.join("\n");
+    let lines_seen = stdout_acc.lines_seen;
+    let stdout = stdout_acc.into_string();
     let stdout = clean_output(&stdout);
 
     if stdout.trim().is_empty() && !stderr_buf.is_empty() {
@@ -2137,7 +2192,7 @@ pub(crate) async fn run_subprocess_streaming(
     tracing::debug!(
         program = call.program,
         millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        lines = all_lines.len(),
+        lines = lines_seen,
         "host streaming subprocess completed"
     );
     Ok(SubprocessOutput { stdout })
@@ -2310,8 +2365,30 @@ impl TerminalTextSanitizer {
 
     fn process_valid(&mut self, valid: &str, out: &mut String) {
         for ch in valid.chars() {
+            // A C1 code point decoded from well-formed UTF-8 is text, not an
+            // eight-bit control: JSON carries it unescaped inside strings, and
+            // treating it as an OSC/DCS/CSI introducer let one stray U+009D
+            // swallow every following line (the final `result` record
+            // included). Outside a string control it is dropped like DEL, so it
+            // never opens a sequence; inside one it may still terminate it.
+            // Raw C1 bytes keep their control meaning in `process_invalid_utf8`.
+            let ch = if ('\u{0080}'..='\u{009f}').contains(&ch) && !self.in_string_control() {
+                '\u{007f}'
+            } else {
+                ch
+            };
             self.process_char(ch, out);
         }
+    }
+
+    fn in_string_control(&self) -> bool {
+        matches!(
+            self.state,
+            TerminalControlState::Osc
+                | TerminalControlState::OscEscape
+                | TerminalControlState::StringControl
+                | TerminalControlState::StringEscape
+        )
     }
 
     fn process_char(&mut self, ch: char, out: &mut String) {
@@ -3329,6 +3406,26 @@ mod tests {
     }
 
     #[test]
+    fn clean_output_keeps_lines_after_a_utf8_c1_code_point() {
+        // JSON allows U+0080..U+009F unescaped inside strings. As decoded text
+        // they must not open an OSC/DCS/CSI that swallows every later line —
+        // here the terminal result record.
+        let raw = "{\"c\":\"\u{9d}\"}\n{\"type\":\"result\",\"result\":\"FINAL\"}";
+        let cleaned = clean_output(raw);
+        assert!(cleaned.contains("FINAL"), "{cleaned:?}");
+        assert_eq!(
+            cleaned,
+            "{\"c\":\"\"}\n{\"type\":\"result\",\"result\":\"FINAL\"}"
+        );
+        for c1 in ['\u{90}', '\u{98}', '\u{9b}', '\u{9e}', '\u{9f}'] {
+            let cleaned = clean_output(&format!("a{c1}b\nc"));
+            assert_eq!(cleaned, "ab\nc", "{c1:?}");
+        }
+        // A decoded C1 right after ESC does not turn it into a string control.
+        assert_eq!(clean_output("x\x1b\u{9d}y\nz"), "xy\nz");
+    }
+
+    #[test]
     fn clean_output_trims_and_strips() {
         let raw = "  \x1b[33m# PRD\x1b[0m\n\nbody  \n";
         assert_eq!(clean_output(raw), "# PRD\n\nbody");
@@ -3815,6 +3912,37 @@ mod tests {
     }
 
     #[test]
+    fn tail_on_boundary_keeps_the_end_without_splitting_a_character() {
+        assert_eq!(tail_on_boundary("abcdef", 3), "def");
+        assert_eq!(tail_on_boundary("ab", 8), "ab");
+        // "底座" is 6 bytes; a 4-byte tail would cut inside the first character.
+        assert_eq!(tail_on_boundary("底座", 4), "座");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_exit_with_empty_stderr_quotes_the_end_of_stdout() {
+        // A CLI that reports its failure only on stdout must not surface as a
+        // bare "exited with code 1:".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = run_subprocess(SubprocessCall {
+            program: "/bin/sh",
+            args: &[
+                "-c".to_string(),
+                "echo 'progress 1/2'; echo 'fatal: the quota is used up'; exit 1".to_string(),
+            ],
+            prompt: "",
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(30),
+            env: &[],
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("exited with code 1"), "{err}");
+        assert!(err.contains("fatal: the quota is used up"), "{err}");
+    }
+
+    #[test]
     fn map_subprocess_error_classifies_streaming_idle_timeout() {
         let err = "`claude` idle timeout: no stdout for 7s (stream-json hang? lines so far: 1). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.".to_string();
         match map_subprocess_error(err) {
@@ -4008,8 +4136,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn streaming_stdout_is_capped() {
-        // A chatty stream (~400 KiB of small lines) must not grow `all_lines`
-        // without bound: the accumulation is capped at `STREAM_STDOUT_CAP`
+        // A chatty stream (~400 KiB of small lines) must not grow the retained
+        // stdout without bound: the accumulation is capped at `STREAM_STDOUT_CAP`
         // (256 KiB) with a truncation marker, mirroring the non-streaming cap.
         let tmp = tempfile::TempDir::new().unwrap();
         // 2000 lines × 200 bytes ≈ 400 KiB — well past the 256 KiB cap.
@@ -4035,6 +4163,54 @@ mod tests {
         assert!(
             out.stdout.contains("stdout truncated at 256 KiB"),
             "the truncation marker must be present once the cap is hit"
+        );
+    }
+
+    #[test]
+    fn stream_stdout_evicts_head_for_a_large_terminal_record() {
+        let mut acc = StreamStdout::default();
+        acc.push("init".to_string());
+        for _ in 0..200 {
+            acc.push("x".repeat(1024));
+        }
+        let result = format!("RESULT{}", "y".repeat(200 * 1024));
+        acc.push(result.clone());
+        let out = acc.into_string();
+        assert!(out.len() <= STREAM_STDOUT_CAP + 128);
+        assert!(out.starts_with("init\n"));
+        assert!(out.ends_with(&result));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_stdout_cap_keeps_the_terminal_result_line() {
+        // Every base emits its final answer LAST (claude `{"type":"result"}`,
+        // codex's final agent_message / turn.completed, opencode's final text).
+        // Past the cap the accumulator must keep the tail, not only the head,
+        // or a long run's answer is silently replaced by its first events.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 300 lines x ~1 KiB ≈ 300 KiB — past the 256 KiB cap.
+        let script = r#"s=$(head -c 1000 /dev/zero | tr '\0' 'x'); i=0; while [ $i -lt 300 ]; do echo "$s"; i=$((i+1)); done; echo '{"type":"result","result":"FINAL"}'"#;
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: "sh",
+                args: &["-c".to_string(), script.to_string()],
+                prompt: "",
+                workspace: tmp.path(),
+                timeout: Duration::from_secs(30),
+                env: &[],
+            },
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        assert!(out.stdout.len() <= STREAM_STDOUT_CAP + 128);
+        assert!(out.stdout.contains("stdout truncated at 256 KiB"));
+        assert!(
+            out.stdout
+                .ends_with(r#"{"type":"result","result":"FINAL"}"#),
+            "the terminal result line must survive the cap: {:?}",
+            &out.stdout[out.stdout.len().saturating_sub(120)..]
         );
     }
 
@@ -4620,54 +4796,6 @@ mod tests {
                     .get_envs()
                     .any(|(key, set)| key == *name && set == Some(std::ffi::OsStr::new(value))),
                 "{name} missing from a session child"
-            );
-        }
-    }
-
-    #[test]
-    fn leaked_secret_env_scrub_removes_umadev_and_publish_secrets_only() {
-        // UmaDev's own internals + publish/CI/signing credentials are scrubbed …
-        for leaked in [
-            "UMADEV_LESSONS_MP_TOKEN",
-            "UMADEV_TELEMETRY_KEY",
-            "UMA_INTERNAL",
-            "NPM_TOKEN",
-            "NODE_AUTH_TOKEN",
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "CARGO_REGISTRY_TOKEN",
-            "APPLE_CERTIFICATE_P12_BASE64",
-            "APPLE_APP_SPECIFIC_PASSWORD",
-            "WINDOWS_CERTIFICATE_PFX_BASE64",
-        ] {
-            assert!(
-                leaked_secret_env_name(leaked),
-                "{leaked} must be scrubbed from a base child"
-            );
-        }
-        // … but the base's OWN provider auth (and normal environment) is PRESERVED,
-        // or the base could not log in — a broken scrub is worse than the leak.
-        for kept in [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "OPENAI_API_KEY",
-            "XAI_API_KEY",
-            "GROK_CODE_XAI_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "PATH",
-            "HOME",
-            "USERPROFILE",
-            "TERM",
-            "LANG",
-            "OPENCODE_SERVER_PASSWORD",
-            // The one deliberate UMADEV_* signal UmaDev sets on the base.
-            GOVERN_ROOT_ENV,
-        ] {
-            assert!(
-                !leaked_secret_env_name(kept),
-                "{kept} must be preserved for the base to function"
             );
         }
     }

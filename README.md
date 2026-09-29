@@ -275,7 +275,7 @@ umadev convenes a nine-seat team — eight specialists plus a coordinator — an
 | Role | What it owns (deliverable on the shared blackboard) |
 |---|---|
 | Product manager | Scope, user stories, EARS acceptance criteria — `*-prd.md` |
-| Architect | Layering, data model, API contract — `*-architecture.md` + `openapi.*` |
+| Architect | Layering, data model, API contract — `*-architecture.md` (its API table is the contract; `umadev adopt` also writes `openapi.*`) |
 | UI/UX designer | Design system: tokens, typography, component states, page skeleton — `*-uiux.md` |
 | Frontend engineer | Components and pages that import the tokens and call the contract URLs |
 | Backend engineer | Data model, endpoints, and business logic aligned to the contract |
@@ -335,15 +335,15 @@ Build, lint, typecheck, and test results are checked directly. The acceptance fl
 
 **2. The frontend↔backend contract is verified mechanically**
 
-`umadev-contract` parses the architecture doc's API table into a typed spec, renders `openapi.json` to `.umadev/contracts/`, extracts every `fetch`/`axios` call in the frontend source, and cross-validates the paths. A mismatch is a blocking finding.
+`umadev-contract` parses the architecture doc's API table into a typed spec, extracts every `fetch`/`axios` call in the frontend source, and cross-validates the paths. A mismatch is a blocking finding. (`umadev adopt` also renders the spec as `openapi.json` in `.umadev/contracts/`.)
 
 **3. Every important action leaves evidence**
 
 Tool calls, verification runs, and critic verdicts are written to `.umadev/audit/` as JSONL. The proof pack includes the evidence chain.
 
-**4. Governance runs on every file write**
+**4. Governance runs on every file write UmaDev drives**
 
-113 content checks cover emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
+113 content checks cover emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook in the Claude Code and Kimi Code sessions UmaDev drives (a `claude` or Kimi Code session you start yourself is not checked or recorded), as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. Every rule outside that floor is configurable in `.umadev/rules.toml`; the floor ignores that file, so a floor block is resolved by changing the content (for example, reading a secret from an environment variable) or by making the edit yourself. All checks are fail-open — a bug in the governor never blocks your work.
 
 ---
 
@@ -460,7 +460,7 @@ skip_checks = []
 
 umadev started as a governance tool and that remains a core capability.
 
-The spec layer has 34 normative clauses. The implementation includes 113 governance content checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
+The spec layer has 34 normative clauses. The implementation includes 113 governance content checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check outside the irreversible write floor (leaked secrets and credentials, sensitive-path writes, destructive shell commands) is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
 
 Governance entry points:
 
@@ -696,14 +696,14 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `umadev adopt [path]` | Onboard an existing repo: detect stack, index source, reverse-derive the API contract |
 | `umadev` | Launch the chat TUI |
 | `umadev doctor` | Self-test |
-| `umadev verify` | Workspace conformance and evidence chain; `--runtime` boots the app and hits its routes |
+| `umadev verify` | Workspace conformance and evidence chain, then runs the project's install / lint / typecheck / test / build steps (it executes project code, can rewrite a lockfile, and exits non-zero when a step fails); `--runtime` also boots the app and hits its routes |
 | `umadev report` | Compliance mapping (SOC 2 / ISO 27001 / EU AI Act); `--review` writes a PR-ready review report + runs the pre-PR security scan |
 | `umadev usage` | Per-run / per-phase token usage + a rough cost estimate |
 | `umadev lessons` | Curated reusable rules distilled from incidents and verified outcomes (the concrete incident ledger remains in TUI `/pitfalls`) |
 | `umadev history` | List rollback snapshots |
 | `umadev rollback latest` | Roll back to a snapshot |
 | `umadev update` | Upgrade through the owning package manager (npm / pnpm / yarn / bun), or through GitHub Releases for a standalone/native install |
-| `umadev uninstall` | Full uninstall: removes `~/.umadev`, governance hooks, and the binary (`--base <id>` for hook-only) |
+| `umadev uninstall` | Full uninstall: removes `~/.umadev`, governance hooks, and the binary; an npm/pnpm/yarn/bun install's `@umatech/umadev` package is removed with the manager that installed it (`--base <id>` for hook-only) |
 
 **Script / CI run (non-interactive outer command)**
 
@@ -729,7 +729,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | Command | What it does |
 |---|---|
 | `umadev ci [--changed-only] [--report-only]` | Run governance over every source file (CI mode) |
-| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | Install native project-scoped pre/post-tool governance where supported, or the git fallback |
+| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | Install native project-scoped pre/post-tool governance for the base sessions UmaDev drives, or the git fallback, which checks every commit |
 
 **Platform extensions**
 
@@ -755,7 +755,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `UMADEV_GROK_BIN` | Override the Grok Build executable | `grok` |
 | `UMADEV_KIMI_BIN` | Override the Kimi Code executable | `kimi` |
 | `UMADEV_WORKER_TIMEOUT` | Per-call worker timeout in seconds | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | Verify-loop per-call timeout in seconds | `120` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | Timeout in seconds for every verify step (install, lint, test, build); when unset each step uses its own budget | `120` (`600` for install / test / build) |
 | `UMADEV_NO_GOAL_MODE` | Disable `/goal` mode if set to `1` | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | Seed the base's live process-log visibility (also toggled in-app with `/logs`) | off |
 | `UMADEV_CONTINUOUS` | Set to `0` (or `UMADEV_LEGACY_RUN=1`) to opt out of the continuous single-session path | on |
@@ -763,7 +763,8 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `OPENAI_EMBED_KEY` | Dedicated key for remote embeddings; inert without the explicit opt-in below | — |
 | `UMADEV_ALLOW_CLOUD_EMBED` | Set to `1` to allow remote embedding when `OPENAI_EMBED_KEY` is also set | off |
 | `OPENAI_EMBED_BASE` | Remote embedding service base; consulted only after the two-part cloud opt-in | `https://api.openai.com` |
-| `UMADEV_EMBED_MODEL_DIR` | Directory containing a compatible local `config.json`, `tokenizer.json`, and `model.safetensors` | `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | Directory containing a compatible local `config.json`, `tokenizer.json`, and `model.safetensors`; when it names a directory, the npm launcher downloads nothing | `~/.umadev/embed-model` |
+| `UMADEV_NO_MODEL_DOWNLOAD` | Set to `1` to stop the npm launcher from downloading the embedding model (retrieval uses BM25). Without it, a failed download, or one skipped with Ctrl+C, is retried after 24 hours rather than on every launch | off |
 | `XDG_CONFIG_HOME` | Base directory for `config.toml` | `$HOME` |
 
 ---
@@ -799,7 +800,7 @@ engine = "hybrid"
 top_k = 6
 ```
 
-The tier is `guarded` by default, in the TUI and for `umadev run` / `umadev quick`. Auto is only ever chosen on your machine, for the session: `shift+Tab`, `/mode auto` or `/auto` in the TUI, `--mode auto` on the CLI. A repository cannot choose it: `.umadevrc` `pipeline.auto_approve_gates = true` is ignored with a warning, and a saved run's Auto tier resumes only in a trusted project whose run state UmaDev on this machine wrote. No tier removes the irreversible-action confirmation floor. Git merge/reset, deletes, deploys, and network pushes always require confirmation on every tier.
+The tier is `guarded` by default, in the TUI and for `umadev run` / `umadev quick`. Auto is only ever chosen on your machine, for the session: `shift+Tab`, `/mode auto` or `/auto` in the TUI, `--mode auto` on the CLI. A repository cannot choose it: `.umadevrc` `pipeline.auto_approve_gates = true` is ignored with a warning, and a saved run's Auto tier counts only in a trusted project whose run state UmaDev on this machine wrote. `umadev continue`, `redo` and `revise` resume at that tier; in the TUI a resumed run never has more authority than the session's current tier: a run saved in Auto continues at the session's tier (Guarded by default), UmaDev says so, and `/mode auto` gives it back. No tier removes the irreversible-action confirmation floor. Git merge/reset, deletes, deploys, and network pushes always require confirmation on every tier.
 
 **Workspace trust.** The first time UmaDev runs in a project it asks whether you trust it (a picker in the TUI, a `y/N` question on a CLI terminal) and keeps the answer in `~/.umadev`, never in the project. Change it with `/trust` or `umadev trust [--revoke]`; `umadev doctor` shows it. A script or CI run that nobody can answer treats the project as untrusted unless it passes `--trust-project` or sets `UMADEV_TRUST_PROJECT=1`, which trust it for that command only. An untrusted project runs at most in `guarded` (Plan stays available), and every base starts without the project's own configuration: Claude Code with `--setting-sources user --strict-mcp-config` (UmaDev's own governance hooks, when installed, are passed with `--settings`), Codex with the project and its parents marked `untrusted`, and OpenCode with `OPENCODE_DISABLE_PROJECT_CONFIG=1`. Grok Build keeps project configuration behind its own folder trust. Kimi Code cannot skip a project's MCP files, so it is refused in an untrusted project that ships `.mcp.json` or `.kimi-code/mcp.json`. MCP servers added to the project with `umadev mcp-manage` load only once the project is trusted.
 

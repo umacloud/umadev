@@ -110,6 +110,13 @@ const MAX_GROK_NOTES_CHARS: usize = 16 * 1024;
 const MAX_GROK_PLAN_CHARS: usize = 256 * 1024;
 const MAX_KIMI_PLAN_REVIEW_CHARS: usize = 256 * 1024;
 const MAX_TOOL_CALL_ID_CHARS: usize = 512;
+// Tool-call ids remembered per state (announced, provisional, settled); the
+// oldest is forgotten first beyond this many.
+const MAX_RECENT_TOOL_IDS: usize = 256;
+// A permission request names its tool call by id. What each unsettled call does
+// is remembered until it settles; calls a cancelled turn never settles age out,
+// oldest first, beyond this many.
+const MAX_TOOL_CALL_SUBJECTS: usize = 64;
 // Kimi's official adapter carries the final tool output in the terminal
 // `tool_call_update` rather than streaming stdout progress. Keep enough of that
 // result for `/logs` and expanded tool cards; the TUI applies its own folding
@@ -1470,6 +1477,8 @@ pub struct AcpSession {
     stderr: StderrTail,
     stderr_drain: StderrDrain,
     reader_task: Option<tokio::task::JoinHandle<()>>,
+    /// Set once the reader has stopped: nothing will answer a new request.
+    closed: Arc<AtomicBool>,
     turn_active: Arc<AtomicBool>,
     latest_usage: LatestUsage,
     grok_client_source_capabilities: GrokSourceCapabilities,
@@ -1908,6 +1917,7 @@ impl AcpSession {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_active = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
         let grok_source_capabilities = Arc::new(AtomicU32::new(0));
         // Fresh sessions have no replay window. Recovery flips this only for
         // the bounded resume/load request and clears it on every result path.
@@ -1933,6 +1943,7 @@ impl AcpSession {
             vendor,
             writer: Arc::clone(&writer),
             pending: Arc::clone(&pending),
+            closed: Arc::clone(&closed),
             approvals: Arc::clone(&approvals),
             turn_active: Arc::clone(&turn_active),
             active_session_id: Arc::clone(&active_session_id),
@@ -1978,6 +1989,7 @@ impl AcpSession {
             stderr: stderr_tail,
             stderr_drain,
             reader_task: Some(reader_task),
+            closed,
             turn_active,
             latest_usage,
             grok_client_source_capabilities,
@@ -3036,6 +3048,9 @@ impl AcpSession {
                     None,
                 ));
             }
+            Err(SessionError::Closed) => {
+                return Err((self.process_closed_open_error(label, None).await, None));
+            }
             Err(error) => return Err((error, None)),
         };
         match tokio::time::timeout(handshake_timeout(), receiver).await {
@@ -3101,6 +3116,11 @@ impl AcpSession {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            // Checked under the lock the reader drains on exit, so a request
+            // is either failed by that drain or refused here.
+            if self.closed.load(Ordering::Acquire) {
+                return Err(SessionError::Closed);
+            }
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(SessionError::Send(
                     "ACP pending-request limit reached".to_string(),
@@ -3231,6 +3251,9 @@ impl AcpSession {
                 self.vendor.display_name()
             )));
         }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionError::Closed);
+        }
         if self.turn_active.swap(true, Ordering::AcqRel) {
             return Err(SessionError::Send(
                 "an ACP turn is already in progress".to_string(),
@@ -3252,12 +3275,19 @@ impl AcpSession {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            if pending.len() >= MAX_PENDING_REQUESTS {
+            let refusal = if self.closed.load(Ordering::Acquire) {
+                Some(SessionError::Closed)
+            } else if pending.len() >= MAX_PENDING_REQUESTS {
+                Some(SessionError::Send(
+                    "ACP pending-request limit reached".to_string(),
+                ))
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
                 self.turn_active.store(false, Ordering::Release);
                 clear_active_prompt(&self.active_prompt, &prompt_id);
-                return Err(SessionError::Send(
-                    "ACP pending-request limit reached".to_string(),
-                ));
+                return Err(refusal);
             }
             pending.insert(id, tx);
         }
@@ -3358,6 +3388,9 @@ impl AcpSession {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(SessionError::Closed);
+            }
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(SessionError::Send(
                     "ACP pending-request limit reached".to_string(),
@@ -4417,6 +4450,7 @@ struct ReaderContext {
     vendor: AcpVendor,
     writer: SharedWriter,
     pending: PendingMap,
+    closed: Arc<AtomicBool>,
     approvals: ApprovalMap,
     turn_active: Arc<AtomicBool>,
     active_session_id: ActiveSessionId,
@@ -4452,32 +4486,22 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
     let mut terminal_error = "ACP process closed".to_string();
     loop {
         match read_bounded_frame(&mut reader).await {
-            Ok(Some(FrameRead::Line(line))) => {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                dispatch_frame(frame, &context, &mut tools).await;
+            Ok(Some(FrameRead::Line(line))) => match parse_peer_frame(&line) {
+                Ok(frame) => dispatch_frame(frame, &context, &mut tools).await,
+                Err(error) => settle_unreadable_frame(&line, &error.to_string(), &context).await,
+            },
+            // One corrupt line is skipped like a malformed one; it does not
+            // end the session.
+            Ok(Some(FrameRead::InvalidUtf8(line))) => {
+                settle_unreadable_frame(&line, "not UTF-8", &context).await;
             }
             Ok(Some(FrameRead::Oversized)) => {
                 terminal_error = "ACP frame exceeded the 64 MiB safety limit".to_string();
-                if context.turn_active.swap(false, Ordering::AcqRel) {
-                    let _ = context
-                        .event_tx
-                        .send(SessionEvent::TurnDone {
-                            status: TurnStatus::Failed(terminal_error.clone()),
-                            usage: None,
-                        })
-                        .await;
-                }
                 break;
             }
             Ok(None) => break,
-            Err(error) => {
-                terminal_error = if error.kind() == std::io::ErrorKind::InvalidData {
-                    "ACP emitted invalid UTF-8".to_string()
-                } else {
-                    "ACP stdout read failed".to_string()
-                };
+            Err(_) => {
+                terminal_error = "ACP stdout read failed".to_string();
                 break;
             }
         }
@@ -4487,7 +4511,13 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
         active_prompt.take();
     }
 
+    // Whatever stopped the reader, nothing reads the base's replies any more.
+    // The session is marked closed under the pending lock, so a request is
+    // either failed by the drain below or refused when it registers, before
+    // the turn's failure is reported; stdin is closed last so the base sees
+    // EOF too.
     let mut pending = context.pending.lock().await;
+    context.closed.store(true, Ordering::Release);
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(AcpResponseError::message(terminal_error.clone())));
     }
@@ -4502,6 +4532,142 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
                 usage: None,
             })
             .await;
+    }
+    let _ = tokio::time::timeout(CONTROL_WRITE_WAIT, close_acp_stdin(&context.writer)).await;
+}
+
+/// Parse one peer line. A line strict JSON rejects is retried once with every
+/// unpaired UTF-16 surrogate escape replaced by U+FFFD.
+fn parse_peer_frame(line: &str) -> Result<Value, serde_json::Error> {
+    let error = match serde_json::from_str::<Value>(line) {
+        Ok(frame) => return Ok(frame),
+        Err(error) => error,
+    };
+    let Some(repaired) = replace_unpaired_surrogate_escapes(line) else {
+        return Err(error);
+    };
+    let frame = serde_json::from_str::<Value>(&repaired)?;
+    tracing::warn!(
+        bytes = line.len(),
+        "ACP frame carried an unpaired UTF-16 surrogate escape; read it as U+FFFD"
+    );
+    Ok(frame)
+}
+
+/// `line` with every unpaired UTF-16 surrogate escape (`\uD800`-`\uDFFF`
+/// without its partner) replaced by `\uFFFD`, or `None` when it has none.
+///
+/// Node's `JSON.stringify` writes half of an astral character as a lone escape
+/// when a string was cut between its two UTF-16 units, and Kimi cuts command
+/// summaries and long file lines by code unit. serde_json rejects such an
+/// escape, which lost the whole frame. Only these escapes are rewritten, so a
+/// line that is malformed in any other way still fails to parse.
+fn replace_unpaired_surrogate_escapes(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut repaired: Option<String> = None;
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        let paired = match utf16_escape_at(bytes, index) {
+            Some(0xD800..=0xDBFF) => utf16_escape_at(bytes, index + 6)
+                .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next)),
+            Some(0xDC00..=0xDFFF) => false,
+            Some(_) => {
+                index += 6;
+                continue;
+            }
+            None => {
+                // Any other escape: step over the backslash and what it escapes.
+                index += 2;
+                continue;
+            }
+        };
+        if paired {
+            index += 12;
+            continue;
+        }
+        let out = repaired.get_or_insert_with(|| String::with_capacity(line.len()));
+        out.push_str(&line[copied..index]);
+        out.push_str("\\ufffd");
+        index += 6;
+        copied = index;
+    }
+    let mut out = repaired?;
+    out.push_str(&line[copied..]);
+    Some(out)
+}
+
+/// The UTF-16 code unit of the `\uXXXX` escape starting at byte `at`.
+fn utf16_escape_at(bytes: &[u8], at: usize) -> Option<u16> {
+    let [b'\\', b'u', digits @ ..] = bytes.get(at..at + 6)? else {
+        return None;
+    };
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u16::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+}
+
+/// The JSON-RPC envelope of a line that is not a valid frame as a whole. Its
+/// other fields are skipped without being decoded.
+#[derive(serde::Deserialize)]
+struct UnreadableEnvelope {
+    id: Option<Value>,
+    method: Option<String>,
+}
+
+/// Settle a peer line that cannot be read as a frame, after logging why.
+///
+/// Dropping it would leave a request unanswered for good: Kimi's permission
+/// RPC has no timeout, so its turn would stall until the idle watchdog. A
+/// permission request is declined as cancelled, any other request gets a
+/// JSON-RPC error, and a response fails the request it answers.
+async fn settle_unreadable_frame(line: &str, reason: &str, context: &ReaderContext) {
+    let envelope = serde_json::from_str::<UnreadableEnvelope>(line).ok();
+    tracing::warn!(
+        bytes = line.len(),
+        method = ?envelope
+            .as_ref()
+            .and_then(|envelope| envelope.method.as_deref())
+            .map(|method| clip_text(method, 80)),
+        reason,
+        "ACP peer line is not a valid frame"
+    );
+    let Some(UnreadableEnvelope {
+        id: Some(id),
+        method,
+    }) = envelope
+    else {
+        return;
+    };
+    match method.as_deref() {
+        Some("session/request_permission") => {
+            let _ = write_permission_response(&context.writer, &id, None, None).await;
+        }
+        Some(_) => {
+            reply_rpc_error(
+                &context.writer,
+                id,
+                -32_700,
+                "ACP request could not be parsed",
+            )
+            .await;
+        }
+        None => {
+            let Some(id) = id.as_u64() else {
+                return;
+            };
+            let sender = context.pending.lock().await.remove(&id);
+            if let Some(sender) = sender {
+                let _ = sender.send(Err(AcpResponseError::message(
+                    "ACP response could not be parsed",
+                )));
+            }
+        }
     }
 }
 
@@ -4741,7 +4907,7 @@ async fn dispatch_server_message(
             handle_grok_queue_changed(params, context, replaying).await;
         }
         (method, true) => {
-            dispatch_host_request(frame, method, params, context, replaying).await;
+            dispatch_host_request(frame, method, params, context, tools, replaying).await;
         }
         _ => {}
     }
@@ -4752,6 +4918,7 @@ async fn dispatch_host_request(
     method: &str,
     params: &Value,
     context: &ReaderContext,
+    tools: &ToolState,
     replaying: bool,
 ) {
     match method {
@@ -4776,6 +4943,7 @@ async fn dispatch_host_request(
                 frame,
                 params,
                 context,
+                tools,
                 reader_grok_supports(context, GrokSourceCapability::PermissionRequests),
             )
             .await;
@@ -5553,6 +5721,7 @@ async fn handle_permission_request(
     frame: &Value,
     params: &Value,
     context: &ReaderContext,
+    tools: &ToolState,
     upstream_permission_boundary: bool,
 ) {
     let raw_id = frame.get("id").cloned().unwrap_or(Value::Null);
@@ -5614,16 +5783,15 @@ async fn handle_permission_request(
             drop(map);
             remember_interaction_owner(&context.interaction_sessions, &req_id, params).await;
             let tool = params.get("toolCall").unwrap_or(&Value::Null);
-            // The approval subject comes from the raw input: the trust policy
-            // must classify exactly what the agent will run.
-            let input = tool.get("rawInput").unwrap_or(tool);
+            // The trust policy must classify exactly what the agent will run.
+            let (action, target) = approval_subject(tool, tools);
             emit_event(
                 &context.event_tx,
                 SessionEvent::HostRequest {
                     req_id,
                     request: HostRequest::Approval {
-                        action: tool_name(tool),
-                        target: approval_target(tool, input),
+                        action,
+                        target,
                         message: tool
                             .get("title")
                             .and_then(Value::as_str)
@@ -5832,7 +6000,9 @@ async fn handle_user_input_request(
         }
     }
     let params = sanitize_value(normalized_params.clone());
-    let questions = parse_host_questions(&params);
+    // Grok matches an answer against its own question and option text, so the
+    // pending state keeps that text; the user is shown a redacted copy.
+    let questions = parse_host_questions(normalized_params);
     if questions.is_empty() {
         reply_rpc_error(
             writer,
@@ -5844,36 +6014,10 @@ async fn handle_user_input_request(
         return;
     }
     let req_id = rpc_id_string(&raw_id);
-    let pending_questions = questions
-        .iter()
-        .map(|question| PendingQuestion {
-            id: question.id.clone(),
-            prompt: question.prompt.clone(),
-            option_labels: question
-                .options
-                .iter()
-                .flat_map(|option| {
-                    [
-                        (option.value.clone(), option.label.clone()),
-                        (option.label.clone(), option.label.clone()),
-                    ]
-                })
-                .collect(),
-            option_previews: question
-                .options
-                .iter()
-                .filter_map(|option| {
-                    option.preview.as_ref().map(|preview| {
-                        [
-                            (option.value.clone(), preview.clone()),
-                            (option.label.clone(), preview.clone()),
-                        ]
-                    })
-                })
-                .flatten()
-                .collect(),
-            multi_select: matches!(question.kind, HostQuestionKind::MultiChoice),
-        })
+    let pending_questions = questions.iter().map(pending_question).collect();
+    let questions = questions
+        .into_iter()
+        .map(crate::redaction::sanitize_question)
         .collect();
     let request = PendingHostRequest::UserInput {
         raw_id: raw_id.clone(),
@@ -5915,6 +6059,34 @@ async fn handle_user_input_request(
         },
     )
     .await;
+}
+
+/// The pending state of one question, which the user answers from its
+/// redacted copy.
+///
+/// The peer matches an answer against its own text: Grok keys it by the
+/// question and names the chosen options by their labels. The user sees a
+/// redacted copy and answers with its option values, so every shown value and
+/// label maps to the peer's own label and preview.
+fn pending_question(question: &HostQuestion) -> PendingQuestion {
+    let shown = crate::redaction::sanitize_question(question.clone());
+    let mut option_labels = HashMap::new();
+    let mut option_previews = HashMap::new();
+    for (option, shown_option) in question.options.iter().zip(&shown.options) {
+        for key in [&shown_option.value, &shown_option.label] {
+            option_labels.insert(key.clone(), option.label.clone());
+            if let Some(preview) = &option.preview {
+                option_previews.insert(key.clone(), preview.clone());
+            }
+        }
+    }
+    PendingQuestion {
+        id: shown.id,
+        prompt: question.prompt.clone(),
+        option_labels,
+        option_previews,
+        multi_select: matches!(question.kind, HostQuestionKind::MultiChoice),
+    }
 }
 
 async fn handle_permission_expansion_request(
@@ -6118,11 +6290,11 @@ async fn remember_interaction_owner(
 async fn emit_event(event_tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     match event {
         // High-volume presentation deltas are intentionally lossy. Every other
-        // event carries session, tool, approval, lifecycle, or terminal state and
-        // therefore must apply bounded backpressure instead of disappearing when
-        // the 256-slot queue is full.
-        SessionEvent::TextDelta(_)
-        | SessionEvent::ThinkingDelta(_)
+        // event — including `TextDelta`, which IS the answer the agent builds
+        // replies and verdicts from — carries state and therefore must apply
+        // bounded backpressure instead of disappearing when the 256-slot queue
+        // is full.
+        SessionEvent::ThinkingDelta(_)
         | SessionEvent::ToolOutputDelta(_)
         | SessionEvent::ToolOutputDeltaCorrelated { .. } => {
             let _ = event_tx.try_send(event);
@@ -6155,16 +6327,75 @@ async fn emit_converged_terminal(
 
 #[derive(Default)]
 struct ToolState {
-    known: HashSet<String>,
+    known: RecentToolIds,
     /// Kimi and other ACP agents may create a pending tool from streamed JSON
     /// before parsed `rawInput` exists. Hold those ids until the authoritative
     /// started-upgrade arrives so consumers see one factual tool call, not a
     /// placeholder followed by arguments mislabelled as command output.
-    provisional: HashSet<String>,
-    settled: HashSet<String>,
+    provisional: RecentToolIds,
+    settled: RecentToolIds,
+    /// What each unsettled call does, by call id, with the ids oldest first.
+    /// A permission request's `toolCall` names a call the agent announced
+    /// before, and Kimi's carries no `kind` and no arguments: what the call
+    /// will run exists only on the frames that announced it.
+    subjects: HashMap<String, ToolCallSubject>,
+    subject_order: VecDeque<String>,
     seen_grok_event_ids: HashSet<String>,
     grok_event_order: VecDeque<String>,
     bash_streams: HashMap<String, GrokBashStream>,
+}
+
+/// Recently seen tool-call ids, forgetting the oldest past a bound.
+///
+/// Emptying the whole set at the bound made every call still in flight look
+/// unannounced, so its next update invented a second, phantom tool call.
+#[derive(Debug, Default)]
+struct RecentToolIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RecentToolIds {
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn insert(&mut self, id: String) {
+        if self.ids.contains(&id) {
+            return;
+        }
+        if self.order.len() >= MAX_RECENT_TOOL_IDS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+        self.ids.insert(id.clone());
+        self.order.push_back(id);
+    }
+
+    fn remove(&mut self, id: &str) {
+        if self.ids.remove(id) {
+            self.order.retain(|recent| recent != id);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
+/// What one announced tool call will do.
+#[derive(Debug, Default)]
+struct ToolCallSubject {
+    /// The vendor's ACP `kind`.
+    kind: Option<String>,
+    /// The parsed arguments (`rawInput`).
+    raw_input: Option<Value>,
+    /// The argument JSON streamed into a provisional card so far. Kimi asks
+    /// for permission before the started upgrade that carries `rawInput`, so
+    /// this text is all it has sent about the call when it asks.
+    streamed_arguments: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -6201,6 +6432,49 @@ enum GrokBashUpdate {
 }
 
 impl ToolState {
+    /// Remember what an announced call does. A later frame replaces what it
+    /// carries and keeps what it omits; parsed arguments supersede the
+    /// streamed text. `streaming` says the frame's content is the argument
+    /// JSON streamed so far, not output.
+    fn remember_subject(&mut self, id: &str, update: &Value, streaming: bool) {
+        let kind = update.get("kind").and_then(Value::as_str);
+        let raw_input = update.get("rawInput").or_else(|| update.get("raw_input"));
+        let streamed_arguments = if streaming {
+            streamed_argument_text(update)
+        } else {
+            None
+        };
+        if id.is_empty() || (kind.is_none() && raw_input.is_none() && streamed_arguments.is_none())
+        {
+            return;
+        }
+        if !self.subjects.contains_key(id) {
+            while self.subject_order.len() >= MAX_TOOL_CALL_SUBJECTS {
+                let Some(oldest) = self.subject_order.pop_front() else {
+                    break;
+                };
+                self.subjects.remove(&oldest);
+            }
+            self.subject_order.push_back(id.to_string());
+        }
+        let subject = self.subjects.entry(id.to_string()).or_default();
+        if let Some(kind) = kind {
+            subject.kind = Some(kind.to_string());
+        }
+        if let Some(raw_input) = raw_input {
+            subject.raw_input = Some(raw_input.clone());
+            subject.streamed_arguments = None;
+        } else if let Some(streamed_arguments) = streamed_arguments {
+            subject.streamed_arguments = Some(streamed_arguments.to_string());
+        }
+    }
+
+    fn forget_subject(&mut self, id: &str) {
+        if self.subjects.remove(id).is_some() {
+            self.subject_order.retain(|remembered| remembered != id);
+        }
+    }
+
     fn remember_grok_event(&mut self, event_id: &str) -> bool {
         if event_id.is_empty() || self.seen_grok_event_ids.contains(event_id) {
             return false;
@@ -7079,12 +7353,13 @@ fn parse_tool_call(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent> {
             .get("rawInput")
             .or_else(|| update.get("raw_input"))
             .is_none();
+    tools.remember_subject(&id, update, provisional);
     if provisional {
-        bounded_insert(&mut tools.provisional, id);
+        tools.provisional.insert(id);
         return Vec::new();
     }
     if !id.is_empty() {
-        bounded_insert(&mut tools.known, id.clone());
+        tools.known.insert(id.clone());
     }
     let input = normalized_tool_input(update);
     vec![if id.is_empty() {
@@ -7111,6 +7386,9 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
         .is_some();
     let was_provisional = !id.is_empty() && tools.provisional.contains(&id);
     let was_known = !id.is_empty() && tools.known.contains(&id);
+    if !matches!(status, "completed" | "failed") {
+        tools.remember_subject(&id, update, was_provisional && !has_raw_input);
+    }
     if was_provisional && !has_raw_input && !matches!(status, "completed" | "failed") {
         // Cumulative streamed arguments replace the provisional card's content.
         // They are neither process output nor an authoritative executable input.
@@ -7118,7 +7396,7 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
     }
     if !id.is_empty() && (was_provisional || !tools.known.contains(&id)) {
         tools.provisional.remove(&id);
-        bounded_insert(&mut tools.known, id.clone());
+        tools.known.insert(id.clone());
         let input = normalized_tool_input(update);
         events.push(SessionEvent::ToolCallCorrelated {
             call_id: id.clone(),
@@ -7166,7 +7444,8 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
     match status {
         "completed" | "failed" if id.is_empty() || !tools.settled.contains(&id) => {
             if !id.is_empty() {
-                bounded_insert(&mut tools.settled, id.clone());
+                tools.settled.insert(id.clone());
+                tools.forget_subject(&id);
                 if let Some(mut stream) = tools.bash_streams.remove(&id) {
                     append_grok_bash_tail(
                         &mut bash_update,
@@ -7285,13 +7564,6 @@ fn push_grok_bash_event(events: &mut Vec<SessionEvent>, call_id: &str, update: G
     }
 }
 
-fn bounded_insert(set: &mut HashSet<String>, value: String) {
-    if set.len() >= 256 {
-        set.clear();
-    }
-    set.insert(value);
-}
-
 fn bounded_tool_call_id(value: &Value) -> String {
     value
         .get("toolCallId")
@@ -7398,6 +7670,98 @@ fn approval_target(tool: &Value, input: &Value) -> String {
     first_target(input, preferred)
         .or_else(|| first_target(input, &TOOL_TARGET_KEYS))
         .unwrap_or_default()
+}
+
+/// The action and target of a permission request, judged by what the call it
+/// names will do.
+///
+/// ACP sends the request's `toolCall` as an update of a call the agent already
+/// announced, so a field it omits keeps its announced value. Kimi's carries
+/// only the call id, the tool name as `title` and a prose summary, and Kimi
+/// asks before the started upgrade that carries `rawInput`: the command or
+/// path exists only as the argument JSON it streamed into the call's card.
+/// The input is therefore the request's own `rawInput`, else the announced
+/// one, else the streamed arguments, else the path of a `diff` card. The bare
+/// title is never the target: `Bash` is no command and `Write` no path.
+/// Without any input the target is the request's summary, except for a shell
+/// command: the summary cuts a long command short, so the target stays empty
+/// and the trust floor escalates a command it cannot see.
+fn approval_subject(tool: &Value, tools: &ToolState) -> (String, String) {
+    let remembered = tools.subjects.get(&bounded_tool_call_id(tool));
+    let mut vendor = serde_json::Map::new();
+    for key in ["name", "toolName", "title"] {
+        if let Some(value) = tool.get(key) {
+            vendor.insert(key.to_string(), value.clone());
+        }
+    }
+    let kind = tool
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| remembered.and_then(|subject| subject.kind.as_deref()));
+    if let Some(kind) = kind {
+        vendor.insert("kind".to_string(), Value::from(kind));
+    }
+    let vendor = Value::Object(vendor);
+    let streamed = remembered
+        .and_then(|subject| subject.streamed_arguments.as_deref())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object);
+    let diff = diff_path_input(tool);
+    let input = tool
+        .get("rawInput")
+        .or_else(|| tool.get("raw_input"))
+        .or_else(|| remembered.and_then(|subject| subject.raw_input.as_ref()))
+        .or(streamed.as_ref())
+        .or(diff.as_ref());
+    let action = tool_name(&vendor);
+    let target = input
+        .map(|input| approval_target(&vendor, input))
+        .filter(|target| !target.trim().is_empty())
+        .unwrap_or_else(|| {
+            if action.eq_ignore_ascii_case("bash") {
+                String::new()
+            } else {
+                tool_content_text(tool)
+            }
+        });
+    (action, target)
+}
+
+/// The argument JSON a provisional card shows: its first text entry.
+fn streamed_argument_text(update: &Value) -> Option<&str> {
+    update
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find_map(|item| item.pointer("/content/text").and_then(Value::as_str))
+}
+
+/// `{"file_path": …}` from the `content[type=diff]` card of a tool payload.
+fn diff_path_input(tool: &Value) -> Option<Value> {
+    tool.get("content")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("diff"))?
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| json!({"file_path": path}))
+}
+
+/// The text entries of a tool payload's `content`, one per line.
+fn tool_content_text(tool: &Value) -> String {
+    tool.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.pointer("/content/text")
+                .or_else(|| item.get("text"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn grok_bash_raw_output(update: &Value) -> Option<&Value> {
@@ -8541,8 +8905,10 @@ fn grok_accepted_result(
         }
         wire_answers.insert(question.prompt.clone(), json!(labels));
 
+        // The user was shown, and echoes, the redacted preview; Grok gets its own.
         let supplied_preview = annotation.and_then(|annotation| annotation.preview.as_deref());
-        if supplied_preview.is_some_and(|preview| Some(preview) != selected_preview.as_deref()) {
+        let shown_preview = selected_preview.as_deref().map(redact_text);
+        if supplied_preview.is_some_and(|preview| Some(preview) != shown_preview.as_deref()) {
             return Err("Grok question annotation preview did not match the selected option");
         }
         if let Some(notes) = notes.as_deref() {
@@ -8823,6 +9189,8 @@ async fn write_json_line(writer: &SharedWriter, frame: &Value) -> Result<(), Ses
 
 enum FrameRead {
     Line(String),
+    /// A whole line that is not UTF-8, decoded lossily. It has been consumed.
+    InvalidUtf8(String),
     Oversized,
 }
 
@@ -8861,10 +9229,12 @@ async fn read_bounded_frame<R: AsyncBufRead + Unpin>(
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
         bytes.pop();
     }
-    let line = String::from_utf8(bytes).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
-    })?;
-    Ok(Some(FrameRead::Line(line)))
+    Ok(Some(match String::from_utf8(bytes) {
+        Ok(line) => FrameRead::Line(line),
+        Err(error) => {
+            FrameRead::InvalidUtf8(String::from_utf8_lossy(error.as_bytes()).into_owned())
+        }
+    }))
 }
 
 fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionError> {
@@ -9382,6 +9752,12 @@ mod folder_trust_tests;
 
 #[cfg(test)]
 mod background_control_tests;
+
+#[cfg(test)]
+mod kimi_wire_tests;
+
+#[cfg(test)]
+mod grok_question_tests;
 
 #[cfg(test)]
 mod tests {
@@ -12632,12 +13008,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_deltas_survive_a_slow_consumer() {
+        // `TextDelta` IS the answer (the agent builds replies and JSON verdicts
+        // from it), so a full queue must backpressure, never drop a delta.
+        let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let total = EVENT_CHANNEL_CAP + 10;
+        let producer = tokio::spawn(async move {
+            for index in 0..total {
+                emit_event(&event_tx, SessionEvent::TextDelta(format!("d{index};"))).await;
+            }
+        });
+        let mut received = String::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a slow consumer must keep receiving deltas")
+        {
+            if let SessionEvent::TextDelta(delta) = event {
+                received.push_str(&delta);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("producer task should not panic");
+        let expected = (0..total).fold(String::new(), |mut expected, index| {
+            std::fmt::Write::write_fmt(&mut expected, format_args!("d{index};")).unwrap();
+            expected
+        });
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
     async fn critical_events_survive_a_slow_consumer_after_a_large_display_burst() {
         let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
         for index in 0..(EVENT_CHANNEL_CAP + 64) {
             emit_event(
                 &event_tx,
-                SessionEvent::TextDelta(format!("decorative-{index}")),
+                SessionEvent::ThinkingDelta(format!("decorative-{index}")),
             )
             .await;
         }
@@ -13237,6 +13642,53 @@ mod tests {
             &mut tools,
         );
         assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn known_tool_rollover_keeps_in_flight_ids() {
+        // A long resident session announces hundreds of calls. Reaching the
+        // bound on remembered ids must not forget a call that is still
+        // running: its later updates would invent a second, phantom call.
+        let mut tools = ToolState::default();
+        let mut update =
+            |update: Value| parse_session_update(&json!({"update":update}), &mut tools);
+        let started = |id: &str| {
+            json!({"sessionUpdate":"tool_call","toolCallId":id,"kind":"execute",
+                "status":"in_progress","rawInput":{"command":"cargo test"}})
+        };
+        let completed = |id: &str| {
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+                "status":"completed","rawOutput":"ok"})
+        };
+        for index in 0..255 {
+            let id = format!("done-{index}");
+            update(started(&id));
+            update(completed(&id));
+        }
+        let mut events = update(started("a"));
+        // The 257th distinct id.
+        events.extend(update(started("b")));
+        events.extend(update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"a",
+            "title":"Running tests"}),
+        ));
+        events.extend(update(completed("a")));
+        let calls_for_a = events
+            .iter()
+            .filter(|event| {
+                matches!(event, SessionEvent::ToolCallCorrelated { call_id, .. } if call_id == "a")
+            })
+            .count();
+        assert_eq!(calls_for_a, 1, "{events:?}");
+        assert!(events.contains(&SessionEvent::ToolProgressCorrelated {
+            call_id: "a".to_string(),
+            title: "Running tests".to_string(),
+        }));
+        assert!(events.contains(&SessionEvent::ToolResultCorrelated {
+            call_id: "a".to_string(),
+            ok: true,
+            summary: "ok".to_string(),
+        }));
     }
 
     #[test]
@@ -15226,7 +15678,7 @@ mod tests {
         })
     }
 
-    fn kimi_fixture_config_options(model: &str, mode: &str) -> Value {
+    pub(super) fn kimi_fixture_config_options(model: &str, mode: &str) -> Value {
         kimi_fixture_config_options_with_thinking(model, mode, "on")
     }
 

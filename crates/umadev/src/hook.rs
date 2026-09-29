@@ -4,7 +4,7 @@
 //! (registered via `umadev install`). It reads a PreToolUse JSON payload from stdin,
 //! extracts the target file path + new content, runs the governance rules
 //! (emoji / color / AI-slop), and prints a permission-decision JSON object
-//! that both hosts honour to allow or deny the write.
+//! that both hosts honour to deny the write.
 //!
 //! ## Claude Code PreToolUse payload shape (simplified)
 //! ```json
@@ -27,10 +27,16 @@
 //!   }
 //! }
 //! ```
-//! When all rules pass, we emit `permissionDecision: "allow"`.
+//! When all rules pass we print nothing. Exit 0 with no output is "no
+//! decision" in both hosts, so the call continues through the host's own
+//! permission flow; in a UmaDev Claude session that flow sends the approval
+//! request to UmaDev (`--permission-prompt-tool stdio`). An explicit `"allow"`
+//! would instead approve the call and skip that flow: every Write, Edit and
+//! Bash the user runs through plain `claude` in an installed project would stop
+//! asking, and the base's approval requests would never reach UmaDev.
 //!
 //! Fail-open: if the payload can't be parsed or the tool isn't a write,
-//! we allow (never block a legitimate operation on a parse error).
+//! we pass (never block a legitimate operation on a parse error).
 
 use serde::Deserialize;
 use std::io::Read as _;
@@ -520,12 +526,11 @@ fn run_post_tool_scoped(stdin: &str, project_root: &Path, driving: bool) -> Opti
     if tool.is_empty() {
         return None;
     }
-    // The audited target: the file written / the command run. Fall back through
-    // the same field names the PreToolUse parsing understands.
-    let target = payload
-        .tool_input
-        .file_path
-        .as_deref()
+    // The audited target: the file written (Claude `file_path`, Kimi `path`,
+    // NotebookEdit `notebook_path`, exactly as the PreToolUse scan reads it) or
+    // else the command run.
+    let target = Some(payload.tool_input.scan_path())
+        .filter(|path| !path.is_empty())
         .or(payload.tool_input.command.as_deref())
         .or(payload.tool_input.cmd.as_deref())
         .or(payload.tool_input.script.as_deref())
@@ -567,8 +572,12 @@ fn post_tool_outcome(resp: &serde_json::Value) -> &'static str {
     "ok"
 }
 
-pub fn print_decision(decision: &Decision) {
-    let result = if decision.block {
+/// The stdout a `PreToolUse` hook prints for `decision`: the deny object for a
+/// block, and nothing for a pass (see the module docs for why a pass must not
+/// say `"allow"`).
+#[must_use]
+pub fn decision_output(decision: &Decision) -> Option<String> {
+    decision.block.then(|| {
         serde_json::json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -576,15 +585,14 @@ pub fn print_decision(decision: &Decision) {
                 "permissionDecisionReason": decision.reason
             }
         })
-    } else {
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow"
-            }
-        })
-    };
-    println!("{}", serde_json::to_string(&result).unwrap_or_default());
+        .to_string()
+    })
+}
+
+pub fn print_decision(decision: &Decision) {
+    if let Some(output) = decision_output(decision) {
+        println!("{output}");
+    }
 }
 
 /// Claude Code PreToolUse stdin payload.
@@ -1450,10 +1458,26 @@ mod tests {
     }
 
     #[test]
-    fn print_decision_outputs_deny_json() {
-        let d = Decision::block("UD-CODE-001", "emoji here");
-        // Just verify it doesn't panic and produces JSON with deny.
-        print_decision(&d);
+    fn a_block_prints_the_deny_object() {
+        let output = decision_output(&Decision::block("UD-CODE-001", "emoji here"))
+            .expect("a block must print a decision");
+        let json: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let decision = &json["hookSpecificOutput"];
+        assert_eq!(decision["hookEventName"], "PreToolUse");
+        assert_eq!(decision["permissionDecision"], "deny");
+        assert_eq!(decision["permissionDecisionReason"], "emoji here");
+    }
+
+    #[test]
+    fn a_pass_prints_nothing_so_the_host_keeps_its_own_permission_prompt() {
+        // `"allow"` would approve the call and skip Claude Code's permission
+        // prompt (and UmaDev's Guarded approvals). No output is no decision.
+        assert_eq!(decision_output(&Decision::pass()), None);
+        let passed = pre_write(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"fn main() {}"}}"#,
+        );
+        assert!(!passed.block);
+        assert_eq!(decision_output(&passed), None);
     }
 
     #[test]
@@ -1895,6 +1919,23 @@ mod tests {
         let log = root.join(".umadev/audit/tool-calls.jsonl");
         let body = std::fs::read_to_string(&log).unwrap();
         assert!(body.contains("src/App.tsx") && body.contains("\"audit\""));
+    }
+
+    #[test]
+    fn post_tool_audit_records_kimi_path_and_notebook_path_targets() {
+        // Kimi Code's native Write/Edit name the file `path`, and Claude's
+        // NotebookEdit names it `notebook_path`: the audit row must still say
+        // which file was written, not record an empty target.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kimi = r#"{"tool_name":"Write","tool_input":{"path":"src/a.ts","content":"x"}}"#;
+        let rec = post_tool_in(kimi, tmp.path()).expect("a record is written");
+        assert_eq!(rec.file, "src/a.ts");
+        let notebook = concat!(
+            r#"{"tool_name":"NotebookEdit","#,
+            r#""tool_input":{"notebook_path":"nb/analysis.ipynb","new_source":"print(1)"}}"#
+        );
+        let rec = post_tool_in(notebook, tmp.path()).expect("a record is written");
+        assert_eq!(rec.file, "nb/analysis.ipynb");
     }
 
     #[test]

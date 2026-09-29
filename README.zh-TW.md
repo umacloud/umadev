@@ -324,7 +324,7 @@ umadev 是**一支八角色的開發團隊**，外加一個協調者統籌全程
 | 角色 | 它產出什麼（黑板上的產物） |
 |---|---|
 | 產品經理 | 拆需求、使用者故事、EARS 驗收標準 — `*-prd.md` |
-| 架構師 | 分層、資料模型、API 契約 — `*-architecture.md` + `openapi.*` |
+| 架構師 | 分層、資料模型、API 契約 — `*-architecture.md`（其中的 API 表即契約；`umadev adopt` 還會寫出 `openapi.*`） |
 | UI/UX 設計師 | 設計系統：令牌、字體、元件狀態、頁面骨架 — `*-uiux.md` |
 | 前端工程師 | 匯入令牌、呼叫契約 URL 的元件 / 頁面 |
 | 後端工程師 | 資料模型、端點、對齊契約的業務邏輯 |
@@ -508,6 +508,8 @@ flowchart LR
     C["MCP server<br/>給其他 AI 工具呼叫"] --> G
     D["品質門<br/>交付前補掃"] --> G
 ```
+
+其中 Claude Code / Kimi Code 掛鉤只在 UmaDev 驅動的工作階段裡生效；你自己直接啟動的 `claude` 或 Kimi Code 工作階段不會被它檢查或記錄。
 
 專案可以透過 `.umadev/rules.toml` 調整：
 
@@ -729,12 +731,12 @@ umadev 有兩套入口，一一對應：
 | `umadev init` | 鷹架工作區（寫 `umadev.yaml` + 設計系統 / 範本 / 知識庫種子） |
 | `umadev`（無子命令） | 啟動對話 TUI |
 | `umadev doctor` | 自檢 |
-| `umadev verify` | 工作區合規 + 證據鏈狀態（加 `--runtime` 啟動應用並探測路由，寫入 `runtime-proof.json`） |
+| `umadev verify` | 工作區合規 + 證據鏈狀態，並實際執行專案的安裝 / lint / 型別檢查 / 測試 / 建置步驟（會執行專案程式碼、可能改寫鎖定檔，任一步失敗即以非零結束；加 `--runtime` 另外啟動應用並探測路由，寫入 `runtime-proof.json`） |
 | `umadev report` | 合規對應（SOC 2 / ISO 27001 / EU AI Act）；加 `--review` 產出 PR 前的評審報告與安全掃描 |
 | `umadev history` | 列出回滾快照 |
 | `umadev rollback latest` | 回滾到某快照 |
 | `umadev update` | 透過實際所屬套件管理器（npm / pnpm / yarn / bun）升級；原生 / 獨立安裝則從 GitHub Release 驗證並原子更新 |
-| `umadev uninstall` | 完整解除安裝：確認後刪 `~/.umadev` + 本專案治理掛鉤 + 二進位（加 `--base <claude-code\|pre-commit>` 則僅卸掛鉤） |
+| `umadev uninstall` | 完整解除安裝：確認後刪 `~/.umadev` + 本專案治理掛鉤 + 二進位；透過 npm/pnpm/yarn/bun 安裝的，用當初安裝它的套件管理器移除 `@umatech/umadev` 套件（加 `--base <claude-code\|pre-commit>` 則僅卸掛鉤） |
 | `umadev adopt` | 棕地專案：偵測技術棧、索引現有原始碼、反推 API 契約 |
 | `umadev lessons` | 檢視由復發事故或機械驗證結果形成的可重用規則及 pending / validated / needs-revision 狀態；具體事故看 TUI `/pitfalls` |
 | `umadev usage` | token 用量 + 大致成本 |
@@ -756,7 +758,7 @@ umadev 有兩套入口，一一對應：
 | 命令 | 作用 |
 |---|---|
 | `umadev ci [--changed-only] [--report-only]` | 對工作區每個原始檔跑治理（CI 模式） |
-| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安裝專案作用域的原生 pre/post-tool 治理掛鉤，或 git 備援 |
+| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安裝專案作用域的原生 pre/post-tool 治理掛鉤（只作用於 UmaDev 驅動的底座工作階段），或 git 備援（檢查每次提交） |
 
 **平台擴充**
 
@@ -784,14 +786,15 @@ umadev 有兩套入口，一一對應：
 | `UMADEV_GROK_BIN` | 覆寫 Grok Build 執行檔 | `grok` |
 | `UMADEV_KIMI_BIN` | 覆寫 Kimi Code 執行檔 | `kimi` |
 | `UMADEV_WORKER_TIMEOUT` | 單次 worker 逾時（秒） | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | verify 迴圈單次逾時（秒） | `120` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | 每個 verify 步驟（安裝、lint、測試、建置）的逾時（秒）；未設定時各步驟使用自己的預算 | `120`（安裝 / 測試 / 建置為 `600`） |
 | `UMADEV_CONTINUOUS` | 設 `0`（或 `UMADEV_LEGACY_RUN=1`）退出持續單工作階段，改用每次單獨呼叫 | `1` |
 | `UMADEV_NO_GOAL_MODE` | 設 `1` 停用 `/goal` 原生模式 | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | 預置底座即時行程日誌可見性（也可在 App 內用 `/logs` 切換） | 關 |
 | `OPENAI_EMBED_KEY` | 遠端向量專用 key；沒有下面的明確上傳開關時不生效 | — |
 | `UMADEV_ALLOW_CLOUD_EMBED` | 與專用 key 同時設為 `1` 才允許遠端 embedding 上傳 | 關 |
 | `OPENAI_EMBED_BASE` | 遠端 embedding 服務基址；只在雙重雲端 opt-in 後讀取 | `https://api.openai.com` |
-| `UMADEV_EMBED_MODEL_DIR` | 放置相容 `config.json`、`tokenizer.json`、`model.safetensors` 的本地目錄 | `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | 放置相容 `config.json`、`tokenizer.json`、`model.safetensors` 的本地目錄；指向一個目錄時 npm 啟動器不會再下載模型 | `~/.umadev/embed-model` |
+| `UMADEV_NO_MODEL_DOWNLOAD` | 設 `1` 後 npm 啟動器不再下載向量模型（檢索改用 BM25）。未設定時，下載失敗或按 Ctrl+C 略過後，24 小時後才會重試，而不是每次啟動都重新下載 | 關 |
 | `XDG_CONFIG_HOME` | `config.toml` 的基目錄 | `$HOME` |
 
 ---
@@ -828,7 +831,7 @@ engine = "hybrid"
 top_k = 6
 ```
 
-TUI 與 `umadev run` / `umadev quick` 的預設檔位都是 `guarded`。Auto 只能由你在本機為目前工作階段選擇：TUI 裡的 `shift+Tab`、`/mode auto` 或 `/auto`，CLI 的 `--mode auto`。儲存庫無法替你選擇：`.umadevrc` 的 `pipeline.auto_approve_gates = true` 會被忽略並提示，已儲存執行的 Auto 檔位也只在已信任、且由本機 UmaDev 寫下執行狀態的專案中恢復。任何檔位都不會移除不可逆操作確認；git merge/reset、刪除、部署與連網推送在任何檔位都要確認。
+TUI 與 `umadev run` / `umadev quick` 的預設檔位都是 `guarded`。Auto 只能由你在本機為目前工作階段選擇：TUI 裡的 `shift+Tab`、`/mode auto` 或 `/auto`，CLI 的 `--mode auto`。儲存庫無法替你選擇：`.umadevrc` 的 `pipeline.auto_approve_gates = true` 會被忽略並提示，已儲存執行的 Auto 檔位也只在已信任、且由本機 UmaDev 寫下執行狀態的專案中有效。`umadev continue`、`redo` 與 `revise` 依該檔位恢復；TUI 中恢復的執行不會擁有超過目前工作階段檔位的權限，以 Auto 儲存的執行會依目前工作階段的檔位（預設為 Guarded）繼續，UmaDev 會告知你，使用 `/mode auto` 即可恢復 Auto。任何檔位都不會移除不可逆操作確認；git merge/reset、刪除、部署與連網推送在任何檔位都要確認。
 
 **專案信任。** UmaDev 第一次在某個專案執行時會詢問你是否信任它（TUI 裡是選擇器，CLI 終端裡是 `y/N`），答案保存在 `~/.umadev`，不寫進專案；可用 `/trust` 或 `umadev trust [--revoke]` 修改，`umadev doctor` 會顯示目前狀態。無人回應的腳本 / CI 執行預設不信任，除非傳入 `--trust-project` 或設定 `UMADEV_TRUST_PROJECT=1`（只對這一條命令生效）。未信任的專案最高以 `guarded` 執行（Plan 仍可用），底座啟動時不載入專案自帶的設定：Claude Code 使用 `--setting-sources user --strict-mcp-config`（已安裝的 UmaDev 治理鉤子改由 `--settings` 傳入），Codex 把專案及其上層目錄標為 `untrusted`，OpenCode 設定 `OPENCODE_DISABLE_PROJECT_CONFIG=1`；Grok Build 由它自己的資料夾信任把關；Kimi Code 無法略過專案的 MCP 檔案，因此未信任且帶有 `.mcp.json` 或 `.kimi-code/mcp.json` 的專案會拒絕啟動 Kimi。用 `umadev mcp-manage` 加入專案的 MCP 伺服器也要在信任專案後才會載入。
 

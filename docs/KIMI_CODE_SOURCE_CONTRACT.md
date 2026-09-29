@@ -153,6 +153,23 @@ with other tools.
   `approve_always`, and `reject` rows with their source-defined labels and
   semantic kinds. A widened or reordered permission surface is rejected rather
   than guessed.
+- Kimi's ordinary permission request carries only the tool-call id, the tool
+  name as `title` and a prose summary; it has no `kind` and no arguments, and
+  Kimi sends it before the started `tool_call_update` that carries `rawInput`.
+  UmaDev therefore judges it by the call Kimi announced under the same id: that
+  call's `kind`, and its arguments as parsed from the JSON Kimi streamed into
+  the call's card (or its `rawInput`, when an agent sends that first). Without
+  them it uses a diff card's path, then the summary text. The bare tool name is
+  never the target, so a shell call is judged by its command and a write by its
+  real path, including one outside the workspace. A shell command it cannot see
+  is never judged by the summary, which Kimi cuts after 50 characters; the
+  trust floor asks for it instead.
+- Kimi cuts command summaries and long file lines by UTF-16 code unit, so a
+  frame can carry half of an emoji as a lone `\ud83d` escape, which strict
+  JSON rejects. UmaDev reads such an escape as U+FFFD instead of dropping the
+  frame. A line that still cannot be read is logged, and a request it carries is
+  answered with a cancelled outcome, so Kimi's permission request, which has no
+  timeout, never waits for an answer that will not come.
 - Negotiated ACP image and embedded-resource capabilities drive native image and
   file delivery. Kimi's official adapter accepts UTF-8 text embedded resources
   but explicitly drops blob resources, so UmaDev sends text files natively and

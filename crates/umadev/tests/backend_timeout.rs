@@ -22,6 +22,13 @@ fn hermetic_command(cwd: &Path) -> Command {
     let home = cwd.join(".umadev").join("e2e-home");
     let empty_model = home.join("empty-embed-model");
     std::fs::create_dir_all(&empty_model).expect("create hermetic timeout-test home");
+    // The CLI prints in the saved UI language, else the machine's locale (English
+    // on macOS and Windows runners). Pin Simplified Chinese: the assertions below
+    // check the Chinese disclosure of the offline placeholder.
+    let config_dir = home.join(".config").join("umadev");
+    std::fs::create_dir_all(&config_dir).expect("create hermetic config dir");
+    std::fs::write(config_dir.join("config.toml"), "lang = \"zh-CN\"\n")
+        .expect("pin the CLI language");
 
     let mut command = Command::new(bin());
     command

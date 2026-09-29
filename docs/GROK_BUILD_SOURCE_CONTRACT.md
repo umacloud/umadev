@@ -759,6 +759,11 @@ The pinned Grok line reader allows at most 64 MiB including the newline. An
 oversized or invalid UTF-8 frame is fatal to the connection. UmaDev must drain
 pending requests with one precise, redacted protocol error and terminate the
 reader; it must not accept a forged response after an oversized frame.
+Whatever stops UmaDev's reader also closes the session: a later prompt or
+request fails at once instead of waiting for the idle watchdog, and the agent's
+stdin is closed so it exits. A single line that is not UTF-8 or not JSON does not
+end the session; UmaDev logs it and answers a request it can still identify with
+a safe refusal (a cancelled permission outcome or a JSON-RPC error).
 
 Malformed JSON is bounded by an error budget and never logged with secrets.
 Explicit non-2.0 JSON-RPC is rejected. Response ids that cannot match an

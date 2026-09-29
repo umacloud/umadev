@@ -73,6 +73,46 @@ fn live_compound_and_plan_git_requests_never_enter_any_queue() {
 }
 
 #[test]
+fn submit_wording_in_product_requests_reaches_normal_routing() {
+    // 提交 is also the everyday "submit". A button, a form flow or a Git hook is
+    // product work for the base; the host commit boundary must not drop it.
+    for request in [
+        "加一个确认提交按钮",
+        "用户提交后推送通知给管理员",
+        "创建一个提交按钮",
+        "给项目加一个 git commit 前自动跑 eslint 的钩子",
+    ] {
+        let mut app = fresh_app(Some("offline"));
+        assert_eq!(
+            app.submit_text(request.into()),
+            Action::Route(request.into()),
+            "{request}"
+        );
+        assert!(
+            !app.history
+                .iter()
+                .any(|message| message.body().contains("[blocked]")),
+            "{request}"
+        );
+    }
+
+    // At an open gate the same wording is revision feedback, not a commit.
+    let mut app = fresh_app(Some("offline"));
+    app.set_trust_mode(umadev_agent::TrustMode::Auto);
+    app.apply_engine(EngineEvent::GateOpened {
+        gate: Gate::PreviewConfirm,
+        choice: None,
+    });
+    for ch in "/revise 把按钮文字改成确认提交".chars() {
+        let _ = app.apply_key(KeyCode::Char(ch));
+    }
+    assert_eq!(
+        app.apply_key(KeyCode::Enter),
+        Action::Revise("把按钮文字改成确认提交".into())
+    );
+}
+
+#[test]
 fn host_commit_does_not_replace_the_requirement_that_redo_uses() {
     let mut app = fresh_app(Some("offline"));
     app.set_trust_mode(umadev_agent::TrustMode::Auto);

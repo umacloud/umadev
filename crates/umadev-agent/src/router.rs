@@ -45,7 +45,7 @@ use crate::runner::RunOptions;
 
 mod git_commit;
 use git_commit::{
-    git_commit_control_text, git_commit_request_has_additional_work,
+    git_commit_context, git_commit_control_text, git_commit_request_has_additional_work,
     git_commit_request_is_question_or_negated, git_commit_scope_text,
     request_is_git_commit_diagnostic, unquoted_lowercase_text,
 };
@@ -255,29 +255,23 @@ impl RoutePlan {
     }
 
     /// A one-line human rationale for this route — what UmaDev decided and why, for
-    /// the [`crate::events::EngineEvent::IntentDecided`] card. Bilingual-friendly,
-    /// derived deterministically from the typed fields (no model call).
+    /// the [`crate::events::EngineEvent::IntentDecided`] card, in the current UI
+    /// language (the card shows it under a localized headline). Derived
+    /// deterministically from the typed fields (no model call).
     #[must_use]
     pub fn rationale(&self) -> String {
-        match self.class {
-            RouteClass::Chat => "这是对话,直接回应,不进开发流程。".to_string(),
-            RouteClass::Explain => "这是一次讲解/答疑,只读理解,不改动工作区。".to_string(),
-            RouteClass::QuickEdit => "这是一个小修改,快速单写 + 定向校验即可。".to_string(),
-            RouteClass::Debug => {
-                if self.depth.is_deliberate() {
-                    "这是一个排障任务,影响面待定,进研发流程定位+修复+回归。".to_string()
-                } else {
-                    "这是一个小排障,快速定位并修复。".to_string()
-                }
-            }
-            RouteClass::Build => {
-                // A REASON (why build), not a restatement of the localized
-                // intent.build headline the card already shows - otherwise the card
-                // printed the full-build line twice (the reported duplicate).
-                "判定为完整构建:需求规模较大、涉及多个环节,交由多角色团队分阶段交付更稳妥。"
-                    .to_string()
-            }
-        }
+        let key = match self.class {
+            RouteClass::Chat => "intent.rationale.chat",
+            RouteClass::Explain => "intent.rationale.explain",
+            RouteClass::QuickEdit => "intent.rationale.quick_edit",
+            RouteClass::Debug if self.depth.is_deliberate() => "intent.rationale.debug_deep",
+            RouteClass::Debug => "intent.rationale.debug_fast",
+            // A REASON (why build), not a restatement of the localized
+            // intent.build headline the card already shows - otherwise the card
+            // printed the full-build line twice (the reported duplicate).
+            RouteClass::Build => "intent.rationale.build",
+        };
+        umadev_i18n::tl(key).to_string()
     }
 
     /// The **generous turn ceiling** for a base session driving this route — the
@@ -489,6 +483,8 @@ pub async fn route_with_context_and_readonly_session(
         );
     }
 
+    let mut brain = brain;
+    brain.scope = workspace_scope_claims(&brain.scope, requirement, &options.project_root);
     let plan = apply_route_ceilings(
         brain_to_route_in_mode(&brain, requirement, options.mode),
         requirement,
@@ -984,14 +980,35 @@ pub fn looks_like_work_request(text: &str) -> bool {
 /// are candidate `scope` claims for retrieval and execution validation; an empty
 /// result is fine because a lightweight turn may discover a bounded source surface.
 fn path_hints_from_text(text: &str) -> Vec<String> {
-    const EXTS: &[&str] = &[
-        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".css", ".html", ".json",
-        ".toml", ".yaml", ".yml", ".md", ".vue", ".svelte", ".sql",
-    ];
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for raw in text.split(|c: char| {
-        c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；' | '(' | ')' | '`')
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | '，'
+                    | '、'
+                    | ';'
+                    | '；'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '`'
+                    | '：'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '「'
+                    | '」'
+                    | '『'
+                    | '』'
+                    | '《'
+                    | '》'
+                    | '【'
+                    | '】'
+            )
     }) {
         let tok = raw
             .trim_matches(|c: char| {
@@ -1001,18 +1018,65 @@ fn path_hints_from_text(text: &str) -> Vec<String> {
         if tok.is_empty() {
             continue;
         }
-        let lower = tok.to_lowercase();
-        let looks_pathy = tok.contains('/')
-            || EXTS.iter().any(|e| lower.ends_with(e))
-            || matches!(lower.as_str(), ".gitignore" | ".umadevrc");
-        if looks_pathy && seen.insert(tok.to_string()) {
-            out.push(tok.to_string());
-            if out.len() >= 8 {
-                break;
+        for hint in path_hints_in_token(tok) {
+            if seen.insert(hint.to_string()) {
+                out.push(hint.to_string());
+                if out.len() >= 8 {
+                    return out;
+                }
             }
         }
     }
     out
+}
+
+/// The path claims in one token. Chinese users often glue a path to the words
+/// around it (`把src/pages/index.tsx的标题改成欢迎`); the claim is the ASCII path
+/// run, not the whole token, which would reject the edit to the real file. A
+/// token whose ASCII runs are only fragments (`配置/发布.toml`) is itself a
+/// non-ASCII path and stays whole.
+fn path_hints_in_token(tok: &str) -> Vec<&str> {
+    if tok.is_ascii() {
+        return if looks_like_path(tok) {
+            vec![tok]
+        } else {
+            Vec::new()
+        };
+    }
+    let runs: Vec<&str> = tok
+        .split(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '\\' | '@' | '+'))
+        })
+        .map(|run| run.trim_end_matches('.'))
+        .filter(|run| {
+            // A run that starts at a separator, or is only an extension, is the
+            // tail of a longer non-ASCII path.
+            !run.starts_with(['/', '\\'])
+                && looks_like_path(run)
+                && run
+                    .rsplit_once('.')
+                    .map_or(*run, |(stem, _)| stem)
+                    .chars()
+                    .any(|c| c.is_ascii_alphanumeric())
+        })
+        .collect();
+    if runs.is_empty() && looks_like_path(tok) {
+        vec![tok]
+    } else {
+        runs
+    }
+}
+
+/// A path separator, a known source extension, or a known dotfile.
+fn looks_like_path(tok: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".css", ".html", ".json",
+        ".toml", ".yaml", ".yml", ".md", ".vue", ".svelte", ".sql",
+    ];
+    let lower = tok.to_lowercase();
+    tok.contains('/')
+        || EXTS.iter().any(|e| lower.ends_with(e))
+        || matches!(lower.as_str(), ".gitignore" | ".umadevrc")
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1063,22 +1127,39 @@ where
     Ok(if value.is_finite() { value } else { 0.0 })
 }
 
+/// Tolerant deserializer for the brain-triage string fields: a JSON string, or
+/// `null` / any other value -> empty. Models routinely write `null` for "no
+/// question" or "no kind", and serde default only covers an ABSENT field, so one
+/// `null` failed the WHOLE BrainRoute parse and dropped a real build to the
+/// fallback route (no Director, no routed QC) - the same failure the array and
+/// number fields already guard against. An empty value never authorizes a write.
+fn de_lenient_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct BrainRoute {
     /// `chat | explain | quick_edit | debug | build` (free text; mapped tolerantly).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     class: String,
     /// `greenfield | frontend_only | backend_only | bugfix | refactor | docs_only | light`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     kind: String,
     /// `simple | medium | complex` — maps to a depth.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     complexity: String,
     /// `read_only | mutating` — the model's semantic reading of whether this
     /// request authorizes workspace changes. Kept separate from task size so a
     /// quoted/hypothetical build can remain an Explain turn. Missing or malformed
     /// values never authorize a write.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     authorization: String,
     /// What the request needs (roles / capabilities) — informs the team.
     #[serde(default, deserialize_with = "de_string_or_vec")]
@@ -1090,7 +1171,7 @@ struct BrainRoute {
     // (that's the plan's job — see `plan_state`), so it's intentionally not a field
     // here. serde ignores the unknown key, keeping the brain's schema unchanged.
     /// A clarifying question, when the request is genuinely ambiguous.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     clarify_question: String,
     /// Discrete options for the clarifying question.
     #[serde(default, deserialize_with = "de_string_or_vec")]
@@ -1806,8 +1887,10 @@ pub fn apply_authorization_ceiling(mut plan: RoutePlan, requirement: &str) -> Ro
     }
     let q = git_commit_control_text(requirement);
     let compact: String = q.chars().filter(|c| !c.is_whitespace()).collect();
-    let commit_question = (q.contains("commit") || compact.contains("提交"))
-        && git_commit_request_is_question_or_negated(&q, &compact);
+    // Only a real Git commit context counts. `提交` is also the everyday "submit",
+    // so `表单提交前检查是否登录` or `校验失败时不要提交表单` stay the model's call.
+    let commit_question =
+        git_commit_context(requirement) && git_commit_request_is_question_or_negated(&q, &compact);
     if commit_question && plan.class.mutates_workspace() {
         plan.class = RouteClass::Explain;
         plan.kind = TaskKind::Light;
@@ -2237,8 +2320,12 @@ fn safe_fallback_route(requirement: &str) -> RoutePlan {
 /// queries. These shapes never earn write authority from a create keyword alone.
 fn fallback_requires_read_only(requirement: &str) -> bool {
     let q = requirement.trim().to_lowercase();
+    let unpunctuated = q.trim_end_matches(['。', '.', '!', '！']);
     q.contains('?')
         || q.contains('？')
+        || ["吗", "嗎", "呢"]
+            .iter()
+            .any(|particle| unpunctuated.ends_with(particle))
         || [
             "如何",
             "怎么",
@@ -2249,6 +2336,11 @@ fn fallback_requires_read_only(requirement: &str) -> bool {
             "是什麼",
             "什么意思",
             "什麼意思",
+            "在哪",
+            "哪里",
+            "哪裡",
+            "哪个",
+            "哪個",
             "能否解释",
             "能否解釋",
             "解释‘",
@@ -2560,32 +2652,87 @@ fn explicit_mutation_command(requirement: &str) -> bool {
 
     // Inspect clause starts, not arbitrary substrings. This recognizes a direct
     // command after a status question while avoiding past-tense summaries such as
-    // "本次改动，修复了三个问题".
-    q.split(['?', '？', ',', '，', ';', '；', '.', '。', '!', '！', '\n'])
-        .map(str::trim)
-        .filter(|clause| !clause.is_empty())
-        .any(|clause| {
-            if mutation_question(clause)
-                || past_tense_prefix
-                    .iter()
-                    .any(|prefix| clause.starts_with(prefix))
-            {
-                return false;
-            }
-            let command = command_lead
+    // "本次改动，修复了三个问题". A clause that asks something is a question even
+    // when it opens with a noun built from a write verb (开发环境怎么启动,
+    // 实现原理是什么, 更新日志在哪里看), so only a clause that orders the change
+    // counts. An explicit command lead (请 / 帮我) keeps a how-clause inside an
+    // order writable (请修改一下如何处理空值的逻辑); a question mark never does.
+    const DELIMITERS: [char; 11] = ['?', '？', ',', '，', ';', '；', '.', '。', '!', '！', '\n'];
+    q.split_inclusive(DELIMITERS).any(|piece| {
+        let asked = piece.ends_with(['?', '？']);
+        let clause = piece.trim_end_matches(DELIMITERS).trim();
+        if clause.is_empty()
+            || asked
+            || mutation_question(clause)
+            || past_tense_prefix
                 .iter()
-                .find_map(|prefix| clause.strip_prefix(prefix))
-                .map(str::trim_start)
-                .unwrap_or(clause);
-            direct_prefix
+                .any(|prefix| clause.starts_with(prefix))
+        {
+            return false;
+        }
+        let lead = command_lead
+            .iter()
+            .find_map(|prefix| clause.strip_prefix(prefix));
+        if lead.is_none() && clause_asks_a_question(clause) {
+            return false;
+        }
+        let command = lead.map_or(clause, str::trim_start);
+        direct_prefix
+            .iter()
+            .any(|prefix| command.starts_with(prefix))
+            || (object_first_prefix
                 .iter()
                 .any(|prefix| command.starts_with(prefix))
-                || (object_first_prefix
-                    .iter()
-                    .any(|prefix| command.starts_with(prefix))
-                    && clear_mutation_request(command))
-                || resultative_create_command(clause)
-        })
+                && clear_mutation_request(command))
+            || resultative_create_command(clause)
+    })
+}
+
+/// Whether one clause asks something: a question particle at its end, an
+/// interrogative word (怎么, 什么, 哪里, 多少, 是否…), or an English wh-word
+/// opening it.
+fn clause_asks_a_question(clause: &str) -> bool {
+    const ASKING: &[&str] = &[
+        "怎么",
+        "怎麼",
+        "怎样",
+        "怎樣",
+        "如何",
+        "什么",
+        "什麼",
+        "为何",
+        "為何",
+        "哪里",
+        "哪裡",
+        "哪儿",
+        "哪兒",
+        "哪个",
+        "哪個",
+        "哪些",
+        "哪一",
+        "哪种",
+        "哪種",
+        "在哪",
+        "多少",
+        "多大",
+        "多久",
+        "多长",
+        "多長",
+        "是否",
+        "能否",
+        "能不能",
+        "可不可以",
+        "要不要",
+        "啥",
+    ];
+    ["吗", "嗎", "呢"]
+        .iter()
+        .any(|particle| clause.ends_with(particle))
+        || ASKING.iter().any(|word| clause.contains(word))
+        || clause
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .is_some_and(|word| matches!(word, "how" | "what" | "where" | "why" | "which" | "who"))
 }
 
 fn request_has_git_commit_plus_additional_work(requirement: &str) -> bool {
@@ -2632,6 +2779,31 @@ fn brain_unavailable_chat_route() -> RoutePlan {
     }
 }
 
+/// The model's scope entries that name something real: a path that exists under
+/// the workspace, or one the user wrote in the request (a file the turn may
+/// create). The scope becomes the resident turn's write allow-list, so a label
+/// (`登录模块`), a guessed path that does not exist, or a path outside the
+/// workspace would otherwise reject the correct edit as out of scope.
+fn workspace_scope_claims(
+    scope: &[String],
+    requirement: &str,
+    root: &std::path::Path,
+) -> Vec<String> {
+    let named: HashSet<String> = path_hints_from_text(requirement)
+        .iter()
+        .filter_map(|hint| crate::execution_contract::normalize_claim(hint))
+        .collect();
+    scope
+        .iter()
+        .filter(|entry| {
+            crate::execution_contract::normalize_claim(entry).is_some_and(|claim| {
+                named.contains(&claim) || std::fs::symlink_metadata(root.join(&claim)).is_ok()
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Union two scope lists (floor first), deduped, bounded to 12 entries.
 fn union_scope(floor: &[String], brain: &[String]) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -2669,7 +2841,7 @@ fn build_clarify(brain: &BrainRoute) -> Option<ClarifyQuestion> {
 
 /// Map the brain's free-text `class` to a [`RouteClass`] (tolerant; `None` on an
 /// unrecognised value so reconciliation keeps the floor's class).
-fn parse_class(s: &str) -> Option<RouteClass> {
+pub(crate) fn parse_class(s: &str) -> Option<RouteClass> {
     match s
         .trim()
         .to_ascii_lowercase()
@@ -2688,7 +2860,7 @@ fn parse_class(s: &str) -> Option<RouteClass> {
 }
 
 /// Map the brain's `complexity` to a [`Depth`] (tolerant; `None` on unrecognised).
-fn parse_depth(s: &str) -> Option<Depth> {
+pub(crate) fn parse_depth(s: &str) -> Option<Depth> {
     match s.trim().to_ascii_lowercase().as_str() {
         "simple" | "trivial" | "small" | "fast" => Some(Depth::Fast),
         "medium" | "moderate" | "standard" => Some(Depth::Standard),
@@ -2698,7 +2870,7 @@ fn parse_depth(s: &str) -> Option<Depth> {
 }
 
 /// Map the brain's `kind` to a [`TaskKind`] (tolerant; `None` on unrecognised).
-fn parse_kind(s: &str) -> Option<TaskKind> {
+pub(crate) fn parse_kind(s: &str) -> Option<TaskKind> {
     match s
         .trim()
         .to_ascii_lowercase()

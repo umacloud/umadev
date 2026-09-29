@@ -70,9 +70,10 @@ impl ExecutionContract {
     }
 
     /// Build the strict contract for an owned plan. The plan's declared surfaces,
-    /// not the router's advisory hints, are authoritative. Every Build step must
-    /// contribute a surface; missing declarations are explicit preflight failures
-    /// instead of silently disabling scope enforcement for the whole run.
+    /// not the router's advisory hints, are authoritative. Every Build step that will
+    /// still run must contribute a surface; missing declarations are explicit
+    /// preflight failures instead of silently disabling scope enforcement for the
+    /// whole run. A Done step never runs a writer again, so it is not one of them.
     #[must_use]
     pub fn from_plan(route: &RoutePlan, objective: &str, plan: &Plan) -> Self {
         let allowed_paths = normalized_unique(plan.steps.iter().flat_map(|step| step.files.all()));
@@ -80,7 +81,7 @@ impl ExecutionContract {
         let mut verification = BTreeSet::new();
         let mut missing_surface_steps = Vec::new();
         for step in &plan.steps {
-            if step.kind == StepKind::Build && step.files.is_empty() {
+            if step.lacks_pending_surface() {
                 missing_surface_steps.push(format!("{} · {}", step.id, step.title));
             }
             verification.insert(format!("{}: {}", step.id, step.criterion_label()));
@@ -331,7 +332,9 @@ fn normalized_unique<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String
         .collect()
 }
 
-fn normalize_claim(raw: &str) -> Option<String> {
+/// A workspace-relative path claim, or `None` for an absolute, parent-escaping
+/// or malformed one.
+pub(crate) fn normalize_claim(raw: &str) -> Option<String> {
     let path = raw.trim().trim_matches(['`', '"', '\'']).replace('\\', "/");
     if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') {
         return None;
@@ -371,7 +374,9 @@ fn claim_covers(claim: &str, path: &str) -> bool {
     path == directory || path.starts_with(&format!("{directory}/"))
 }
 
-fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+/// Glob match where `*` matches any run of bytes, `/` included (so `**` acts
+/// the same). Callers lowercase both sides for case-insensitive matching.
+pub(crate) fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     let (mut p, mut v, mut star, mut mark) = (0usize, 0usize, None, 0usize);
     while v < value.len() {
         if p < pattern.len() && pattern[p] == value[v] {
@@ -395,9 +400,14 @@ fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     p == pattern.len()
 }
 
+/// UmaDev's own runtime state, plus the open-decisions register the firmware tells
+/// every work turn to append to (and never delete) — neither is the turn's product
+/// work, so neither may be rejected as out of scope or counted against the budget.
 fn is_internal_runtime_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower == ".umadev" || lower.starts_with(".umadev/")
+    lower == ".umadev"
+        || lower.starts_with(".umadev/")
+        || lower.eq_ignore_ascii_case(crate::open_decisions::REGISTER_REL_PATH)
 }
 
 /// Whether a workspace-relative directory can contain a path that
@@ -499,6 +509,33 @@ mod tests {
     }
 
     #[test]
+    fn a_done_step_without_a_surface_does_not_fail_the_preflight() {
+        // A resumed plan's Done step never runs a writer again; only the steps that
+        // still will are held to the preflight.
+        let mut done = step("single-turn-build", &[]);
+        done.status = StepStatus::Done;
+        let route = route(RouteClass::Build, Depth::Standard, &[]);
+        let plan = Plan {
+            steps: vec![done.clone()],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        assert!(ExecutionContract::from_plan(&route, "resume", &plan)
+            .preflight_violations()
+            .is_empty());
+        let plan = Plan {
+            steps: vec![done, step("frontend", &[])],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        let violations =
+            ExecutionContract::from_plan(&route, "resume", &plan).preflight_violations();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("frontend"));
+        assert!(!violations[0].message.contains("single-turn-build"));
+    }
+
+    #[test]
     fn exact_evidence_infers_the_same_allowed_surface() {
         let mut step = step("seo", &[]);
         step.evidence = vec![EvidenceContract::FileContains {
@@ -528,6 +565,30 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].code, "execution-path-out-of-scope");
         assert_eq!(violations[0].path.as_deref(), Some("src/auth.rs"));
+    }
+
+    #[test]
+    fn the_firmware_mandated_decision_register_is_an_internal_artifact() {
+        // Every work turn is told to append deferred decisions to this register; the
+        // contract must neither reject that write nor count it against the budget.
+        let contract = ExecutionContract::from_route(
+            &route(RouteClass::QuickEdit, Depth::Fast, &["src/seo/a.ts"]),
+            "adjust SEO",
+        );
+        assert!(contract
+            .validate_changed_paths([
+                "src/seo/a.ts",
+                crate::open_decisions::REGISTER_REL_PATH,
+                "docs/decisions/open-decisions.md",
+            ])
+            .is_empty());
+        assert_eq!(
+            contract
+                .validate_changed_paths(["src/seo/a.ts", "docs/decisions/ADR-7.md"])
+                .len(),
+            1,
+            "only the register itself is internal, not its directory"
+        );
     }
 
     #[test]

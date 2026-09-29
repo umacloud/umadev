@@ -56,6 +56,93 @@ pub fn uncovered_requirements(project_root: &Path, slug: &str) -> Vec<String> {
     declared.difference(&cited).cloned().collect()
 }
 
+/// Requirement coverage as the director judges it ([`requirement_coverage`]). Typed
+/// so that a source that cannot be read, or the absence of anything a requirement
+/// could be traced to, never reads as "every requirement uncovered".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequirementCoverage {
+    /// Every declared requirement is traced (or the PRD declares none).
+    Covered,
+    /// Declared `FR-` ids that no plan step, task list or architecture doc cites.
+    Uncovered(Vec<String>),
+    /// Coverage cannot be judged; the reason, in the user's language.
+    Unavailable(String),
+}
+
+/// Requirement coverage for the director path. [`uncovered_requirements`] reads only
+/// the legacy pipeline's task artifacts (`output/<slug>-execution-plan.md`, the newest
+/// `.umadev/changes/*/tasks.md`), which the director never writes. Here a requirement
+/// is also traced when the owned plan (`.umadev/plan.json` step titles and evidence)
+/// or the architecture doc cites its id. With none of those on disk there is nothing
+/// a requirement could be traced to yet, so coverage is `Unavailable` rather than
+/// "all uncovered".
+#[must_use]
+pub fn requirement_coverage(project_root: &Path, slug: &str) -> RequirementCoverage {
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_COVERAGE_TOTAL_BYTES, MAX_COVERAGE_FILE_BYTES);
+    let unreadable = |path: &Path, error: &std::io::Error| {
+        let shown = path.strip_prefix(project_root).unwrap_or(path);
+        RequirementCoverage::Unavailable(umadev_i18n::tlf(
+            "qc.floor_input_unreadable",
+            &[&shown.display().to_string(), &error.to_string()],
+        ))
+    };
+    let prd_path = project_root.join("output").join(format!("{slug}-prd.md"));
+    let prd = match read_optional(project_root, &prd_path, &mut budget) {
+        Ok(Some(prd)) => prd,
+        Ok(None) => return RequirementCoverage::Covered,
+        Err(error) => return unreadable(&prd_path, &error),
+    };
+    let declared = extract_fr_ids(&prd);
+    if declared.is_empty() {
+        return RequirementCoverage::Covered;
+    }
+    let mut cited = BTreeSet::new();
+    let mut traceable = false;
+    for doc in ["execution-plan", "architecture"] {
+        let path = project_root.join("output").join(format!("{slug}-{doc}.md"));
+        match read_optional(project_root, &path, &mut budget) {
+            Ok(Some(text)) => {
+                traceable = true;
+                cited.extend(extract_fr_ids(&text));
+            }
+            Ok(None) => {}
+            Err(error) => return unreadable(&path, &error),
+        }
+    }
+    match latest_tasks(project_root, &mut budget) {
+        Ok(Some(tasks)) => {
+            traceable = true;
+            cited.extend(extract_fr_ids(&tasks));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return RequirementCoverage::Unavailable(umadev_i18n::tlf(
+                "qc.floor_input_unreadable",
+                &[".umadev/changes/*/tasks.md", &error.to_string()],
+            ));
+        }
+    }
+    if let Some(plan) = crate::plan_state::load(project_root) {
+        traceable = true;
+        for step in &plan.steps {
+            cited.extend(extract_fr_ids(&step.title));
+            cited.extend(extract_fr_ids(&step.criterion_label()));
+        }
+    }
+    if !traceable {
+        return RequirementCoverage::Unavailable(
+            umadev_i18n::tl("qc.coverage_nothing_to_trace").to_string(),
+        );
+    }
+    let uncovered: Vec<String> = declared.difference(&cited).cloned().collect();
+    if uncovered.is_empty() {
+        RequirementCoverage::Covered
+    } else {
+        RequirementCoverage::Uncovered(uncovered)
+    }
+}
+
 fn coverage_unavailable(path: &Path, error: &std::io::Error) -> String {
     format!(
         "[unavailable] requirement coverage could not read {} completely ({error})",
@@ -131,7 +218,8 @@ fn latest_tasks(
     read_optional(project_root, &latest.join("tasks.md"), budget)
 }
 
-/// Scan for `FR-<digits>` tokens (case-insensitive on `FR`), normalised to a
+/// Scan for `FR-<digits>` tokens (case-insensitive on `FR`, starting at a word
+/// boundary so `NFR-<digits>` is not an FR), normalised to a
 /// canonical zero-padded `FR-NNN`. `FR-` and ASCII digits are single-byte, so
 /// byte indexing here is multibyte-safe even amid CJK prose.
 ///
@@ -146,7 +234,11 @@ fn extract_fr_ids(text: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let mut i = 0;
     while i + 3 < n {
-        let is_fr = (b[i] | 0x20) == b'f' && (b[i + 1] | 0x20) == b'r' && b[i + 2] == b'-';
+        // Word boundary before `FR`: `NFR-004` (a non-functional requirement)
+        // or `xFR-5` must not be read as `FR-004` / `FR-005`.
+        let at_boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let is_fr =
+            at_boundary && (b[i] | 0x20) == b'f' && (b[i + 1] | 0x20) == b'r' && b[i + 2] == b'-';
         if is_fr {
             let mut j = i + 3;
             while j < n && b[j].is_ascii_digit() {
@@ -197,6 +289,26 @@ mod tests {
         .unwrap();
         let uncovered = uncovered_requirements(root, "demo");
         assert_eq!(uncovered, vec!["FR-003".to_string()]);
+    }
+
+    #[test]
+    fn non_functional_ids_are_not_functional_requirements() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(
+            root.join("output").join("demo-prd.md"),
+            "| FR-001 | 登录 |\n| NFR-002 | p95 < 200ms |",
+        )
+        .unwrap();
+        let cdir = root.join(".umadev").join("changes").join("demo-20260101");
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(cdir.join("tasks.md"), "- [ ] 实现登录 _(FR-001)_").unwrap();
+        assert!(uncovered_requirements(root, "demo").is_empty());
+        assert_eq!(
+            extract_fr_ids("NFR-004, xFR-5, (FR-6), 需求FR-7"),
+            ["FR-006", "FR-007"].map(String::from).into()
+        );
     }
 
     #[test]
@@ -325,5 +437,106 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let relative = tmp.path().strip_prefix(cwd).unwrap_or(tmp.path());
         assert!(uncovered_requirements(relative, "demo").is_empty());
+    }
+
+    /// A plan whose single step's title (or evidence) may cite requirement ids.
+    fn save_plan_step_titled(root: &Path, title: &str) {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus};
+        let plan = Plan {
+            steps: vec![PlanStep {
+                id: "auth".into(),
+                title: title.into(),
+                seat: crate::critics::Seat::BackendEngineer,
+                kind: StepKind::Build,
+                depends_on: Vec::new(),
+                acceptance: AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
+                files: StepFiles {
+                    create: vec!["src/auth/".into()],
+                    modify: Vec::new(),
+                },
+                status: StepStatus::Pending,
+            }],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        crate::plan_state::save(&plan, root).unwrap();
+    }
+
+    #[test]
+    fn requirement_coverage_is_traced_by_the_director_plan_and_architecture_doc() {
+        // The director writes no legacy task list: its owned plan and the
+        // architecture doc are what trace a requirement to the work.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(
+            root.join("output/demo-prd.md"),
+            "| FR-001 | login |\n| FR-002 | logout |\n| FR-003 | signup |\n",
+        )
+        .unwrap();
+        // Nothing yet a requirement could be traced to: not judged, never "all
+        // uncovered", and the reason is in the user's language.
+        assert_eq!(
+            requirement_coverage(root, "demo"),
+            RequirementCoverage::Unavailable(
+                umadev_i18n::tl("qc.coverage_nothing_to_trace").to_string()
+            )
+        );
+
+        save_plan_step_titled(root, "实现登录接口 (FR-001)");
+        std::fs::write(
+            root.join("output/demo-architecture.md"),
+            "| POST | /api/logout | end the session (FR-2) |\n",
+        )
+        .unwrap();
+        assert_eq!(
+            requirement_coverage(root, "demo"),
+            RequirementCoverage::Uncovered(vec!["FR-003".to_string()]),
+            "FR-003 is the one requirement nothing traces"
+        );
+        // The legacy spec gate still reads only its own task artifacts.
+        assert_eq!(uncovered_requirements(root, "demo").len(), 3);
+
+        save_plan_step_titled(root, "实现登录与注册 (FR-001, FR-003)");
+        assert_eq!(
+            requirement_coverage(root, "demo"),
+            RequirementCoverage::Covered
+        );
+    }
+
+    #[test]
+    fn requirement_coverage_without_declared_requirements_is_covered() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            requirement_coverage(tmp.path(), "demo"),
+            RequirementCoverage::Covered
+        );
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(tmp.path().join("output/demo-prd.md"), "# PRD\n\nno ids\n").unwrap();
+        assert_eq!(
+            requirement_coverage(tmp.path(), "demo"),
+            RequirementCoverage::Covered
+        );
+    }
+
+    #[test]
+    fn requirement_coverage_with_an_unreadable_trace_is_unavailable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-prd.md"),
+            "| FR-001 | login |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            vec![b'x'; MAX_COVERAGE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            requirement_coverage(tmp.path(), "demo"),
+            RequirementCoverage::Unavailable(reason) if reason.contains("demo-architecture.md")
+        ));
     }
 }

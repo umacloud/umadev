@@ -317,6 +317,53 @@ mod tests {
     }
 
     #[test]
+    fn zh_catalogs_translate_every_user_facing_string() {
+        // A zh value identical to the English one is English text shipped to a
+        // Chinese user. Only language-neutral values may repeat verbatim: brand
+        // names, pure punctuation/marker formats, and the `token` unit.
+        const LANGUAGE_NEUTRAL: &[&str] = &[
+            "adopt.artifact_line",
+            "adopt.note_line",
+            "backend.claude",
+            "backend.codex",
+            "backend.grok",
+            "backend.kimi",
+            "backend.opencode",
+            "event.phase_done",
+            "gate.detail.dark_ok",
+            "host.input.marker",
+            "lessons.item_prefix",
+            "lessons.time.unknown",
+            "memory.retention.entry",
+            "pitfalls.time.unknown",
+            "team.handoff.entry",
+            "tui.diff.collapsed",
+            "tui.gauge.cost",
+            "tui.gauge.cost_exact",
+            "tui.gauge.tokens",
+            "tui.gauge.tokens_lower_bound",
+            "tui.hint.gate_tag",
+            "tui.wait.tokens",
+            "tui.wait.tokens_lower_bound",
+        ];
+        let cats = catalogs();
+        let en = &cats[Lang::En as usize];
+        let mut untranslated = Vec::new();
+        for lang in [Lang::ZhCn, Lang::ZhTw] {
+            for (key, value) in &cats[lang as usize] {
+                if en.get(key) == Some(value) && !LANGUAGE_NEUTRAL.contains(&key.as_str()) {
+                    untranslated.push(format!("{}:{key}", lang.code()));
+                }
+            }
+        }
+        untranslated.sort();
+        assert!(
+            untranslated.is_empty(),
+            "zh catalog values still in English: {untranslated:?}"
+        );
+    }
+
+    #[test]
     fn retired_backends_are_not_advertised_by_the_catalog() {
         for lang in Lang::ALL {
             for key in [
@@ -389,6 +436,8 @@ mod tests {
             "rewind.restored",
             "rewind.failed",
             "deploy.confirm_preflight",
+            "deploy.cli_preflight",
+            "deploy.cli_run_hint",
             "preview.confirm_command",
             "worker.init_failed",
             "pipeline.start_failed",

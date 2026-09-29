@@ -18,7 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::UserConfig;
-use crate::local_command::{LocalCommandRequest, LocalCommandResult};
+use crate::local_command::LocalCommandRequest;
 use crate::prompt_queue_ui::PromptQueueUi;
 
 mod animation_settings;
@@ -32,6 +32,7 @@ mod host_git;
 pub(crate) mod host_input;
 mod lessons_view;
 mod live_meta;
+mod local_task;
 mod memory_view;
 pub(crate) mod permissions;
 mod plan_view;
@@ -3022,6 +3023,9 @@ pub struct App {
     /// Its settle/cancel path must never reset a parked Director run or consume
     /// any resident base-session identity.
     pub(crate) host_git_in_flight: bool,
+    /// Stop handle of the running TUI-local task (`!cmd`, a helper command or a
+    /// confirmed `/deploy`); a cancel stops only that task.
+    pub(crate) local_task: Option<crate::local_command::LocalTaskStop>,
     /// Session-level review-mode override set via `/manual` (`Some(false)`) or
     /// `/auto` (`Some(true)`). `None` → gates pause for review. Lets the user
     /// flip review mode mid-session without losing it on restart-of-flow.
@@ -3754,6 +3758,7 @@ impl App {
             thinking_block_idx: None,
             agentic_in_flight: false,
             host_git_in_flight: false,
+            local_task: None,
             auto_approve_override: None,
             trust_mode_override: None,
             workspace_trust: workspace_trust::load(&project_root),
@@ -10522,8 +10527,11 @@ impl App {
             || self.director_gate_paused)
             && umadev_agent::is_running_cancel_intent(&text)
         {
-            self.active_gate = None;
-            self.gate_choice = None;
+            // A local command stops on its own; a gate behind it stays open.
+            if self.local_task.is_none() {
+                self.active_gate = None;
+                self.gate_choice = None;
+            }
             self.push(ChatRole::You, text);
             self.refresh_status();
             return Action::Cancel;
@@ -10820,11 +10828,15 @@ impl App {
         if let Some(action) = self.pick_workspace_trust(idx) {
             return action;
         }
-        if self.gate_query_in_flight {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "gate.query.busy"),
-            );
+        if self.gate_query_in_flight || self.local_task.is_some() {
+            // A gate decision resumes or tears down the parked run; it waits
+            // for a gate question or a local command still in flight.
+            let busy = if self.gate_query_in_flight {
+                "gate.query.busy"
+            } else {
+                "tui.local.busy"
+            };
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, busy));
             self.refresh_status();
             return Action::None;
         }
@@ -11394,29 +11406,6 @@ impl App {
         self.thinking_started = Some(std::time::Instant::now());
         self.agentic_in_flight = true;
         self.tool_in_progress = true;
-        self.refresh_status();
-    }
-
-    /// Settle a tracked deploy and release its single-task guard.
-    pub(crate) fn record_deploy_done(&mut self, succeeded: bool) {
-        self.stream_compacted = None;
-        self.arm_completion_bell(self.thinking_started);
-        self.thinking = false;
-        self.thinking_started = None;
-        self.agentic_in_flight = false;
-        self.tool_in_progress = false;
-        self.record_turn(
-            "assistant",
-            format!(
-                "[control: deploy task settled — {}]",
-                if succeeded {
-                    "deployed"
-                } else {
-                    "not deployed"
-                }
-            ),
-        );
-        self.persist_chat();
         self.refresh_status();
     }
 
@@ -12492,7 +12481,7 @@ impl App {
     /// Code's `!` convenience-shell convention), so it never touches the base
     /// session. A bare `!` (or `!` + only whitespace) is a consumed no-op — it
     /// neither runs anything nor leaks the literal `!` to the base. Fully
-    /// fail-open: a spawn error / nonzero exit / >10s hang all surface as a
+    /// fail-open: a spawn error / nonzero exit / timeout all surface as a
     /// finished row with an explanatory line, never a panic or a frozen UI.
     fn try_bang_command(&mut self, raw: &str) -> Option<Action> {
         let cmd = raw.strip_prefix('!')?.trim();
@@ -12531,46 +12520,6 @@ impl App {
             "Bash",
             &request.display,
         );
-        self.refresh_status();
-    }
-
-    /// Settle the exact local-command row without relying on transcript
-    /// adjacency: users can queue input or receive status notices while the
-    /// child is running, so "last row wins" would update the wrong message.
-    pub(crate) fn record_local_command_done(&mut self, result: LocalCommandResult) {
-        let call_id = local_command_call_id(result.request.presentation);
-        let target = self.history.iter().rposition(|message| {
-            message.role == ChatRole::Host
-                && matches!(
-                    &message.kind,
-                    MessageBody::Tool(tool)
-                        if tool.status == ToolStatus::Running
-                            && tool.call_id.as_deref() == Some(call_id)
-                )
-        });
-        if let Some(tool) = target
-            .and_then(|index| self.history.get_mut(index))
-            .and_then(|message| match &mut message.kind {
-                MessageBody::Tool(tool) => Some(tool),
-                _ => None,
-            })
-        {
-            tool.status = if result.ok {
-                ToolStatus::Ok
-            } else {
-                ToolStatus::Fail
-            };
-            tool.result = Some(result.output);
-            tool.progress = None;
-            tool.collapsed = result.ok;
-        } else {
-            self.push_local_command_row(&result.request.display, result.ok, result.output);
-        }
-        self.thinking = false;
-        self.thinking_started = None;
-        self.last_output_at = Some(std::time::Instant::now());
-        self.tool_in_progress = false;
-        self.transient_status = None;
         self.refresh_status();
     }
 

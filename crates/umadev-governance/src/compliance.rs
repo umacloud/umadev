@@ -223,6 +223,22 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.5.37"]),
             eu_ai_act_article: s(&["Article 11"]),
         },
+        // Governance rule: broken hash / cipher primitive (MD5, SHA-1, DES, RC4)
+        // in delivered code — encryption controls; ISO use of cryptography +
+        // secure coding; EU AI Act cybersecurity.
+        "UD-SEC-032" => ComplianceFrameworks {
+            soc2_cc: s(&["CC6.1", "CC6.7"]),
+            iso27001_annex_a: s(&["A.8.24", "A.8.28"]),
+            eu_ai_act_article: s(&["Article 15"]),
+        },
+        // Governance rule: a password stored without a visible hash — logical
+        // access / credential protection; ISO authentication information, use of
+        // cryptography, secure coding; EU AI Act cybersecurity.
+        "UD-SEC-033" => ComplianceFrameworks {
+            soc2_cc: s(&["CC6.1"]),
+            iso27001_annex_a: s(&["A.5.17", "A.8.24", "A.8.28"]),
+            eu_ai_act_article: s(&["Article 15"]),
+        },
         _ => ComplianceFrameworks::default(),
     }
 }

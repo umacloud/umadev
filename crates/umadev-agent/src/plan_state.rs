@@ -724,6 +724,14 @@ pub struct PlanStep {
 }
 
 impl PlanStep {
+    /// Whether this Build step will still run a writer without a declared file
+    /// surface — an execution-contract preflight failure. A Done step never runs
+    /// again, so a missing surface on it (a Fast single-turn plan, a plan saved
+    /// before surfaces existed) is history, not a reason to refuse a continuation.
+    pub(crate) fn lacks_pending_surface(&self) -> bool {
+        self.kind == StepKind::Build && self.status != StepStatus::Done && self.files.is_empty()
+    }
+
     /// Typed evidence summary when present, otherwise the coarse acceptance bar.
     pub(crate) fn criterion_label(&self) -> String {
         if self.evidence.is_empty() {
@@ -1002,12 +1010,18 @@ impl Plan {
     /// are restored (an already-`Done` step is NOT re-driven); the NEW steps keep
     /// `Pending` (fresh work the scheduler will pick up by readiness).
     ///
+    /// The replacement takes over the retired steps' territory: every NEW Build step
+    /// inherits their declared file surface (on top of any it declares), so it runs
+    /// under a bounded execution contract and whatever the blocked step already wrote
+    /// stays claimed instead of reading as unplanned work at the final gate.
+    ///
     /// Returns `true` ONLY when the merge actually CHANGES the plan — the replacement
     /// must introduce at least one genuinely-new step id (a real route around the
     /// blocker). An empty / unparseable sub-DAG, a reply that re-emits only existing
-    /// ids, or a normalisation that survives nothing new leaves `self` **unchanged** and
-    /// returns `false` (fail-open → the caller keeps today's honest stranded-Blocked
-    /// report). Never panics.
+    /// ids, a normalisation that survives nothing new, or a Build step left with no
+    /// file surface to run under leaves `self` **unchanged** and returns `false`
+    /// (fail-open → the caller keeps today's honest stranded-Blocked report). Never
+    /// panics.
     pub fn merge_replan(&mut self, replaced: &HashSet<String>, new_steps: Vec<PlanStep>) -> bool {
         if new_steps.is_empty() {
             return false;
@@ -1030,6 +1044,15 @@ impl Plan {
             .filter(|s| !replaced.contains(&s.id))
             .map(|s| (s.id.trim().to_string(), s.status))
             .collect();
+        let mut inherited = StepFiles::default();
+        for s in self
+            .steps
+            .iter()
+            .filter(|s| replaced.contains(&s.id) && s.kind == StepKind::Build)
+        {
+            extend_unique(&mut inherited.create, &s.files.create);
+            extend_unique(&mut inherited.modify, &s.files.modify);
+        }
         // Build the merged node list: SURVIVORS first (so `normalized`'s first-seen
         // dedup keeps them over any colliding new id), then the new sub-DAG.
         let mut merged: Vec<PlanStep> = self
@@ -1052,11 +1075,20 @@ impl Plan {
         let Some(mut normalized) = candidate.normalized(None) else {
             return false; // nothing usable survived normalisation → fail-open
         };
-        // Restore the survivors' statuses; NEW steps keep `normalized`'s fresh Pending.
+        // Restore the survivors' statuses; NEW steps keep `normalized`'s fresh Pending
+        // and inherit the retired steps' file surface.
         for s in &mut normalized.steps {
             if let Some(&st) = survivor_status.get(&s.id) {
                 s.status = st;
+            } else if s.kind == StepKind::Build {
+                extend_unique(&mut s.files.create, &inherited.create);
+                extend_unique(&mut s.files.modify, &inherited.modify);
             }
+        }
+        // A replacement must be executable: a Build step still without a file surface
+        // would fail the execution-contract preflight with a zero change budget.
+        if normalized.steps.iter().any(PlanStep::lacks_pending_surface) {
+            return false;
         }
         // Final guard: the normalised merge must still carry a genuinely-new step id
         // (one absent from the OLD plan) — else the sub-DAG collapsed to nothing new and
@@ -2117,13 +2149,27 @@ fn parse_brain_files(v: &serde_json::Value) -> StepFiles {
 /// reply.
 const MAX_DECLARED_PATHS: usize = 64;
 
+/// Append each path of `from` that `into` does not hold yet, keeping order.
+fn extend_unique(into: &mut Vec<String>, from: &[String]) {
+    for path in from {
+        if !into.contains(path) {
+            into.push(path.clone());
+        }
+    }
+}
+
 /// Canonicalise ONE declared path: trim, normalise `\` → `/`, strip a leading `./`
-/// and any leading `/` (declarations are repo-relative), and reject an empty result
-/// or an absolute / parent-escaping path (a declaration can only claim things INSIDE
-/// the workspace). `None` ⇒ the entry is dropped.
+/// and a single leading `/` (declarations are repo-relative), and reject an empty
+/// result or a drive-letter / UNC / colon-bearing / parent-escaping path (a
+/// declaration can only claim things INSIDE the workspace — the same paths the
+/// execution contract's claim normaliser rejects). `None` ⇒ the entry is dropped.
 fn normalize_declared_path(raw: &str) -> Option<String> {
     let p = raw.trim().replace('\\', "/");
-    let p = p.trim_start_matches("./").trim_start_matches('/').trim();
+    let p = p.trim_start_matches("./");
+    if p.starts_with("//") || p.contains(':') {
+        return None;
+    }
+    let p = p.strip_prefix('/').unwrap_or(p).trim();
     if p.is_empty() || p.split('/').any(|seg| seg == "..") {
         return None;
     }
@@ -2153,7 +2199,9 @@ fn normalize_declared_path(raw: &str) -> Option<String> {
 /// approval would wedge the base waiting on a decision — poisoning this same shared
 /// session for the later fallback build. Cleanly denying ends the turn and leaves
 /// the session usable. Fail-open: a dead session / a timeout / an empty reply →
-/// `None` (the caller then runs the plain build on the still-usable session).
+/// `None` (the caller then runs the plain build on the same session). A turn that
+/// timed out is stopped first; if it cannot be stopped the session is closed, so
+/// the plain build fails honestly instead of reading the plan turn's end.
 async fn drain_plan_turn(
     session: &mut dyn BaseSession,
     directive: String,
@@ -2204,14 +2252,14 @@ async fn drain_plan_turn_traced(
             // The plan turn forbids tools; an approval request means the base tried to
             // act anyway. DENY it (best-effort) so the JSON-only turn ends cleanly and
             // the shared session stays usable for the fallback build. If `respond`
-            // fails, interrupt the turn to un-wedge the session, then bail.
+            // fails, stop the turn (see `stop_plan_turn`), then bail.
             Ok(Some(SessionEvent::NeedApproval { req_id, .. })) => {
                 if session
                     .respond(&req_id, ApprovalDecision::Deny)
                     .await
                     .is_err()
                 {
-                    let _ = session.interrupt().await;
+                    stop_plan_turn(session).await;
                     return TracedPlanTurn {
                         text: None,
                         recipe_receipt,
@@ -2226,11 +2274,11 @@ async fn drain_plan_turn_traced(
             // fallback build a shared session that still carried an unanswered RPC
             // (exactly the wedge the NeedApproval arm above exists to prevent).
             // A JSON-only plan turn forbids tools: safe-reject it and, if the
-            // reply cannot be written, interrupt to un-wedge the session.
+            // reply cannot be written, stop the turn (see `stop_plan_turn`).
             Ok(Some(SessionEvent::HostRequest { req_id, request })) => {
                 let rejection = request.safe_rejection("plan-only turn does not run tools");
                 if session.respond_host(&req_id, rejection).await.is_err() {
-                    let _ = session.interrupt().await;
+                    stop_plan_turn(session).await;
                     return TracedPlanTurn {
                         text: None,
                         recipe_receipt,
@@ -2240,11 +2288,20 @@ async fn drain_plan_turn_traced(
             // A JSON-only plan turn should emit no other tools; ignore anything else
             // and let the next-event timeout bound a misbehaving turn.
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 return TracedPlanTurn {
                     text: None,
                     recipe_receipt,
                 }
+            }
+            // The turn is still running: stop it before the fallback build reuses
+            // the session, or its result would end the build's first turn.
+            Err(_) => {
+                stop_plan_turn(session).await;
+                return TracedPlanTurn {
+                    text: None,
+                    recipe_receipt,
+                };
             }
         }
     }
@@ -2253,6 +2310,14 @@ async fn drain_plan_turn_traced(
         text: (!text.is_empty()).then_some(text),
         recipe_receipt,
     }
+}
+
+/// Stop a plan turn that is being abandoned. The session is shared with the
+/// fallback build, so a turn the interrupt did not settle closes it: the build's
+/// send then fails honestly instead of reading the plan turn's end as its own.
+async fn stop_plan_turn(session: &mut dyn BaseSession) {
+    let bound = std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS);
+    crate::turn_interrupt::interrupt_or_close(session, bound).await;
 }
 
 /// Plan plus the exact recipe receipt (when a prior was actually accepted by the
@@ -2883,15 +2948,20 @@ mod tests {
     // ── drain_plan_turn cleanly handles a mid-turn approval (MEDIUM #3) ──
 
     /// A minimal scripted [`BaseSession`] for `drain_plan_turn` tests: it replays a
-    /// fixed event batch after `send_turn`, records approval replies + interrupts, and
-    /// can be told to FAIL `respond` (to exercise the interrupt fallback).
+    /// fixed event batch after `send_turn`, records approval replies, interrupts and
+    /// closes, and can be told to FAIL `respond` (to exercise the interrupt
+    /// fallback), to leave its interrupt pending, or to hang once the batch is out.
+    #[allow(clippy::struct_excessive_bools)]
     struct ScriptedSession {
         events: std::collections::VecDeque<umadev_runtime::SessionEvent>,
         responded:
             std::sync::Arc<std::sync::Mutex<Vec<(String, umadev_runtime::ApprovalDecision)>>>,
         interrupts: std::sync::Arc<std::sync::Mutex<usize>>,
+        ends: std::sync::Arc<std::sync::Mutex<usize>>,
         respond_fails: bool,
         send_fails: bool,
+        interrupt_pending: bool,
+        hang_when_empty: bool,
     }
 
     impl ScriptedSession {
@@ -2900,8 +2970,11 @@ mod tests {
                 events: events.into_iter().collect(),
                 responded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 interrupts: std::sync::Arc::new(std::sync::Mutex::new(0)),
+                ends: std::sync::Arc::new(std::sync::Mutex::new(0)),
                 respond_fails,
                 send_fails: false,
+                interrupt_pending: false,
+                hang_when_empty: false,
             }
         }
 
@@ -2927,6 +3000,9 @@ mod tests {
             }
         }
         async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            if self.events.is_empty() && self.hang_when_empty {
+                std::future::pending::<()>().await;
+            }
             self.events.pop_front()
         }
         async fn respond(
@@ -2948,9 +3024,16 @@ mod tests {
         }
         async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
             *self.interrupts.lock().unwrap() += 1;
-            Ok(())
+            if self.interrupt_pending {
+                Err(umadev_runtime::SessionError::InterruptPending(
+                    "the plan turn has not ended".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            *self.ends.lock().unwrap() += 1;
             Ok(())
         }
     }
@@ -3162,6 +3245,7 @@ mod tests {
             true, // respond fails
         );
         let interrupts = std::sync::Arc::clone(&s.interrupts);
+        let ends = std::sync::Arc::clone(&s.ends);
         let out = drain_plan_turn(
             &mut s,
             "plan please".into(),
@@ -3174,6 +3258,86 @@ mod tests {
             1,
             "the session was interrupted to un-wedge it for the fallback build"
         );
+        assert_eq!(
+            *ends.lock().unwrap(),
+            0,
+            "a settled interrupt leaves the session to the fallback build"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_closes_the_session_when_its_interrupt_does_not_settle() {
+        use umadev_runtime::{HostRequest, SessionEvent};
+        // The fallback build reuses this session. A plan turn the interrupt did not
+        // settle may still end later, and its result would end the build's first
+        // turn, so the session is closed instead: the build then fails honestly.
+        let approval = SessionEvent::NeedApproval {
+            req_id: "req-1".into(),
+            action: "write".into(),
+            target: "app.rs".into(),
+        };
+        let question = SessionEvent::HostRequest {
+            req_id: "hr-1".into(),
+            request: HostRequest::UserInput {
+                questions: Vec::new(),
+                metadata: serde_json::Value::Null,
+            },
+        };
+        for event in [approval, question] {
+            let mut s = ScriptedSession::new(vec![event], true);
+            s.interrupt_pending = true;
+            let interrupts = std::sync::Arc::clone(&s.interrupts);
+            let ends = std::sync::Arc::clone(&s.ends);
+            let out = drain_plan_turn(
+                &mut s,
+                "plan please".into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+            )
+            .await;
+            assert!(out.is_none(), "a failed reply bails out fail-open");
+            assert_eq!(*interrupts.lock().unwrap(), 1, "the turn was interrupted");
+            assert_eq!(
+                *ends.lock().unwrap(),
+                1,
+                "a session whose plan turn may still end is closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_stops_a_timed_out_turn_before_the_build_reuses_the_session() {
+        // A plan turn that outlives its wait is still running. Handing the session
+        // on without stopping it lets that turn's result end the fallback build's
+        // first turn. It is interrupted, and closed when the interrupt does not
+        // settle.
+        for (interrupt_pending, closed) in [(false, 0), (true, 1)] {
+            let mut s = ScriptedSession::new(Vec::new(), false);
+            s.hang_when_empty = true;
+            s.interrupt_pending = interrupt_pending;
+            let interrupts = std::sync::Arc::clone(&s.interrupts);
+            let ends = std::sync::Arc::clone(&s.ends);
+            let out = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                drain_plan_turn(
+                    &mut s,
+                    "plan please".into(),
+                    std::time::Instant::now() + std::time::Duration::from_millis(50),
+                ),
+            )
+            .await
+            .expect("the drain settles on its deadline");
+            assert!(out.is_none(), "a timed-out plan turn bails out fail-open");
+            assert_eq!(
+                *interrupts.lock().unwrap(),
+                1,
+                "the timed-out turn was stopped (interrupt pending: {interrupt_pending})"
+            );
+            assert_eq!(
+                *ends.lock().unwrap(),
+                closed,
+                "closed only when the interrupt did not settle (interrupt pending: {interrupt_pending})"
+            );
+        }
     }
 
     /// A session whose `next_event` never resolves (the base hangs holding the pipe
@@ -4707,10 +4871,14 @@ mod tests {
             step("api", &["scaffold"]),
             step("ui", &["api"]),
         ]);
+        for s in &mut p.steps {
+            s.files.create = vec![format!("src/{}/", s.id)];
+        }
         mark(&mut p, "scaffold", StepStatus::Done);
         mark(&mut p, "api", StepStatus::Blocked);
         let replaced: HashSet<String> = ["api".to_string(), "ui".to_string()].into_iter().collect();
-        let new_steps = vec![step("api2", &["scaffold"]), step("ui2", &["api2"])];
+        let mut new_steps = vec![step("api2", &["scaffold"]), step("ui2", &["api2"])];
+        new_steps[1].files.modify = vec!["src/app.tsx".to_string()];
         assert!(p.merge_replan(&replaced, new_steps));
         let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
         // The blocked subtree is gone; the fresh route is spliced in.
@@ -4728,6 +4896,28 @@ mod tests {
             StepStatus::Pending
         );
         assert_eq!(deps_of(&p, "api2"), &["scaffold".to_string()]);
+        // The new route inherits the retired steps' surface, on top of its own.
+        let files = |id: &str| p.steps.iter().find(|s| s.id == id).unwrap().files.clone();
+        assert_eq!(files("api2").create, vec!["src/api/", "src/ui/"]);
+        assert_eq!(files("ui2").create, vec!["src/api/", "src/ui/"]);
+        assert_eq!(files("ui2").modify, vec!["src/app.tsx"]);
+        assert_eq!(files("scaffold").create, vec!["src/scaffold/"]);
+    }
+
+    #[test]
+    fn merge_replan_rejects_a_subdag_with_no_file_surface_to_run_under() {
+        // Retired steps from a plan saved before surfaces were required leave nothing
+        // to inherit; a new Build step declaring none would fail the preflight.
+        let mut p = plan(vec![step("a", &[]), step("b", &["a"])]);
+        mark(&mut p, "a", StepStatus::Blocked);
+        let before = p.clone();
+        let replaced: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        assert!(!p.merge_replan(&replaced, vec![step("a2", &[])]));
+        assert_eq!(p, before, "an unrunnable sub-DAG leaves the plan unchanged");
+
+        let mut runnable = step("a2", &[]);
+        runnable.files.create = vec!["src/a2.ts".to_string()];
+        assert!(p.merge_replan(&replaced, vec![runnable]));
     }
 
     #[test]
@@ -4908,6 +5098,33 @@ mod tests {
         assert!(parse_brain_files(&json!("src/a.ts")).is_empty());
         assert!(parse_brain_files(&json!(null)).is_empty());
         assert!(parse_brain_files(&json!(7)).is_empty());
+    }
+
+    #[test]
+    fn drive_letter_and_unc_declarations_are_dropped_not_made_relative() {
+        // A drive-letter or UNC path is absolute on Windows. Kept as `C:/proj/…`
+        // (or folded into `srv/x`) it passes the plan, then the ledger rejects it as
+        // an artifact when the step settles Done and the whole run fails. Like the
+        // execution contract's claim normaliser, never read one as repo-relative.
+        for raw in [
+            "C:/proj/src/app.ts",
+            "C:\\proj\\src\\app.ts",
+            "c:relative.ts",
+            "\\\\srv\\share\\x.ts",
+            "//srv/x",
+            "src/a:b.ts",
+        ] {
+            assert_eq!(normalize_declared_path(raw), None, "{raw}");
+        }
+        // A single leading `/` stays the repo-root convention the brain uses.
+        assert_eq!(
+            normalize_declared_path("/src/y.ts").as_deref(),
+            Some("src/y.ts")
+        );
+        assert_eq!(
+            normalize_declared_path(".\\src\\api\\x.ts").as_deref(),
+            Some("src/api/x.ts")
+        );
     }
 
     #[test]

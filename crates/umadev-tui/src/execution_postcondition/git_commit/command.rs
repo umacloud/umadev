@@ -158,6 +158,42 @@ pub(crate) fn git_std_command(root: &Path) -> Command {
     command
 }
 
+/// A probe that compares or classifies work-tree content the way native Git
+/// does. Besides the repository's own attributes it reads the ones the other
+/// isolated children skip: the system file and the user's global file
+/// (`attributes_file`, else Git's own default). Attribute files only select
+/// Git's built-in conversions and name drivers: `check-attr` runs nothing, and
+/// a status or diff caller blanks every filter driver, so no configured program
+/// can run. `git diff` rewrites the index after finding a file that is only
+/// stat-dirty even under `--no-optional-locks`, which would break the frozen
+/// index snapshot, so that refresh is off.
+pub(crate) fn git_content_probe_command(root: &Path, attributes_file: Option<&Path>) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("--no-pager")
+        .arg("--literal-pathspecs")
+        .arg("--no-optional-locks")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            INERT_HOOKS_CONFIG,
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "diff.autoRefreshIndex=false",
+        ]);
+    if let Some(file) = attributes_file {
+        let mut value = std::ffi::OsString::from("core.attributesFile=");
+        value.push(file);
+        command.arg("-c").arg(value);
+    }
+    command.arg("-C").arg(root);
+    isolate_git_configuration(&mut command);
+    command.env_remove("GIT_ATTR_NOSYSTEM");
+    command
+}
+
 pub(crate) fn git_tokio_command(root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command
@@ -278,6 +314,48 @@ pub(crate) fn configured_git_path(
         ));
     }
     Ok(Some(PathBuf::from(value)))
+}
+
+/// Read a boolean from the user's effective Git configuration (repository,
+/// global, and system), normalized by Git itself.
+pub(crate) fn configured_git_bool(
+    root: &Path,
+    key: &str,
+) -> Result<Option<bool>, ResidentExecutionBlocked> {
+    let mut command = Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--bool", "--get", key]);
+    remove_git_environment_overrides(&mut command);
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: 1024,
+            ..GitCommandLimits::default()
+        },
+        "git-config-unverifiable",
+        "git config --bool --get",
+    )?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(git_command_failed(
+            "git-config-unverifiable",
+            "git config --bool --get",
+            &output,
+        ));
+    }
+    match output.stdout.trim_ascii() {
+        b"true" => Ok(Some(true)),
+        b"false" => Ok(Some(false)),
+        _ => Err(git_commit_blocked(
+            "git-config-invalid",
+            "Git 布尔配置无效 / Git boolean configuration is invalid",
+        )),
+    }
 }
 
 pub(crate) fn git_output(

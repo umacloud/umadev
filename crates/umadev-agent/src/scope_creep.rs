@@ -43,7 +43,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::bounded_fs::{read_utf8_beneath, Utf8ReadBudget};
-use crate::plan_state::{Plan, StepKind};
+use crate::plan_state::{Plan, StepKind, StepStatus};
 
 /// One scope finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,19 +179,20 @@ const MAX_ROUTE_INPUT_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 ///
 /// Returns contract findings; current execution-scope violations are blocking.
 /// Empty when the run diff is unreadable/no baseline exists, a review-only plan has
-/// no writer, or every changed path was claimed.
+/// no writer, a completed step's changes cannot be attributed (see
+/// [`completed_steps_without_surface`]), or every changed path was claimed.
 ///
 /// Bounded: one shadow-repo diff, one backend-route extraction over the changed set,
 /// and at most one before/after manifest comparison per changed manifest.
 #[must_use]
 pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
-    // EXECUTION-CONTRACT GATE: every mutating step contributes to the denominator.
-    // Missing declarations are not an IO/parser surprise; they are an explicit plan
-    // defect. Report it instead of switching the whole floor off.
+    // EXECUTION-CONTRACT GATE: every mutating step that will still run contributes to
+    // the denominator. Missing declarations are not an IO/parser surprise; they are
+    // an explicit plan defect. Report it instead of switching the whole floor off.
     let missing: Vec<&str> = plan
         .steps
         .iter()
-        .filter(|step| step.kind == StepKind::Build && step.files.is_empty())
+        .filter(|step| step.lacks_pending_surface())
         .map(|step| step.id.as_str())
         .collect();
     if !missing.is_empty() {
@@ -203,6 +204,14 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
             ),
             file: String::new(),
         }];
+    }
+    // A COMPLETED step with no surface (a fast single-turn plan, or one saved before
+    // surfaces were required) never runs a writer again, so it is no plan defect the
+    // base could repair; but its changes cannot be attributed to any claim, so this
+    // run's scope cannot be judged. Fail-open, like an unreadable run diff; the final
+    // gate tells the user.
+    if !completed_steps_without_surface(plan).is_empty() {
+        return Vec::new();
     }
 
     let claims: Vec<&str> = plan
@@ -348,9 +357,23 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
     out
 }
 
+/// Completed Build steps that declared no file surface. Their changes cannot be
+/// attributed to any claim, so [`unclaimed_changes`] cannot judge the run's scope.
+#[must_use]
+pub fn completed_steps_without_surface(plan: &Plan) -> Vec<String> {
+    plan.steps
+        .iter()
+        .filter(|step| {
+            step.kind == StepKind::Build && step.status == StepStatus::Done && step.files.is_empty()
+        })
+        .map(|step| step.id.clone())
+        .collect()
+}
+
 /// Whether a declared claim covers a changed path. A claim is either an exact
 /// (normalised) path or a DIRECTORY prefix — `src/api/`, or a bare `src/api` that the
-/// changed path sits under — so a step can claim a subtree without enumerating it.
+/// changed path sits under — so a step can claim a subtree without enumerating it —
+/// or a glob (`src/components/*.tsx`, `src/api/**`).
 ///
 /// Compared CASE-INSENSITIVELY: macOS and Windows both ship case-insensitive
 /// filesystems by default, so a step that claimed `src/Api/` and a diff that reports
@@ -366,6 +389,11 @@ fn claim_covers(claim: &str, path: &str) -> bool {
         return false;
     }
     let path = path.to_ascii_lowercase();
+    // A glob claim (`src/components/*.tsx`, `src/api/**`) uses the same matcher
+    // as the execution contract, so both scope checks agree on what it covers.
+    if claim.contains('*') {
+        return crate::execution_contract::wildcard_match(claim.as_bytes(), path.as_bytes());
+    }
     let dir = claim.trim_end_matches('/');
     path == dir || path.starts_with(&format!("{dir}/"))
 }
@@ -373,11 +401,14 @@ fn claim_covers(claim: &str, path: &str) -> bool {
 /// Whether a changed path is outside the team's source surface entirely (UmaDev's own
 /// artifacts, generated lockfiles, the doc blackboard, vendored/build/cache trees) —
 /// the ignored DIRECTORY NAMES matched at ANY depth (see [`IGNORED_DIR_SEGMENTS`]).
+/// The open-decisions register is UmaDev-owned too: the firmware tells every work
+/// turn to append to it and never delete the trail, so it can never be unclaimed work.
 fn is_ignored(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
     LOCKFILES.contains(&name)
         || IGNORED_FILE_NAMES.contains(&name)
+        || lower.eq_ignore_ascii_case(crate::open_decisions::REGISTER_REL_PATH)
         || IGNORED_PREFIXES.iter().any(|p| lower.starts_with(p))
         || lower
             .split('/')
@@ -651,6 +682,33 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_step_without_a_surface_is_no_contract_failure_to_repair() {
+        let Some(tmp) = baselined_workspace() else {
+            return;
+        };
+        // A fast single-turn plan (or one saved before surfaces were required) can
+        // reach the final gate with a Done, surface-less Build step. It never runs a
+        // writer again, so the base is not told to "re-plan" it; its changes just
+        // cannot be attributed, so the scope check stands down.
+        write(tmp.path(), "src/built.ts", "export const built = 1;\n");
+        let mut plan = plan_claiming(&[]);
+        plan.steps[0].status = StepStatus::Done;
+        assert!(unclaimed_changes(tmp.path(), &plan).is_empty());
+        assert_eq!(completed_steps_without_surface(&plan), vec!["impl"]);
+
+        // The same step still to run would start an unconstrained writer: blocking.
+        plan.steps[0].status = StepStatus::Pending;
+        let findings = unclaimed_changes(tmp.path(), &plan);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.blocking && f.message.contains("contract incomplete")),
+            "{findings:?}"
+        );
+        assert!(completed_steps_without_surface(&plan).is_empty());
+    }
+
+    #[test]
     fn a_diff_too_large_to_analyze_says_the_floor_stood_down_instead_of_going_dark() {
         // N2: past the analysis cap the diff is discarded — correctly, since a PARTIAL
         // view would misread every unlisted file as "unchanged". But the old code
@@ -705,6 +763,32 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.file == "src/planned.ts"),
             "a claimed file is in scope: {f:?}"
+        );
+    }
+
+    #[test]
+    fn the_open_decisions_register_the_firmware_mandates_is_never_scope_creep() {
+        let Some(tmp) = baselined_workspace() else {
+            return;
+        };
+        // Every work turn's firmware tells the base to append deferred decisions to
+        // this register and never to delete the trail; the scope floor must not then
+        // ask for its removal. A genuinely unplanned edit beside it still blocks.
+        write(tmp.path(), "src/planned.ts", "export const planned = 1;\n");
+        write(
+            tmp.path(),
+            crate::open_decisions::REGISTER_REL_PATH,
+            "## OPEN — design-decision-to-evaluate — cache layer\n",
+        );
+        write(tmp.path(), "docs/notes.md", "an unplanned doc edit\n");
+        let f = unclaimed_changes(tmp.path(), &plan_claiming(&["src/"]));
+        assert!(
+            !f.iter().any(|x| x.file.contains("OPEN-DECISIONS")),
+            "the register is UmaDev-owned, not unclaimed work: {f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.blocking && x.file == "docs/notes.md"),
+            "an unplanned edit next to it is still blocking: {f:?}"
         );
     }
 
@@ -800,6 +884,25 @@ mod tests {
         assert!(!claim_covers("src/api", "src/apikeys.ts"));
         assert!(!claim_covers("src/api", "src/other.ts"));
         assert!(!claim_covers("", "src/a.ts"));
+    }
+
+    #[test]
+    fn claim_covers_glob_claims() {
+        assert!(claim_covers(
+            "src/components/*.tsx",
+            "src/components/Button.tsx"
+        ));
+        assert!(claim_covers(
+            "src/Components/*.TSX",
+            "src/components/Button.tsx"
+        ));
+        assert!(claim_covers("src/api/**", "src/api/v1/login.ts"));
+        assert!(claim_covers("**/*.test.ts", "src/api/login.test.ts"));
+        assert!(!claim_covers(
+            "src/components/*.tsx",
+            "src/components/Button.css"
+        ));
+        assert!(!claim_covers("src/components/*.tsx", "src/pages/Home.tsx"));
     }
 
     #[test]

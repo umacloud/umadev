@@ -1424,12 +1424,26 @@ pub fn check_ecosystem(workspace: &Path) -> CheckResult {
         Ok(text) if text.trim().is_empty() => {}
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
-                let mcp_count = v
-                    .get("mcpServers")
-                    .and_then(|s| s.as_object())
-                    .map_or(0, serde_json::Map::len);
+                let servers = v.get("mcpServers").and_then(|s| s.as_object());
+                // Claude Code skips a URL server without a transport `type`
+                // (older `umadev mcp-manage install` wrote such entries).
+                let untyped: Vec<&str> = servers
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, entry)| entry.get("url").is_some() && entry.get("type").is_none())
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                let mcp_count = servers.map_or(0, serde_json::Map::len) - untyped.len();
                 if mcp_count > 0 {
                     parts.push(format!("{mcp_count} MCP server(s) configured (.mcp.json)"));
+                }
+                if !untyped.is_empty() {
+                    warnings.push(format!(
+                        ".mcp.json URL server(s) without a \"type\" are skipped by Claude Code: {}; \
+                         add \"type\": \"http\" (or \"sse\") to each, or re-run \
+                         `umadev mcp-manage install <name> -- <url>`",
+                        untyped.join(", ")
+                    ));
                 }
             }
             Err(e) => {
@@ -2037,6 +2051,24 @@ mod tests {
         let r = check_ecosystem(tmp.path());
         assert_eq!(r.status, Status::Passed);
         assert!(r.detail.contains("1 MCP server"));
+    }
+
+    #[test]
+    fn ecosystem_url_server_without_transport_type_warns() {
+        // Claude Code skips a URL server with no "type", so doctor must not
+        // count it as configured. Older `umadev mcp-manage install` wrote these.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".mcp.json"),
+            r#"{"mcpServers":{"docs":{"url":"https://x/mcp"},"ok":{"type":"http","url":"https://y/mcp"},"gh":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let r = check_ecosystem(tmp.path());
+        assert_eq!(r.status, Status::Warning, "{}", r.detail);
+        assert!(r.detail.contains("docs"), "{}", r.detail);
+        assert!(r.detail.contains("\"type\""), "{}", r.detail);
+        assert!(!r.detail.contains("ok,"), "{}", r.detail);
+        assert!(r.detail.contains("2 MCP server(s)"), "{}", r.detail);
     }
 
     #[test]

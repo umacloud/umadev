@@ -28,15 +28,22 @@ use crate::runner::RunOptions;
 use crate::trust::requires_confirmation_with_ledger;
 use umadev_spec::Phase;
 
+mod acceptance_floor;
+mod declared_evidence;
+mod host_approval;
 mod operational_review;
 mod quality_evidence;
-mod resume;
+pub(crate) mod resume;
 mod review_checkpoint;
 mod review_liveness;
 mod step_metrics;
 mod step_outcome;
 mod step_review;
 
+use acceptance_floor::acceptance_floor;
+#[cfg(test)]
+use acceptance_floor::acceptance_floor_blocking;
+use declared_evidence::red_half_verdict;
 #[cfg(test)]
 use operational_review::post_build_rework_context;
 use operational_review::run_final_gate;
@@ -53,7 +60,7 @@ use resume::{
 };
 pub use resume::{
     has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
-    rearm_operational_review_for_explicit_retry, terminal_review_circuit_reason,
+    rearm_operational_review_for_explicit_retry, resume_route, terminal_review_circuit_reason,
     transient_resume_hint,
 };
 use resume::{load_resumable_plan, record_artifact_versions};
@@ -293,6 +300,24 @@ pub(crate) fn budget_exhausted(
     now >= hard_cap || now.saturating_duration_since(last_progress) >= idle
 }
 
+/// Where the scheduler's sliding between-steps window restarts once a step settles.
+/// The window counts wall-clock WITHOUT base activity: a doer or review turn that
+/// actually ran is activity even when the step then failed its acceptance. Only a
+/// step whose base completed no turn leaves the window running. Pure.
+#[must_use]
+pub(crate) fn slide_step_budget_clock(
+    last_activity: std::time::Instant,
+    drove: bool,
+    made_progress: bool,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    if drove || made_progress {
+        now
+    } else {
+        last_activity
+    }
+}
+
 /// The EFFECTIVE deadline instant for the next idle wait: the sliding idle window
 /// (`last_progress + idle`) clamped to never exceed the ABSOLUTE `hard_cap`. Threaded
 /// as the run-budget `deadline` into [`next_event_idle`] so a live-but-silent tool is
@@ -416,14 +441,14 @@ pub(crate) enum IdleEvent {
     },
     /// The watchdog settled the turn without a real event — either a NON-tool hang
     /// (no event for the base window with no tool in flight → genuinely hung, so the
-    /// watchdog issued a best-effort, bounded `interrupt()` before settling), OR a base
-    /// that was still mid-tool when the overall run-budget `deadline` was reached (the
-    /// liveness backstop: a live base running a tool keeps waiting only until the run
-    /// budget is exhausted, then settles WITHOUT an interrupt — the run finalization /
-    /// `session.end()` releases it). The pump settles the turn as a failure so
-    /// `thinking` clears rather than blocking forever. Carries the base's diagnosis
-    /// captured at the settle (for the hang case, AFTER the bounded interrupt — an
-    /// interrupt may have made a hung child exit, surfacing its status/stderr).
+    /// watchdog interrupted it, bounded, closing a session whose turn did not settle),
+    /// OR a base that was still mid-tool when the overall run-budget `deadline` was
+    /// reached (the liveness backstop: a live base running a tool keeps waiting only
+    /// until the run budget is exhausted, then settles WITHOUT an interrupt — the run
+    /// finalization / `session.end()` releases it). The pump settles the turn as a
+    /// failure so `thinking` clears rather than blocking forever. Carries the base's
+    /// diagnosis captured at the settle (for the hang case, AFTER the interrupt — an
+    /// interrupt or a close may have made a hung child exit, surfacing its status).
     IdleTimedOut {
         /// The base child's exit status if it had already exited (else `None`).
         exit: Option<std::process::ExitStatus>,
@@ -452,9 +477,9 @@ pub(crate) enum IdleEvent {
 ///   [`IdleEvent::IdleTimedOut`]). A tool of ANY duration with a live base survives.
 /// - **No tool in flight** (`in_tool_call == false`): the `budget.base` window IS the
 ///   hang deadline — pure silence past it means the base is genuinely hung, so the
-///   watchdog issues a best-effort `interrupt()` (itself bounded by
-///   [`INTERRUPT_TIMEOUT_SECS`] so a wedged interrupt path can't re-introduce the hang)
-///   and settles as [`IdleEvent::IdleTimedOut`]. The non-tool case is NEVER unbounded.
+///   watchdog interrupts it (bounded by [`INTERRUPT_TIMEOUT_SECS`]), closes a session
+///   whose turn did not settle (it could end the next turn), and settles as
+///   [`IdleEvent::IdleTimedOut`]. The non-tool case is NEVER unbounded.
 ///
 /// ANY real event returns immediately ([`IdleEvent::Event`]); the caller loops, calling
 /// this again, so the next wait re-reads the window for the (possibly changed)
@@ -515,15 +540,15 @@ pub(crate) async fn next_event_idle(
                     continue;
                 }
                 // NOT in a tool → pure silence past the base window means the base is
-                // genuinely hung. Best-effort interrupt to release the child, bounded
-                // so a dead pipe can't wedge it (the watchdog must always make
-                // progress), then settle. Capture AFTER the interrupt — a hung child
-                // the interrupt just killed now has an exit status / final stderr line.
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                    session.interrupt(),
-                )
-                .await;
+                // genuinely hung. Interrupt it, bounded so a dead pipe can't wedge the
+                // watchdog (it must always make progress), then settle. A turn the
+                // interrupt did not settle may still end later and land in the next
+                // turn, so its session is closed and the caller cannot re-drive onto
+                // it (see `crate::turn_interrupt`). Capture AFTER the interrupt — a
+                // hung child the interrupt (or the close) just ended now has an exit
+                // status / final stderr line.
+                let bound = Duration::from_secs(INTERRUPT_TIMEOUT_SECS);
+                crate::turn_interrupt::interrupt_or_close(session, bound).await;
                 return IdleEvent::IdleTimedOut {
                     exit: session.try_exit_status(),
                     stderr_tail: session.stderr_tail(),
@@ -816,6 +841,11 @@ pub async fn drive_director_loop_routed(
         events.emit(EngineEvent::Note(format!("team · {reason}")));
         return DirectorLoopOutcome::Failed(reason);
     }
+    // Nor may a planning turn that fails open leave this run judged against, or
+    // `/continue` resuming, the previous run's plan.
+    resume::retire_previous_plan(&options.project_root);
+    // Save the route this run executes under, so a resume after any pause keeps it.
+    resume::record_run_route(&options.project_root, route);
 
     // Attribute governance findings to this run. The snapshot survives a
     // cross-process `/continue`, so unchanged brownfield findings are not
@@ -1716,14 +1746,15 @@ async fn drive_plan_steps(
     // runs; otherwise the scope denominator is unknowable and the old scope floor
     // silently stood down. Planning already performs one bounded repair re-ask. If
     // it is still incomplete, fail explicitly and keep the workspace untouched —
-    // never widen to the legacy end-to-end mega-turn.
+    // never widen to the legacy end-to-end mega-turn. Only steps that will still run
+    // are gated: a resumed Done step keeps its truth even if it predates surfaces.
     let contract =
         crate::execution_contract::ExecutionContract::from_plan(route, &options.requirement, plan);
     if let Some(violation) = contract.preflight_violations().into_iter().next() {
         for step in plan
             .steps
             .iter_mut()
-            .filter(|step| step.kind == plan_state::StepKind::Build && step.files.is_empty())
+            .filter(|step| step.lacks_pending_surface())
         {
             step.status = StepStatus::Blocked;
             events.emit(EngineEvent::plan_step_status(
@@ -2178,15 +2209,18 @@ async fn drive_plan_steps(
         // Fail-open. This is what keeps `/status` honest as the build progresses.
         sync_phase_from_plan(plan, options);
 
-        // SLIDING run-budget reset (Stage 3): a step that made genuine forward
-        // progress is base productivity at the scheduling level — slide the between-
-        // steps idle window so a build that keeps completing (even slow) steps is
-        // never guillotined between them (bounded only by the ABSOLUTE cap). A step
-        // that drove NOTHING forward does not reset it, so a truly stalled run still
-        // winds down to a resumable budget pause.
-        if made_progress {
-            last_progress = std::time::Instant::now();
-        }
+        // SLIDING run-budget reset (Stage 3): a step whose turn the base actually ran
+        // is base activity at the scheduling level, accepted or not — slide the
+        // between-steps idle window so a build that keeps working (even slow, even
+        // through failed acceptance) is bounded only by the ABSOLUTE cap, as
+        // CONFIG.md documents. A step whose base completed no turn does not reset it,
+        // so a truly stalled run still winds down to a resumable budget pause.
+        last_progress = slide_step_budget_clock(
+            last_progress,
+            drove,
+            made_progress,
+            std::time::Instant::now(),
+        );
 
         if status == StepStatus::Done && made_progress {
             let kind = match step.kind {
@@ -2374,9 +2408,9 @@ async fn drive_plan_steps(
     // strands nothing → no Note.
     let stranded = mark_unreachable_pending_blocked(plan, events);
     if stranded > 0 {
-        events.emit(EngineEvent::Note(format!(
-            "team · {stranded} 个计划步骤因前置被阻塞而跳过(标记为已阻塞,未执行)"
-        )));
+        let count = stranded.to_string();
+        let note = umadev_i18n::tlf("plan.stranded_skipped", &[&count]);
+        events.emit(EngineEvent::Note(note));
         persist_plan_ref(plan, options);
     }
 
@@ -4076,7 +4110,8 @@ async fn verify_step_evidence(
         .iter()
         .any(|c| matches!(c, E::RouteResponds { .. }));
     let runtime = if needs_runtime {
-        let proof = crate::runtime_proof::run_runtime_proof(root).await;
+        let declared = declared_evidence::declared_routes(step);
+        let proof = crate::runtime_proof::run_runtime_proof_probing(root, &declared).await;
         // FRESHNESS: a proof is a statement about the tree it ran against. If the
         // source moved between the probe and this instant (a concurrent write, a base
         // still finishing a file), the proof no longer describes the code we are about
@@ -4117,7 +4152,13 @@ async fn verify_step_evidence(
                 method,
                 path,
                 status,
-            } => route_responds_outcome(runtime.as_ref(), method, path, *status),
+            } => declared_evidence::route_responds_outcome(
+                events,
+                runtime.as_ref(),
+                method,
+                path,
+                *status,
+            ),
             // M6: an under-specified brain evidence entry is ALWAYS an unmet gap — it
             // never auto-passes, so the step is held to a falsifiable bar instead of
             // silently degrading to the coarse "any source exists" default.
@@ -4310,6 +4351,7 @@ async fn test_red_green_outcome(
                  is not done until its own test is green"
             ));
         }
+        T::NotFound => return EvidenceOutcome::Gap(declared_evidence::named_test_not_run(test)),
         // We could not run it at all (no runner / unrecognised project / timeout). Fall
         // open to the ordinary named-test bar — never block on our own blindness.
         T::Unavailable => return test_passes_outcome(root, Some(needle), build),
@@ -4446,31 +4488,6 @@ fn red_half_remember(
     memo.insert(red_half_key(root, pre, test), outcome);
 }
 
-/// The RED half's verdict, given how the named test behaved at the step's PRE-state.
-/// Pure — the decision, separated from the IO that produces it (see
-/// [`test_red_green_outcome`], which has already established that the test is present
-/// and GREEN at head before asking this).
-///
-/// `None` ⇒ **inconclusive**: the caller must fall open to the ordinary `TestPasses`
-/// bar rather than reach a verdict it could not support.
-fn red_half_verdict(test: &str, red: crate::verify::NamedTestOutcome) -> Option<EvidenceOutcome> {
-    use crate::verify::NamedTestOutcome as T;
-    match red {
-        // The step's test was RED before it ran and is GREEN now. That is a test.
-        T::Failed => Some(EvidenceOutcome::Pass),
-        // THE FINDING. The test passed BEFORE the step's work existed, so it cannot be
-        // asserting that work — it was written to match code that was already there.
-        T::Passed => Some(EvidenceOutcome::Gap(format!(
-            "test \"{test}\" ALREADY PASSED at this step's pre-state — it was written after (or \
-             around) the code, so it has never demonstrated that it can detect the behaviour's \
-             absence. Make it a real test: assert the behaviour this step is supposed to add, \
-             confirm it FAILS without that code, then make it pass"
-        ))),
-        // We could not run it in the rewound tree — inconclusive, never a verdict.
-        T::Unavailable => None,
-    }
-}
-
 /// `BuildClean` contract → reuse the already-run build/test floor: green = positive,
 /// red = a typed gap, no-manifest = a neutral skip.
 fn build_clean_outcome(build: Option<&VerifyResult>) -> EvidenceOutcome {
@@ -4509,70 +4526,11 @@ fn contract_outcome(contract: Option<&VerifyResult>) -> EvidenceOutcome {
     }
 }
 
-/// `RouteResponds` contract → reuse the already-run runtime proof: if the app booted
-/// (Verified), the named path must have answered with the expected status (`status ==
-/// 0` ⇒ any non-error). A route that wasn't probed / answered wrong is a typed gap; a
-/// runtime that could NOT be verified at all (no dev server / no curl) is a neutral
-/// skip (fail-open — an unbootable app never blocks a step on this contract).
-fn route_responds_outcome(
-    runtime: Option<&crate::runtime_proof::RuntimeProof>,
-    method: &str,
-    path: &str,
-    status: Option<u16>,
-) -> EvidenceOutcome {
-    let Some(proof) = runtime else {
-        return EvidenceOutcome::Skip;
-    };
-    if !proof.status.is_verified() {
-        // The app couldn't be booted/probed at all — neutral, not a false failure.
-        return EvidenceOutcome::Skip;
-    }
-    let want = normalize_route(path);
-    let Some(probe) = proof
-        .routes
-        .iter()
-        .find(|r| normalize_route(&r.path) == want)
-    else {
-        return EvidenceOutcome::Gap(format!(
-            "declared {method} {path} responds but that route was not among the probed routes"
-        ));
-    };
-    // L2: `None` = any non-error response; `Some(code)` = require exactly `code`
-    // (including a required error status like 401).
-    let ok = match status {
-        None => probe.ok,
-        Some(want) => probe.status == want,
-    };
-    if ok {
-        EvidenceOutcome::Pass
-    } else {
-        match status {
-            None => EvidenceOutcome::Gap(format!(
-                "declared {method} {path} responds OK but it returned status {}",
-                probe.status
-            )),
-            Some(want) => EvidenceOutcome::Gap(format!(
-                "declared {method} {path} responds {want} but it returned status {}",
-                probe.status
-            )),
-        }
-    }
-}
-
 /// Resolve whether a repo-relative `path` exists under `root`. A blank path is never
 /// "present". Reads disk only; fail-open (a stat error ⇒ absent).
 fn step_path_exists(root: &std::path::Path, path: &str) -> bool {
     let p = path.trim();
     !p.is_empty() && root.join(p).exists()
-}
-
-/// Normalise a route path for comparison: trim, ensure a single leading `/`, drop a
-/// trailing `/` (except the root). So `api/users/` and `/api/users` compare equal.
-fn normalize_route(path: &str) -> String {
-    let t = path.trim();
-    let t = t.strip_prefix('/').unwrap_or(t);
-    let trimmed = t.trim_end_matches('/');
-    format!("/{trimmed}")
 }
 
 /// Whether any of the project's source files mentions `needle` — the deterministic
@@ -4775,8 +4733,12 @@ async fn attempt_replan_blocked_subtree(
          `acceptance`: source-present|build-test|contract|design-tokens|review-clean; \
          `evidence` (preferred): an array of machine-checkable proofs, e.g. \
          {\"kind\":\"file-exists\",\"path\":\"src/foo.ts\"}, {\"kind\":\"build-clean\"}. \
+         `files` (REQUIRED for EVERY build step): the paths the step will create or modify, \
+         {\"create\":[\"src/orders/api.ts\"],\"modify\":[\"src/routes.ts\"]}; the new steps \
+         also inherit the replaced steps' surface, so do not repeat it. \
          JSON shape: {\"steps\":[{\"id\":\"…\",\"title\":\"…\",\"seat\":\"…\",\"kind\":\"build\",\
-         \"depends_on\":[],\"acceptance\":\"…\",\"evidence\":[…]}]}";
+         \"depends_on\":[],\"acceptance\":\"…\",\"evidence\":[…],\"files\":{\"create\":[…],\
+         \"modify\":[…]}}]}";
     let gap_line = if gap_evidence.is_empty() {
         "(the step produced no verifiable progress / no positive evidence)".to_string()
     } else {
@@ -4794,10 +4756,18 @@ async fn attempt_replan_blocked_subtree(
         .iter()
         .find(|s| s.id == blocked_id)
         .map_or("?", |s| s.seat.role_id());
+    let replaced_surface = plan
+        .steps
+        .iter()
+        .filter(|s| s.id == blocked_id || stranded.iter().any(|id| id == &s.id))
+        .flat_map(|s| s.files.all())
+        .collect::<Vec<_>>()
+        .join(", ");
     let user = format!(
         "BLOCKED step: {blocked_id} — {blocked_title} (seat {blocked_seat}).\n\
          Why it blocked (typed gap evidence): {gap_line}.\n\
-         STRANDED dependent steps needing a new route:\n{stranded_line}\n\n\
+         STRANDED dependent steps needing a new route:\n{stranded_line}\n\
+         Their file surface, which the replacement inherits: {replaced_surface}\n\n\
          Overall requirement:\n{}\n\n\
          Return ONE JSON object with the replacement sub-DAG.",
         options.requirement
@@ -5509,12 +5479,10 @@ pub(crate) async fn resolve_host_request(
 ) -> HostResponse {
     match request {
         HostRequest::Approval {
-            action,
-            target,
             options: approval_options,
             ..
         } => {
-            let resolved = resolve_approval(options, events, action, target).await;
+            let resolved = host_approval::resolve(options, events, request).await;
             HostResponse::Approval {
                 decision: resolved.decision,
                 selected_option_id: approval_option_id(approval_options, resolved.decision),
@@ -5858,11 +5826,11 @@ async fn drive_one_turn_with_backoff_and_memories(
         // turn runs to the absolute cap; a silent one settles after one idle window.
         let eff = sliding_deadline(deadline, last_progress, idle_window);
         if std::time::Instant::now() >= eff {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
+            // An interrupt that did not settle closes the session: the turn could
+            // still end later, and a later step's turn would read that end as its own
+            // (see `crate::turn_interrupt`).
+            let bound = Duration::from_secs(INTERRUPT_TIMEOUT_SECS);
+            crate::turn_interrupt::interrupt_or_close(session, bound).await;
             record_turn_usage(options, events, None, est_tokens);
             capture_turn_pitfalls(options, events, &pitfalls);
             events.emit(EngineEvent::Note(
@@ -5929,11 +5897,11 @@ async fn drive_one_turn_with_backoff_and_memories(
                 // delivery purely because the deadline happened to land mid-tool rather
                 // than mid-stream).
                 if in_tool_call && std::time::Instant::now() >= eff {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                        session.interrupt(),
-                    )
-                    .await;
+                    // Stopped like the mid-turn budget settle above: an interrupt
+                    // that did not settle closes the session, so no later step reads
+                    // this turn's late end as its own.
+                    let bound = Duration::from_secs(INTERRUPT_TIMEOUT_SECS);
+                    crate::turn_interrupt::interrupt_or_close(session, bound).await;
                     record_turn_usage(options, events, None, est_tokens);
                     capture_turn_pitfalls(options, events, &pitfalls);
                     events.emit(EngineEvent::Note(
@@ -5950,13 +5918,13 @@ async fn drive_one_turn_with_backoff_and_memories(
                 }
                 // Watchdog re-drive (bounded SINGLE retry): a NON-tool silent hang on a
                 // base that is STILL ALIVE (no exit captured even after the watchdog's
-                // bounded interrupt) may be a SILENTLY DROPPED stream, not a dead base —
-                // so re-drive the SAME directive ONCE before failing. Strictly gated so
-                // it never fights the legitimate long-tool wait: it fires ONLY when no
-                // tool was in flight (`!in_tool_call`, so the in-tool budget-reached
-                // settle is excluded), the base is alive (`exit.is_none()`), and we have
+                // settled interrupt; one that did not settle closed the session) may be
+                // a SILENTLY DROPPED stream, not a dead base — so re-drive the SAME
+                // directive ONCE before failing. Strictly gated so it never fights the
+                // legitimate long-tool wait: it fires ONLY when no tool was in flight
+                // (`!in_tool_call`), the base is alive (`exit.is_none()`), and we have
                 // not already re-driven. Fail-open: a re-send error, a second hang, or a
-                // dead base all fall through to the honest failure below.
+                // dead or closed base all fall through to the honest failure below.
                 if !in_tool_call && exit.is_none() && !watchdog_retried {
                     watchdog_retried = true;
                     // The abandoned (hung) attempt still spent its tokens — record the
@@ -6904,7 +6872,7 @@ async fn run_auto_qc(
     // 2b. REQUIRED ACCEPTANCE FLOOR (Wave 4, §L4 / task 2). For a DELIBERATE build
     //     (Standard/Deep) the spec→tasks + spec→code verification becomes a REQUIRED
     //     blocking signal on the default path — not legacy-only. We fold in:
-    //       - coverage gaps   (FR-NNN declared in the PRD but no task cites it),
+    //       - coverage gaps   (an untraced PRD FR-NNN; blocking only when strict),
     //       - acceptance gaps (planned API endpoints with no implementation),
     //       - contract drift  (frontend fetch URLs with no matching backend route),
     //       - runtime-proof   (a written runtime-proof.json that did NOT verify).
@@ -6913,7 +6881,8 @@ async fn run_auto_qc(
     //     Lean/Fast already returned above, so this only runs on the heavyweight
     //     path — speed is preserved. Each contributor is fail-open (a missing
     //     artifact / unreadable doc yields no gap, never a false alarm), so a check
-    //     that genuinely can't run is a NEUTRAL skip, not a fabricated failure.
+    //     that genuinely can't run is a NEUTRAL skip the user sees as a note, not a
+    //     fabricated failure.
     if route.map(|r| r.depth.is_deliberate()).unwrap_or(false) {
         // Compute scope drift once. New surfaces and edits to existing files are both
         // execution-contract violations; a missing diff remains a silent fail-open.
@@ -6921,9 +6890,11 @@ async fn run_auto_qc(
             crate::plan_state::load(&options.project_root)
                 .map(|plan| crate::scope_creep::unclaimed_changes(&options.project_root, &plan))
                 .unwrap_or_default();
-        for line in acceptance_floor_blocking_with(options, route, Some(&scope)) {
-            blocking.push(line);
+        let floor = acceptance_floor(options, route, Some(&scope));
+        for note in floor.notes {
+            events.emit(EngineEvent::Note(note));
         }
+        blocking.extend(floor.blocking);
     }
 
     // Run fork critics only over a deterministically viable candidate; otherwise
@@ -6943,174 +6914,6 @@ async fn run_auto_qc(
         operational,
         raw_failure_log,
     }
-}
-
-/// The REQUIRED acceptance floor for a deliberate build (Wave 4, §L4 / task 2) —
-/// the spec→tasks + spec→code verification, promoted to a blocking signal on the
-/// default deliberate path. Folds in coverage gaps, interface-acceptance gaps,
-/// frontend↔contract drift, an unverified runtime-proof, and (for a Bugfix) a
-/// missing reproduction test. Each contributor is fail-open: a missing artifact /
-/// unparseable doc yields no gap (a neutral skip), so a check that genuinely
-/// cannot run never fabricates a failure. Returns the blocking lines (empty =
-/// the floor is clean OR nothing could be checked).
-#[cfg(test)]
-fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) -> Vec<String> {
-    acceptance_floor_blocking_with(options, route, None)
-}
-
-/// The acceptance-floor core, optionally reusing scope drift the caller already
-/// computed.
-///
-/// `unclaimed_changes` is not cheap: it stages the whole work-tree into the shadow index
-/// (`git add -A --force`), reads a full run diff, and runs a repo-wide backend-route
-/// extraction. A QC pass reuses that one snapshot so every scope finding is judged
-/// against the same workspace state.
-///
-/// `scope: None` keeps the standalone behaviour (compute it here) for callers that have
-/// no precomputed set.
-fn acceptance_floor_blocking_with(
-    options: &RunOptions,
-    route: Option<&RoutePlan>,
-    scope: Option<&[crate::scope_creep::ScopeFinding]>,
-) -> Vec<String> {
-    let slug = options.effective_slug();
-    let root = &options.project_root;
-    let mut out: Vec<String> = Vec::new();
-
-    // spec→tasks: a declared FR-NNN no task covers (a requirement at risk of being
-    // silently dropped). Fail-open: no PRD / no FR ids → empty.
-    for r in crate::coverage::uncovered_requirements(root, &slug) {
-        out.push(format!(
-            "coverage gap: requirement {r} is declared in the PRD but no task implements it — \
-             build it, or remove it from scope honestly"
-        ));
-    }
-    // spec→code: a planned API endpoint with no implementation evidence on disk.
-    // Fail-open: no architecture doc / no endpoints → empty.
-    for g in crate::acceptance::task_acceptance_gaps(root, &slug) {
-        out.push(format!(
-            "acceptance gap: planned endpoint not implemented — {g}"
-        ));
-    }
-    // frontend↔backend contract drift: a fetch URL with no matching backend route.
-    // Reuses the same `quality_floor` machinery the legacy gate used; here we pull
-    // ONLY the qa half (coverage/acceptance already counted above are re-derived,
-    // so we filter to the genuinely-new "contract drift:" lines to avoid dup text).
-    let (qa_floor, _sec) = crate::continuous::quality_floor(options);
-    for line in qa_floor.split('\n').map(str::trim) {
-        let line = line.trim_start_matches("- ").trim();
-        if line.starts_with("contract drift:") {
-            out.push(line.to_string());
-        }
-    }
-
-    // runtime-proof: when a `runtime-proof.json` was written (by `verify --runtime`)
-    // and it did NOT verify, that is a real, recorded failure (the app didn't boot /
-    // a route didn't answer). Absent file → neutral skip (the runtime check simply
-    // wasn't run this loop; we never fabricate a "didn't boot" from a missing file).
-    if let Some(line) = runtime_proof_blocking(root) {
-        out.push(line);
-    }
-
-    // ARCHITECTURE FITNESS (UD-CODE-006, spec §3.6): the REPO-GLOBAL
-    // half of the anti-spaghetti floor — the architecture doc's declared
-    // layer-dependency rules (`## Layering` order / `LAYER-RULE: a !-> b`),
-    // verified against the repo-map's resolved import edges. The touched-file
-    // rules (god-file / added-code clones / comment hygiene) run at the STEP level in
-    // `drive_build_step`, where the changed-file set is known from the pre-step
-    // baseline; here the empty touched set makes them a silent no-op by
-    // construction. Fail-open: no doc / no declaration / no resolved edges →
-    // empty, never a fabricated failure.
-    for f in crate::arch_fitness::arch_fitness_findings(root, &slug, &[]) {
-        if f.blocking {
-            out.push(f.message);
-        }
-    }
-
-    // SCOPE CREEP — the DUAL of the coverage check above. Coverage asks "which declared
-    // requirement has no step?" (UNDER-building). This asks the opposite: "which CHANGE
-    // belongs to no step?" (OVER-building) — an unplanned dependency, an unplanned
-    // source file, an unplanned public route: work nobody sized, nobody asked for, and
-    // nobody reviewed. New surfaces and edits to existing files both violate the
-    // execution contract. A missing run baseline or unreadable diff remains fail-open;
-    // malformed/missing step file declarations are rejected by plan preflight.
-    // See [`crate::scope_creep`]. Reuse the caller's set when it already paid for one.
-    match scope {
-        Some(findings) => out.extend(
-            findings
-                .iter()
-                .filter(|f| f.blocking)
-                .map(|f| f.message.clone()),
-        ),
-        None => {
-            if let Some(plan) = crate::plan_state::load(root) {
-                for f in crate::scope_creep::unclaimed_changes(root, &plan) {
-                    if f.blocking {
-                        out.push(f.message);
-                    }
-                }
-            }
-        }
-    }
-
-    // BUGFIX: require a reproduction test (red→green). A fix that lands no test
-    // asserting the bug can silently regress. Fail-open: only fires when the route
-    // is classified Bugfix AND we can read the source tree.
-    if route
-        .map(|r| r.kind == crate::planner::TaskKind::Bugfix)
-        .unwrap_or(false)
-        && !has_reproduction_test(root)
-    {
-        out.push(
-            "bugfix without a reproduction test: add a test that FAILS on the bug before the fix \
-             and PASSES after (red→green), and keep the rest of the suite green — a fix with no \
-             test asserting the bug can silently regress"
-                .to_string(),
-        );
-    }
-
-    // DESIGN-SYSTEM CONFORMANCE (UD-CODE-007, spec §3.7): the deterministic half
-    // of the design moat. The firmware PREACHES token discipline, paired
-    // foregrounds, measured contrast, and one committed hue — but a prompt is not
-    // a floor. This is the floor:
-    //
-    //   - `007a` schema     — a real system (>= 6 color roles each with a paired
-    //                         `on-` foreground, a >= 4-step type scale at ratio
-    //                         >= 1.125, a 4pt spacing scale, a radius scale,
-    //                         >= 2 durations + >= 1 easing), not `:root{--bg:#000}`.
-    //   - `007b` contrast   — every DECLARED (surface, on-surface) pair MEASURED
-    //                         with the WCAG formula in pure Rust (no browser, no
-    //                         deps): 4.5:1 body, 3:1 large/UI.
-    //   - `007c` drift      — the UI actually DRAWS from the token set (a literal
-    //                         color / font / radius / size off the scale is drift).
-    //   - `007d` hue        — no AI indigo/violet primary/accent unless the
-    //                         requirement asked for purple.
-    //   - `007e` lints      — the register-scoped design-lint registry; only its
-    //                         small P0 tier blocks, the advisory tier is a Note.
-    //   - `007f` direction  — the designer decided a DIRECTION before any token.
-    //
-    // Fail-open at EVERY edge: no `design-tokens.{json,css}` → the report is
-    // `unavailable` and contributes nothing (a project that never asked for a
-    // design system is completely unaffected); no UIUX doc → no direction finding.
-    // Only a project that SHIPPED a design system is held to the contract it
-    // implicitly claimed.
-    let register = crate::design_system::register_for_project(root, &slug);
-    let report = crate::design_system::verify_design_system(root, &options.requirement, register);
-    for f in report.blocking() {
-        out.push(f.message.clone());
-    }
-    // `007f` is gated on the ROUTE, not on a file: an `output/*-uiux.md` left behind by
-    // an earlier UI run (or already present in a brownfield repo) is not a reason to
-    // hold a backend-only task to a design contract it never entered. No route → no UI
-    // claim → nothing (fail-open).
-    let needs_ui = route.is_some_and(RoutePlan::needs_ui);
-    for f in crate::design_system::visual_direction_findings(root, &slug, needs_ui) {
-        if f.blocking {
-            out.push(f.message);
-        }
-    }
-
-    out
 }
 
 /// Map a [`VerifyResult`] from a build/test check to a blocking line, or `None` when

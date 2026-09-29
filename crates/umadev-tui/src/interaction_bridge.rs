@@ -110,14 +110,16 @@ pub(super) type HostInputHolder = Arc<std::sync::Mutex<Option<PendingHostInput>>
 /// Registration is owned by a worker task and can disappear on a terminal
 /// route decision without another keypress. Keeping this sync at loop cadence
 /// prevents a completed/failed session from leaving a stale, actionable-looking
-/// native queue pane and queued-count chip on an otherwise idle screen.
+/// native queue pane and queued-count chip on an otherwise idle screen. Input
+/// the ended lane never delivered is put back into the editor at the same time.
 pub(super) fn sync_live_input_readiness(app: &mut App, hub: &super::LiveInputHub) -> bool {
+    let restored = crate::live_input_lane::restore_returned_live_input(app, hub);
     let live_ready = hub.is_ready();
     let queue_ready = hub.prompt_queue_ready();
     let changed = app.live_input_ready != live_ready || app.prompt_queue.ready() != queue_ready;
     app.live_input_ready = live_ready;
     app.prompt_queue.set_ready(queue_ready);
-    changed
+    changed || restored
 }
 
 pub(super) static NEXT_HOST_INPUT_TOKEN: std::sync::atomic::AtomicU64 =
@@ -385,7 +387,14 @@ pub(super) fn parse_host_question_answer(
     question: &umadev_runtime::HostQuestion,
     raw: &str,
 ) -> std::result::Result<umadev_runtime::HostAnswer, String> {
-    let raw = raw.trim();
+    let raw = if matches!(question.kind, umadev_runtime::HostQuestionKind::Secret) {
+        // Whitespace can be part of a password or token; only the line
+        // terminator is not.
+        raw.strip_suffix('\n')
+            .map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line))
+    } else {
+        raw.trim()
+    };
     if question.required && raw.is_empty() {
         return Err(format!("`{}` requires an answer", question.id));
     }
@@ -487,7 +496,8 @@ pub(super) fn parse_user_input_response(
             })
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        let lines = raw.lines().map(str::trim).collect::<Vec<_>>();
+        // Each answer is trimmed per its question kind (secrets are not).
+        let lines = raw.lines().collect::<Vec<_>>();
         if lines.len() != questions.len() {
             return Err(format!(
                 "expected {} answer lines or a JSON object keyed by question id",
@@ -540,10 +550,16 @@ pub(super) fn parse_host_input_response(
             let expected = requested_schema
                 .get("type")
                 .and_then(serde_json::Value::as_str);
-            let content = match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(value) => value,
-                Err(_) if expected == Some("string") => serde_json::Value::String(raw.to_string()),
-                Err(error) => return Err(format!("invalid JSON response: {error}")),
+            let content = if expected == Some("string") {
+                // Only a JSON string literal is unwrapped; anything else
+                // (`94107`, `true`, `null`, prose) is the string as typed.
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .filter(serde_json::Value::is_string)
+                    .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+            } else {
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .map_err(|error| format!("invalid JSON response: {error}"))?
             };
             if !schema_accepts_top_level(requested_schema, &content) {
                 return Err(format!(
@@ -1059,6 +1075,25 @@ pub(super) async fn await_user_approval(
     await_user_approval_with_auto_release(holder, sink, action, target, true, "").await
 }
 
+/// The approval pause behind the `/run` lane's approval callback. A request only
+/// the user's answer may settle (an upstream permission boundary) is never
+/// released by a switch to Auto, exactly like the chat lane's.
+pub(super) async fn await_run_approval(
+    holder: &ApprovalHolder,
+    sink: &Arc<ChannelSink>,
+    request: &umadev_agent::ApprovalRequest,
+) -> ApprovalReply {
+    await_user_approval_with_auto_release(
+        holder,
+        sink,
+        &request.action,
+        &request.target,
+        !request.requires_user_answer,
+        "",
+    )
+    .await
+}
+
 /// The `HostRequest::Approval` variant: carries the base `req_id` so a later
 /// `HostRequestSettled` can retract exactly this approval bar.
 pub(super) async fn await_user_approval_for_request(
@@ -1268,11 +1303,11 @@ pub(super) async fn resident_approval_decision(
         }
     } else if needs_confirm {
         // The remediation must match the tier. Under Plan (read-only) this
-        // branch is the common case, and the generic message pointed at
-        // `UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions` — which is IGNORED in
-        // Plan (it is read only in the Auto arm), so following it changed nothing
-        // (the reported misleading advice). Plan gets a tier-correct message
-        // pointing at `/mode guarded`; other tiers keep the existing text.
+        // branch is the common case, and the generic message's remedy (relax
+        // with `/mode auto`, confirm the irreversible) does not describe why
+        // Plan declined (the reported misleading advice). Plan gets a
+        // tier-correct message pointing at `/mode guarded`; other tiers keep
+        // the generic text.
         let key = if mode == umadev_agent::TrustMode::Plan {
             "continuous.dangerous_action_denied_plan"
         } else {

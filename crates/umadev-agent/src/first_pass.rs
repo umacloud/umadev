@@ -246,10 +246,9 @@ pub fn low_confidence_nudge(project_root: &Path, kind: &str) -> Option<String> {
     if rate > LOW_RATE_THRESHOLD {
         return None;
     }
-    Some(format!(
-        "signal · 这一类需求的一次过验收率偏低({:.0}%)— 轻量路径历史上不太可靠,\
-         建议多校验 / 降低自动化档位(仅供参考,确定性底线不变)",
-        rate * 100.0
+    Some(umadev_i18n::tlf(
+        "signal.first_pass_low",
+        &[&format!("{:.0}", rate * 100.0)],
     ))
 }
 
@@ -533,9 +532,10 @@ mod tests {
             stats.observe(&kind, i == 0);
         }
         persist_fixture(tmp.path(), &stats);
-        assert!(
-            low_confidence_nudge(tmp.path(), &kind).is_some(),
-            "a low rate over the min sample nudges"
+        assert_eq!(
+            low_confidence_nudge(tmp.path(), &kind),
+            Some(umadev_i18n::tlf("signal.first_pass_low", &["17"])),
+            "a low rate over the min sample nudges, in the user's language"
         );
 
         // A healthy rate (5/5 = 100%) → no nudge.

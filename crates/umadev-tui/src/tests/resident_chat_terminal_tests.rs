@@ -609,10 +609,11 @@ async fn chat_failed_turn_surfaces_api_error_not_a_false_done() {
                 note.contains("usage quota"),
                 "the full base error is shown: {note}"
             );
-            // The actionable rate-limit classifier line is prepended.
+            // The actionable quota line is prepended (an exhausted 5-hour quota
+            // is not a rate limit a retry can clear).
             assert!(
-                note.contains(umadev_i18n::tl("base.fail.ratelimit")),
-                "the rate-limit diagnosis is prepended: {note}"
+                note.contains(umadev_i18n::tl("base.fail.quota")),
+                "the quota diagnosis is prepended: {note}"
             );
         }
         other => panic!("expected RouteDecision::Failed, got {other:?}"),
@@ -1117,7 +1118,7 @@ async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
     let mut saw_build_card = false;
     while let Ok(event) = engine_rx.try_recv() {
         match event {
-            EngineEvent::Note(n) if n.contains("构建执行已结束，尚未验收") => {
+            EngineEvent::Note(n) if is_post_build_qc_note(&n) => {
                 saw_qc = true;
             }
             EngineEvent::IntentDecided { class, .. } if class == "build" => saw_build_card = true,

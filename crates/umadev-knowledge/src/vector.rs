@@ -646,7 +646,7 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
         // A generic OPENAI_API_KEY resolves to None here → no network, BM25.
         let key = cloud_embed_key()?;
         let url = format!("{}/v1/embeddings", api_base());
-        let body = serde_json::json!({ "model": DEFAULT_MODEL, "input": text });
+        let body = embed_request_body(serde_json::json!(text));
         let mut vecs = http_embed(&url, &key, body, 1).await?;
         vecs.pop()
     }
@@ -657,12 +657,15 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
     }
 }
 
-/// Embed many texts in one (or a few batched) API call(s). Returns vectors
-/// in input order, or `None` on any failure. Batches internally at
-/// 100 texts per request to stay within API limits.
+/// Embed many texts in one (or a few batched) call(s). Returns vectors
+/// in input order, or `None` on any failure. Batches internally: the local
+/// model in groups within its per-call bounds, the HTTP API at 100 texts per
+/// request to stay within API limits.
 #[cfg_attr(not(feature = "vector"), allow(clippy::unused_async))]
 pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    // Local bundled model first (zero setup), off the async executor.
+    // Local bundled model first (zero setup), off the async executor. The
+    // corpus build hands over every uncached chunk at once, so the local call
+    // must split the batch rather than refuse it.
     #[cfg(feature = "vector-local")]
     {
         if crate::local_embed::is_available() {
@@ -670,11 +673,12 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
                 return Some(Vec::new());
             }
             let owned = texts.to_vec();
-            let local =
-                tokio::task::spawn_blocking(move || crate::local_embed::embed_texts(&owned, false))
-                    .await
-                    .ok()
-                    .flatten();
+            let local = tokio::task::spawn_blocking(move || {
+                crate::local_embed::embed_texts_batched(&owned, false)
+            })
+            .await
+            .ok()
+            .flatten();
             if let Some(v) = local {
                 if embeddings_have_valid_shape(&v, texts.len()) {
                     return Some(v);
@@ -695,7 +699,7 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
         let url = format!("{}/v1/embeddings", api_base());
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(EMBED_BATCH_MAX) {
-            let body = serde_json::json!({ "model": DEFAULT_MODEL, "input": chunk });
+            let body = embed_request_body(serde_json::json!(chunk));
             let mut vecs = http_embed(&url, &key, body, chunk.len()).await?;
             out.append(&mut vecs);
         }
@@ -721,6 +725,18 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
 /// we keep a conservative cap to bound per-request latency and payload.
 #[cfg(feature = "vector")]
 const EMBED_BATCH_MAX: usize = 100;
+
+/// The JSON body of one `/v1/embeddings` request for `input` (a string or an
+/// array of strings). It asks for [`active_model`], the model the store is
+/// tagged and dimension-checked with, so `UMADEV_EMBED_MODEL` reaches the
+/// provider (a larger OpenAI model, or another OpenAI-compatible provider's).
+#[cfg(feature = "vector")]
+fn embed_request_body(input: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_owned(), active_model().into());
+    body.insert("input".to_owned(), input);
+    serde_json::Value::Object(body)
+}
 
 /// Extract the model name the vector layer uses (for cache invalidation).
 /// Honours the `UMADEV_EMBED_MODEL` env override so a user can point at
@@ -1574,6 +1590,44 @@ mod tests {
             "a generic OPENAI_API_KEY alone must not upload corpus chunks"
         );
         std::env::remove_var(ENV_KEY_FALLBACK);
+    }
+
+    /// Child half of [`embed_requests_name_the_configured_model`]. It only
+    /// checks anything in a process spawned with `UMADEV_EMBED_MODEL` already
+    /// set, where nothing resolved (and cached) the model before it.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embed_request_model_child() {
+        let Ok(expected) = std::env::var("UMADEV_EMBED_MODEL_CHILD_EXPECT") else {
+            return;
+        };
+        assert_eq!(active_model(), expected);
+        for input in [serde_json::json!("query"), serde_json::json!(["a", "b"])] {
+            let body = embed_request_body(input.clone());
+            assert_eq!(body["model"], expected.as_str(), "{body}");
+            assert_eq!(body["input"], input, "{body}");
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embed_requests_name_the_configured_model() {
+        // The store is tagged and dimension-checked with `active_model()`, so the
+        // provider must be asked for that same model. The request bodies used to
+        // hard-code the default, so `UMADEV_EMBED_MODEL` (a larger OpenAI model,
+        // or another OpenAI-compatible provider's model) was never requested.
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "vector::tests::embed_request_model_child"])
+            .env("UMADEV_EMBED_MODEL", "bge-m3")
+            .env("UMADEV_EMBED_MODEL_CHILD_EXPECT", "bge-m3")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "embedding requests must name the UMADEV_EMBED_MODEL model:\n{stdout}\n{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     #[test]

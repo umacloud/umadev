@@ -321,8 +321,8 @@ pub(crate) fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Op
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        changed_files_after_git_status, git_diff_stat, git_status_porcelain_bounded,
-        run_git_status_command, GIT_STATUS_READER_GRACE,
+        agentic_fact_line, changed_files_after_git_status, git_diff_stat,
+        git_status_porcelain_bounded, run_git_status_command, GIT_STATUS_READER_GRACE,
     };
     use std::time::{Duration, Instant};
 
@@ -375,6 +375,31 @@ mod tests {
             changed_files_after_git_status(None, std::path::Path::new("."))
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_after_turn_note_names_a_chinese_path_verbatim() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut init = std::process::Command::new("git");
+        umadev_process::git::remove_git_environment(&mut init);
+        let status = init
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let before = git_status_porcelain_bounded(repo.path()).await.unwrap();
+        std::fs::write(repo.path().join("需求说明.md"), "# 需求\n").unwrap();
+
+        let changed = changed_files_after_git_status(Some(&before), repo.path())
+            .await
+            .unwrap();
+        assert_eq!(changed, ["需求说明.md"]);
+        assert_eq!(
+            agentic_fact_line(Some(&changed), true).as_deref(),
+            Some("[note] 本轮实际文件变更: 需求说明.md")
         );
     }
 

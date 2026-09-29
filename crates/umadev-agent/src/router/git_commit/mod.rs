@@ -1,13 +1,15 @@
+mod clause;
 mod literal;
 mod natural;
 mod quote;
 mod scope;
 
+pub(super) use clause::git_commit_context;
 use literal::{literal_git_commit_policy, literal_git_commit_tail};
 use natural::{
-    find_safe_git_receipt_suffix, natural_git_commit_prefix,
-    natural_git_commit_tail_is_safe_constraint, parse_paths, strip_git_commit_politeness,
-    trim_natural_commit_tail,
+    commit_phrase_is_modifier, commit_tail_chains_git_work, find_safe_git_receipt_suffix,
+    natural_git_commit_prefix, natural_git_commit_tail_is_safe_constraint, parse_paths,
+    strip_git_commit_politeness, trim_natural_commit_tail, NaturalPrefix,
 };
 use quote::{QuoteEvent, QuoteTracker};
 pub(super) use scope::{git_commit_control_text, git_commit_scope_text, unquoted_lowercase_text};
@@ -130,25 +132,44 @@ pub fn parse_host_git_commit_request(requirement: &str) -> Option<HostGitCommitR
 /// execution.
 #[must_use]
 pub fn parse_git_commit_intent(requirement: &str) -> GitCommitIntent {
+    parse_git_commit_clause(requirement).0
+}
+
+/// [`parse_git_commit_intent`], plus whether the matched words are unmistakably
+/// Git rather than the everyday "submit" (see `NaturalPrefix::git_wording`).
+fn parse_git_commit_clause(requirement: &str) -> (GitCommitIntent, bool) {
     let literal_text = strip_git_commit_politeness(requirement.trim());
-    if literal_git_commit_tail(literal_text).is_some() {
-        return match literal_git_commit_policy(literal_text) {
+    if let Some(tail) = literal_git_commit_tail(literal_text) {
+        // `git commit 前自动运行测试` describes a hook, not a command to run.
+        if commit_phrase_is_modifier(tail) {
+            return (GitCommitIntent::NotCommit, true);
+        }
+        let intent = match literal_git_commit_policy(literal_text) {
             Ok(spec) => GitCommitIntent::LiteralCommand(spec),
             Err(()) => GitCommitIntent::UnsupportedLiteralCommand,
         };
+        return (intent, true);
     }
 
     let scope_text = git_commit_scope_text(requirement);
     let command = strip_git_commit_politeness(&scope_text);
     let command_lower = command.to_lowercase();
-    let Some((prefix_len, requires_scope, generic_prefix)) =
-        natural_git_commit_prefix(&command_lower)
-    else {
-        return GitCommitIntent::NotCommit;
+    let Some(prefix) = natural_git_commit_prefix(&command_lower) else {
+        return (GitCommitIntent::NotCommit, false);
     };
-    let tail = trim_natural_commit_tail(&command[prefix_len..]);
-    if tail.is_empty() || (!requires_scope && natural_git_commit_tail_is_safe_constraint(tail)) {
-        return if requires_scope {
+    let Some(tail) = command.get(prefix.len..) else {
+        return (GitCommitIntent::NotCommit, false);
+    };
+    (natural_commit_intent(tail, prefix), prefix.git_wording)
+}
+
+/// Classify the words after a natural-language commit phrase.
+fn natural_commit_intent(raw_tail: &str, prefix: NaturalPrefix) -> GitCommitIntent {
+    let tail = trim_natural_commit_tail(raw_tail);
+    if tail.is_empty()
+        || (!prefix.requires_scope && natural_git_commit_tail_is_safe_constraint(tail))
+    {
+        return if prefix.requires_scope {
             GitCommitIntent::InvalidNaturalScope
         } else {
             GitCommitIntent::NaturalAllDirty
@@ -156,7 +177,14 @@ pub fn parse_git_commit_intent(requirement: &str) -> GitCommitIntent {
     }
     match parse_paths(tail) {
         Some(paths) if !paths.is_empty() => GitCommitIntent::NaturalPaths(paths),
-        _ if generic_prefix => GitCommitIntent::NotCommit,
+        // The phrase names a moment or a thing: 提交代码时…, 确认提交按钮.
+        _ if commit_phrase_is_modifier(tail) => GitCommitIntent::NotCommit,
+        // Without a named object, other words describe a submit flow
+        // (确认提交后跳转到首页, 创建一个提交反馈的页面), unless they go on to more
+        // Git work (确认提交，然后推送), which the host refuses.
+        _ if !prefix.names_object && !commit_tail_chains_git_work(tail) => {
+            GitCommitIntent::NotCommit
+        }
         _ => GitCommitIntent::InvalidNaturalScope,
     }
 }
@@ -259,6 +287,11 @@ pub fn request_is_unsupported_git_commit(requirement: &str) -> bool {
 /// read-only conversation. Callers use this predicate solely as a delegation
 /// firewall: commit-shaped mutations that do not parse as
 /// [`HostGitCommitRequest`] must never fall through to an AI base.
+///
+/// A commit counts where a clause of the request orders it, never as a phrase
+/// anywhere in the text: `提交` is also the everyday "submit", so product work
+/// such as `加一个确认提交按钮`, `用户提交后推送通知给管理员` or
+/// `给项目加一个 git commit 前自动跑 eslint 的钩子` reaches normal routing.
 #[must_use]
 pub fn request_has_git_commit_operation(requirement: &str) -> bool {
     let q = git_commit_control_text(requirement);
@@ -271,46 +304,11 @@ pub fn request_has_git_commit_operation(requirement: &str) -> bool {
     {
         return false;
     }
-    if !matches!(
+    !matches!(
         parse_git_commit_intent(requirement),
         GitCommitIntent::NotCommit
-    ) {
-        return true;
-    }
-
-    q.contains("git commit")
-        || [
-            "提交git记录",
-            "提交git紀錄",
-            "提交git纪录",
-            "提交git",
-            "git提交",
-            "确认提交",
-            "確認提交",
-            "确定提交",
-            "確定提交",
-            "创建一个提交",
-            "創建一個提交",
-            "建立一个提交",
-            "建立一個提交",
-            "提交后推送",
-            "提交後推送",
-            "提交然后推送",
-            "提交然後推送",
-        ]
-        .iter()
-        .any(|needle| compact.contains(needle))
-        || [
-            "commit these changes",
-            "commit the changes",
-            "commit current changes",
-            "commit all changes",
-            "commit my changes",
-            "make a commit",
-            "create a commit",
-        ]
-        .iter()
-        .any(|needle| q.contains(needle))
+    ) || parse_host_git_commit_request(requirement).is_some()
+        || clause::names_git_commit_clause(&q)
 }
 
 pub(super) fn git_commit_request_has_additional_work(q: &str, compact: &str) -> bool {
@@ -666,10 +664,11 @@ pub(super) fn request_is_git_commit_diagnostic(requirement: &str) -> bool {
         ]
         .iter()
         .any(|needle| q.contains(needle));
-    let commit_context = q.contains("commit") || compact.contains("提交");
-    commit_context
+    // A failure word next to the everyday "submit" (提交按钮有问题, 提交订单接口报错)
+    // is product work, not a Git diagnostic.
+    diagnostic
+        && git_commit_context(requirement)
         && !git_commit_request_has_additional_work(&q, &compact)
-        && diagnostic
         && matches!(
             parse_git_commit_intent(requirement),
             GitCommitIntent::NotCommit

@@ -33,6 +33,8 @@ const {
   releaseModelDownloadLock,
   modelDownloadTempPath,
   MODEL_DOWNLOAD_LOCK_NAME,
+  runPackageUninstall,
+  UNINSTALL_COMMANDS,
 } = require('../umadev/bin/cli.js');
 
 function trustedUpdateManifest(version) {
@@ -58,12 +60,42 @@ function trustedUpdateManifest(version) {
       fileCount: 5,
       signatures: [{ keyid: 'test', sig: 'test' }],
       attestations: {
-        url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@${version}`,
+        // The registry percent-encodes the scope separator in this URL.
+        url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@${version}`,
         provenance: { predicateType: 'https://slsa.dev/provenance/v1' },
       },
     },
   };
 }
+
+// A verbatim copy of https://registry.npmjs.org/@umatech/umadev/latest as
+// published for 1.1.1: exactly what `umadev update` receives from npmjs.org.
+const LIVE_REGISTRY_LATEST_1_1_1 = JSON.parse(
+  '{"bin":{"umadev":"bin/cli.js"},"bugs":{"url":"https://github.com/umacloud/umadev/issues"},' +
+    '"dist":{"shasum":"c03f863db0064764ec74f2409483f14450a95774",' +
+    '"tarball":"https://registry.npmjs.org/@umatech/umadev/-/umadev-1.1.1.tgz","fileCount":5,' +
+    '"integrity":"sha512-0wqWluv4gYzuWnTtToVsIwGF61+kuY8Gn24FBRWX0oKBbA1Vm0M4ykd81AgZyc6SM3sGTBjbEBxkkSEVC0bofg==",' +
+    '"signatures":[{"sig":"MEYCIQDTHHMYpZhGUPmtaVGcS/yvUHAyJzF1A/+T/lmTtv/pbQIhAKFR/IYSUEF7TCyFrTik8jopt3MVNVTIAbe1efAFw5+E",' +
+    '"keyid":"SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"}],' +
+    '"attestations":{"url":"https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.1",' +
+    '"provenance":{"predicateType":"https://slsa.dev/provenance/v1"}},"unpackedSize":75120},' +
+    '"name":"@umatech/umadev","_from":"file:/tmp/tmp.MXgKafSOWN/umatech-umadev-1.1.1.tgz",' +
+    '"author":{"name":"Shangyan Technology","email":"11964948@qq.com"},"engines":{"node":">=18"},' +
+    '"license":"MIT","_npmUser":{"name":"umatech","email":"umacloudtech@gmail.com"},' +
+    '"homepage":"https://github.com/umacloud/umadev","keywords":["ai","claude-code","codex","opencode",' +
+    '"grok-build","kimi-code","acp","tui","rust","agent","orchestrator","spec-driven","audit"],' +
+    '"_resolved":"/tmp/tmp.MXgKafSOWN/umatech-umadev-1.1.1.tgz",' +
+    '"_integrity":"sha512-0wqWluv4gYzuWnTtToVsIwGF61+kuY8Gn24FBRWX0oKBbA1Vm0M4ykd81AgZyc6SM3sGTBjbEBxkkSEVC0bofg==",' +
+    '"repository":{"url":"git+https://github.com/umacloud/umadev.git","type":"git"},"_npmVersion":"11.16.0",' +
+    '"description":"UmaDev: a Rust coding agent coordinating a real development team over five first-class base CLIs — Claude Code, Codex, OpenCode, Grok Build, and Kimi Code.",' +
+    '"directories":{},"maintainers":[{"name":"umatech","email":"umacloudtech@gmail.com"}],' +
+    '"_nodeVersion":"24.18.0","_hasShrinkwrap":false,"optionalDependencies":{"@umatech/knowledge":"1.1.1",' +
+    '"@umatech/cli-linux-x64":"1.1.1","@umatech/cli-win32-x64":"1.1.1","@umatech/cli-darwin-x64":"1.1.1",' +
+    '"@umatech/cli-linux-arm64":"1.1.1","@umatech/cli-darwin-arm64":"1.1.1",' +
+    '"@umatech/cli-linux-musl-x64":"1.1.1","@umatech/cli-linux-musl-arm64":"1.1.1"},' +
+    '"_npmOperationalInternal":{"tmp":"tmp/umadev_1.1.1_1787755352065_0.4279776176700856",' +
+    '"host":"s3://npm-registry-packages-npm-production"},"_id":"@umatech/umadev@1.1.1","version":"1.1.1"}',
+);
 
 const PLATFORM_LEAVES = {
   'darwin-arm64': 'cli-darwin-arm64',
@@ -184,7 +216,7 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
   }
   lifecyclePayload.dist.tarball = 'https://registry.npmjs.org/@umatech/umadev/-/umadev-1.0.74.tgz';
   lifecyclePayload.dist.attestations.url =
-    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.0.74';
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.0.74';
   assert.match(validateTrustedUpdateManifest(lifecyclePayload).reason, /lifecycle scripts/);
 
   const noProvenance = structuredClone(clean);
@@ -201,6 +233,172 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
   );
   assert.throws(() => exactUpdateCommand('npm', 'latest; touch /tmp/owned'));
 });
+
+test('terminal contract: updater accepts the registry\'s real attestation URL encoding', () => {
+  // npmjs.org writes the scope separator as `%2f`. A properly published
+  // release must verify, or no package-managed user can run `umadev update`.
+  assert.deepEqual(validateTrustedUpdateManifest(LIVE_REGISTRY_LATEST_1_1_1), {
+    trusted: true,
+    version: '1.1.1',
+  });
+
+  // The literal spelling of the same URL names the same attestation.
+  for (const url of [
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2Fumadev@1.1.1',
+  ]) {
+    const spelled = structuredClone(LIVE_REGISTRY_LATEST_1_1_1);
+    spelled.dist.attestations.url = url;
+    assert.deepEqual(validateTrustedUpdateManifest(spelled), { trusted: true, version: '1.1.1' });
+  }
+
+  // Decoding does not loosen the comparison: another package, version or
+  // host, a suffix, a double encoding, a malformed escape, or a non-string
+  // is still refused.
+  for (const url of [
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fother@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.0',
+    'https://registry.example/-/npm/v1/attestations/@umatech%2fumadev@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.1%3Fx',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%252fumadev@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.1%',
+    '',
+    ['https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.1.1'],
+  ]) {
+    const forged = structuredClone(LIVE_REGISTRY_LATEST_1_1_1);
+    forged.dist.attestations.url = url;
+    assert.match(validateTrustedUpdateManifest(forged).reason, /provenance/, String(url));
+  }
+});
+
+// A package-managed install for the uninstall tests: the main package, a stub
+// platform binary that follows the launcher's handoff protocol (`mode`:
+// `complete` finishes its half, `decline` answers no, `fail` exits 1), and a
+// stub manager that records its arguments and removes the package unless
+// `managerRemoves` is false.
+function uninstallFixture(t, layout, mgr, { mode = 'complete', managerRemoves = true } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-uninstall-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const nodeModules = path.join(root, layout, 'node_modules');
+  const packageRoot = path.join(nodeModules, '@umatech', 'umadev');
+  const platformLeaf = PLATFORM_LEAVES[`${process.platform}-${process.arch}`];
+  const binary = path.join(nodeModules, '@umatech', platformLeaf, 'bin', 'umadev');
+  fs.mkdirSync(path.join(packageRoot, 'bin'), { recursive: true });
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(
+    path.join(packageRoot, 'package.json'),
+    `${JSON.stringify({ name: '@umatech/umadev', version: '9.9.9' })}\n`,
+  );
+  const binaryLog = path.join(root, 'binary.log');
+  fs.writeFileSync(
+    binary,
+    '#!/bin/sh\n' +
+      `echo "args=$*" >> '${binaryLog}'\n` +
+      `echo "command=$UMADEV_UNINSTALL_PACKAGE_COMMAND" >> '${binaryLog}'\n` +
+      (mode === 'fail' ? 'exit 1\n' : '') +
+      (mode === 'complete' ? ': > "$UMADEV_UNINSTALL_HANDOFF"\n' : '') +
+      'exit 0\n',
+    { mode: 0o755 },
+  );
+  const binDir = path.join(root, 'manager-bin');
+  fs.mkdirSync(binDir);
+  const managerLog = path.join(root, 'manager.log');
+  fs.writeFileSync(
+    path.join(binDir, mgr),
+    '#!/bin/sh\n' +
+      'if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi\n' +
+      `echo "$*" >> '${managerLog}'\n` +
+      (managerRemoves ? `rm -rf '${packageRoot}'\n` : '') +
+      'exit 0\n',
+    { mode: 0o755 },
+  );
+  return { packageRoot, binaryLog, managerLog, binDir };
+}
+
+async function runUninstall(fixture, args) {
+  const saved = {
+    path: process.env.PATH,
+    exitCode: process.exitCode,
+    log: console.log,
+    error: console.error,
+  };
+  const output = [];
+  process.env.PATH = `${fixture.binDir}${path.delimiter}${saved.path || ''}`;
+  process.exitCode = undefined;
+  console.log = (...parts) => output.push(parts.join(' '));
+  console.error = (...parts) => output.push(parts.join(' '));
+  try {
+    const handled = await runPackageUninstall(args, fixture.packageRoot);
+    return { handled, exitCode: process.exitCode, text: output.join('\n') };
+  } finally {
+    process.env.PATH = saved.path;
+    process.exitCode = saved.exitCode;
+    console.log = saved.log;
+    console.error = saved.error;
+  }
+}
+
+const readLog = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+
+test(
+  'terminal contract: a full uninstall removes the scoped package through its owner manager',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const npm = uninstallFixture(t, 'npm-prefix/lib', 'npm');
+    const removed = await runUninstall(npm, ['--yes']);
+    assert.equal(removed.handled, true);
+    assert.equal(removed.exitCode, undefined, removed.text);
+    assert.match(readLog(npm.binaryLog), /^args=uninstall --yes$/m);
+    assert.match(readLog(npm.binaryLog), /^command=npm uninstall -g @umatech\/umadev$/m);
+    assert.equal(readLog(npm.managerLog), 'uninstall -g @umatech/umadev\n');
+    assert.equal(fs.existsSync(npm.packageRoot), false);
+    assert.match(removed.text, /UmaDev uninstalled/);
+
+    const pnpm = uninstallFixture(t, 'pnpm/global/5', 'pnpm');
+    const viaPnpm = await runUninstall(pnpm, ['--yes']);
+    assert.equal(viaPnpm.exitCode, undefined, viaPnpm.text);
+    assert.equal(UNINSTALL_COMMANDS.pnpm, 'pnpm remove -g @umatech/umadev');
+    assert.equal(readLog(pnpm.managerLog), 'remove -g @umatech/umadev\n');
+  },
+);
+
+test(
+  'terminal contract: uninstall reports success only when the package is really gone',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    // npm exits 0 for a package that is not installed (the retired unscoped
+    // name did exactly that), so its status is not evidence of removal.
+    const lingering = uninstallFixture(t, 'npm-prefix/lib', 'npm', { managerRemoves: false });
+    const result = await runUninstall(lingering, ['--yes']);
+    assert.equal(result.handled, true);
+    assert.equal(result.exitCode, 1);
+    assert.equal(fs.existsSync(lingering.packageRoot), true);
+    assert.match(result.text, /did not remove the package/);
+    assert.match(result.text, /npm uninstall -g @umatech\/umadev/);
+    assert.doesNotMatch(result.text, /UmaDev uninstalled/);
+
+    // Declining at the binary's prompt, or a failed hook removal, removes nothing.
+    for (const [mode, exitCode] of [
+      ['decline', undefined],
+      ['fail', 1],
+    ]) {
+      const fixture = uninstallFixture(t, 'npm-prefix/lib', 'npm', { mode });
+      const outcome = await runUninstall(fixture, []);
+      assert.equal(outcome.handled, true);
+      assert.equal(outcome.exitCode, exitCode, mode);
+      assert.equal(readLog(fixture.managerLog), '', `${mode}: the manager ran`);
+      assert.equal(fs.existsSync(fixture.packageRoot), true);
+    }
+
+    // A hook-only uninstall and the help text stay with the binary.
+    const hookOnly = uninstallFixture(t, 'npm-prefix/lib', 'npm');
+    for (const args of [['--base', 'claude-code'], ['--host=pre-commit'], ['--help']]) {
+      const outcome = await runUninstall(hookOnly, args);
+      assert.equal(outcome.handled, false, args.join(' '));
+    }
+    assert.equal(readLog(hookOnly.binaryLog), '');
+  },
+);
 
 test('terminal contract: package managers never run from the caller cwd', () => {
   const options = packageManagerSpawnOptions(
@@ -544,7 +742,10 @@ test(
         `catch (error) { fs.writeFileSync(process.argv[3], String(error && error.code || error)); }\n`,
     );
     const manager = path.join(binDir, 'npm.cmd');
-    const manifest = JSON.stringify(trustedUpdateManifest(expected));
+    // cmd.exe expands `%2` in the registry's encoded scope separator (`%2f`) as
+    // the batch file's second argument, so double every `%` to echo the manifest
+    // verbatim.
+    const manifest = JSON.stringify(trustedUpdateManifest(expected)).replace(/%/g, '%%');
     fs.writeFileSync(
       manager,
       `@echo off\r\n` +

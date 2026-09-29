@@ -166,7 +166,9 @@ pub struct AgentRunSnapshot {
     pub run_id: String,
     /// Pointer creation time used for newest-first ordering.
     pub created_at: String,
-    /// Mechanically-derived run state.
+    /// Mechanically-derived run state. A director plan's run is judged on each
+    /// logical step's latest attempt, as the run itself is: an earlier attempt of a
+    /// retried step is history, listed in `tasks` but never a failure of the run.
     pub readiness: RunReadiness,
     /// Current task records, including immutable prior attempts.
     pub tasks: Vec<AgentTaskRecord>,
@@ -708,12 +710,19 @@ impl AgentTaskLedger {
     /// Compute whether the run can truthfully publish success.
     #[must_use]
     pub fn readiness(&self) -> RunReadiness {
+        self.readiness_of(|_| true)
+    }
+
+    /// [`Self::readiness`] over only the records `include` selects, for an owner that
+    /// knows which terminal records are superseded history (an earlier attempt of a
+    /// retried plan step) rather than live obligations of the run.
+    pub(crate) fn readiness_of(&self, include: impl Fn(&AgentTaskRecord) -> bool) -> RunReadiness {
         if self.tasks.is_empty() {
             return RunReadiness::NotTracked;
         }
         let mut blocked = Vec::new();
         let mut in_progress = false;
-        for task in self.tasks.values() {
+        for task in self.tasks.values().filter(|task| include(task)) {
             match task.state {
                 AgentTaskState::Succeeded | AgentTaskState::Superseded => {}
                 AgentTaskState::Failed
@@ -1344,7 +1353,8 @@ pub fn recent_agent_runs(project_root: &Path, limit: usize) -> Vec<AgentRunSnaps
             Some(AgentRunSnapshot {
                 run_id: pointer.run_id,
                 created_at: pointer.created_at,
-                readiness: ledger.readiness(),
+                readiness: crate::plan_tasks::plan_ledger_readiness(&ledger)
+                    .unwrap_or_else(|| ledger.readiness()),
                 tasks: ledger.tasks().cloned().collect(),
             })
         })

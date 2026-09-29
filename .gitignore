@@ -18,6 +18,8 @@ __pycache__/
 # Machine-local Claude Code integration. UmaDev writes the current executable
 # path here using Claude's non-shareable project settings surface.
 .claude/settings.local.json
+# Machine-local Codex hook wiring (absolute paths to a developer's own build).
+.codex/hooks.json
 
 # Workspace runtime state (per-project, not source) — all of .umadev/ is
 # generated/user data: workflow state, audit, checkpoints shadow-git, KB index.

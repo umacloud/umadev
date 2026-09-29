@@ -264,7 +264,9 @@ pub(super) fn next_step_review_checkpoint(
     review_only: bool,
     evidence: OperationalReviewEvidence,
 ) -> OperationalReviewCheckpoint {
-    let consecutive_outages = match prior {
+    // Only a retry of the SAME boundary continues its outage count and its evidence
+    // trail; an earlier, unrelated boundary's findings must never be reported here.
+    let same_boundary = match prior {
         Some(
             checkpoint @ OperationalReviewCheckpoint::StepReview {
                 step_id: prior_step,
@@ -278,12 +280,14 @@ pub(super) fn next_step_review_checkpoint(
             && prior_seats == &required_seats
             && *prior_review_only == review_only =>
         {
-            checkpoint.effective_outages().saturating_add(1)
+            Some(checkpoint)
         }
-        _ => 1,
+        _ => None,
     };
+    let consecutive_outages =
+        same_boundary.map_or(1, |prior| prior.effective_outages().saturating_add(1));
     let evidence = OperationalReviewEvidence::merged(
-        prior.map(OperationalReviewCheckpoint::evidence),
+        same_boundary.map(OperationalReviewCheckpoint::evidence),
         evidence,
     );
     OperationalReviewCheckpoint::StepReview {
@@ -304,7 +308,9 @@ pub(super) fn next_final_review_checkpoint(
     entry_task_run_id: Option<String>,
     evidence: OperationalReviewEvidence,
 ) -> OperationalReviewCheckpoint {
-    let consecutive_outages = match prior {
+    // As for a step review: a prior step boundary, or a final review over different
+    // QC inputs, neither continues this boundary's count nor lends it evidence.
+    let same_boundary = match prior {
         Some(
             checkpoint @ OperationalReviewCheckpoint::FinalGateReview {
                 qc_source_fingerprint: prior_fingerprint,
@@ -312,12 +318,14 @@ pub(super) fn next_final_review_checkpoint(
                 ..
             },
         ) if prior_fingerprint == &qc_source_fingerprint && prior_seats == &required_seats => {
-            checkpoint.effective_outages().saturating_add(1)
+            Some(checkpoint)
         }
-        _ => 1,
+        _ => None,
     };
+    let consecutive_outages =
+        same_boundary.map_or(1, |prior| prior.effective_outages().saturating_add(1));
     let evidence = OperationalReviewEvidence::merged(
-        prior.map(OperationalReviewCheckpoint::evidence),
+        same_boundary.map(OperationalReviewCheckpoint::evidence),
         evidence,
     );
     OperationalReviewCheckpoint::FinalGateReview {
@@ -336,7 +344,7 @@ pub(super) fn next_final_review_checkpoint(
 /// die between their renames. Keeping a distinctive cursor in the plan lets the
 /// loader reconstruct a missing checkpoint without scheduling an ordinary review
 /// and then immediately reviewing again in the final gate.
-pub(super) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
+pub(crate) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
 
 #[cfg(test)]
 fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {
@@ -378,6 +386,95 @@ fn plan_repair_closed(root: &Path) -> bool {
         MAX_PLAN_REPAIR_CLOSED_BYTES,
     )
     .is_ok()
+}
+
+/// Retire the previous run's plan when a FRESH routed run starts. If this run's
+/// planning turn fails open, its changes must not be judged against the old plan's
+/// claims, and `/continue` must not resume the old plan's steps under the new
+/// requirement. A plan this run synthesises is saved in its place.
+pub(super) fn retire_previous_plan(root: &Path) {
+    if let Some(dir) = existing_umadev_dir(root) {
+        let _ = umadev_state::fs::remove_regular_file(&dir.join(crate::run_provenance::PLAN));
+    }
+}
+
+/// The route a run was planned under, saved beside its plan so a resume — after a
+/// gate, budget or review pause — keeps its class, kind, depth and team instead of
+/// re-deriving them from the requirement text (which can resize the review team
+/// and flip every depth-gated floor).
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedRoute {
+    class: String,
+    kind: String,
+    depth: String,
+    #[serde(default)]
+    team: Vec<crate::critics::Seat>,
+    #[serde(default)]
+    scope: Vec<String>,
+    #[serde(default)]
+    confidence: f32,
+}
+
+const MAX_RUN_ROUTE_BYTES: u64 = 64 * 1024;
+
+/// Save (`Some`) or retire (`None`) the route of the run that now owns `.umadev/`.
+/// Best-effort: a resume without a saved route falls back to the explicit-run
+/// route for the requirement, as before.
+pub(super) fn record_run_route(root: &Path, route: Option<&crate::router::RoutePlan>) {
+    let Some(route) = route else {
+        if let Some(dir) = existing_umadev_dir(root) {
+            let _ =
+                umadev_state::fs::remove_regular_file(&dir.join(crate::run_provenance::RUN_ROUTE));
+        }
+        return;
+    };
+    let saved = SavedRoute {
+        class: route.class.as_str().to_string(),
+        kind: route.kind.id().to_string(),
+        depth: route.depth.as_str().to_string(),
+        team: route.team.clone(),
+        scope: route.scope.clone(),
+        confidence: route.confidence,
+    };
+    let Ok(body) = serde_json::to_vec_pretty(&saved) else {
+        return;
+    };
+    let Ok(dir) = crate::bounded_fs::ensure_real_dir_beneath(root, Path::new(".umadev")) else {
+        return;
+    };
+    if umadev_state::fs::atomic_write(&dir.join(crate::run_provenance::RUN_ROUTE), &body).is_ok() {
+        crate::run_provenance::record(root, crate::run_provenance::RUN_ROUTE, &body);
+    }
+}
+
+fn load_run_route(root: &Path) -> Option<crate::router::RoutePlan> {
+    let body = umadev_state::fs::read_bounded_beneath(
+        root,
+        &Path::new(".umadev").join(crate::run_provenance::RUN_ROUTE),
+        MAX_RUN_ROUTE_BYTES,
+    )
+    .ok()?;
+    let saved: SavedRoute = serde_json::from_slice(&body).ok()?;
+    let class = crate::router::parse_class(&saved.class)?;
+    let depth = crate::router::parse_depth(&saved.depth)?;
+    Some(crate::router::RoutePlan {
+        class,
+        kind: crate::router::parse_kind(&saved.kind)?,
+        depth,
+        team: saved.team,
+        scope: saved.scope,
+        needs_clarify: None,
+        est_budget: crate::router::Budget::for_route(class, depth),
+        confidence: saved.confidence.clamp(0.0, 1.0),
+    })
+}
+
+/// The route a `/continue` or a gate approval resumes under: the one the paused
+/// run was planned under, when it was saved, else the explicit-run route for the
+/// requirement.
+#[must_use]
+pub fn resume_route(project_root: &Path, requirement: &str) -> crate::router::RoutePlan {
+    load_run_route(project_root).unwrap_or_else(|| crate::router::for_run(requirement))
 }
 
 fn existing_umadev_dir(root: &Path) -> Option<std::path::PathBuf> {
@@ -800,8 +897,9 @@ pub fn is_budget_pause_reason(reason: &str) -> bool {
 }
 
 /// A ONE-LINE localized discoverability hint to emit when a director run stops with a
-/// still-resumable plan on disk AND the stop was either a **transient** base failure
-/// (a rate limit / an overloaded base / a network blip — [`crate::base_error::is_transient`])
+/// still-resumable plan on disk AND the stop was either a **resumable** base failure
+/// (a rate limit / an overloaded base / a network blip / an exhausted quota —
+/// [`crate::base_error::is_resumable_later`])
 /// OR a **run-time-budget** exhaustion ([`is_budget_pause_reason`]): the plan was
 /// saved and `/continue` picks up the unfinished steps.
 ///
@@ -829,7 +927,7 @@ pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
     // progress for the budget-pause variant (done/total).
     let plan = load_resumable_plan(root)?;
     let failure = crate::base_error::classify(None, None, Some(reason.trim()));
-    if crate::base_error::is_transient(&failure) {
+    if crate::base_error::is_resumable_later(&failure) {
         return Some(umadev_i18n::tl("run.transient_resume_hint").to_string());
     }
     if is_budget_pause_reason(reason) {
@@ -927,6 +1025,107 @@ mod tests {
         clear_operational_review_checkpoint(temp.path());
         clear_operational_review_checkpoint(temp.path());
         assert!(!operational_review_checkpoint_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn a_resume_uses_the_route_its_run_saved() {
+        use crate::router::{Budget, Depth};
+        let temp = tempfile::tempdir().unwrap();
+        let requirement = "做一个完整的电商平台，包含用户、商品、订单、支付和后台管理";
+        let keyword = crate::router::for_run(requirement);
+        // Nothing saved (a plan from before routes were saved): the explicit-run
+        // route for the requirement, exactly as before.
+        assert_eq!(resume_route(temp.path(), requirement), keyword);
+
+        let mut planned = keyword.clone();
+        planned.kind = crate::planner::TaskKind::FrontendOnly;
+        planned.depth = Depth::Fast;
+        planned.team = vec![Seat::FrontendEngineer];
+        planned.est_budget = Budget::for_route(planned.class, planned.depth);
+        planned.needs_clarify = None;
+        assert_ne!(planned, keyword);
+        record_run_route(temp.path(), Some(&planned));
+        assert_eq!(resume_route(temp.path(), requirement), planned);
+
+        // A fresh run with no route of its own retires the saved one.
+        record_run_route(temp.path(), None);
+        assert_eq!(resume_route(temp.path(), requirement), keyword);
+    }
+
+    #[test]
+    fn a_later_review_boundary_never_inherits_an_earlier_boundarys_evidence() {
+        let step_a = next_step_review_checkpoint(
+            None,
+            "a".to_string(),
+            Some("tree-1".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            false,
+            OperationalReviewEvidence::new(
+                &["A: missing input validation".to_string()],
+                &["A: qa reviewer timed out".to_string()],
+            ),
+        );
+        let only_b = |checkpoint: &OperationalReviewCheckpoint| {
+            let evidence = checkpoint.evidence();
+            assert!(
+                !evidence
+                    .semantic_blocking
+                    .iter()
+                    .chain(&evidence.operational_unavailable)
+                    .any(|item| item.starts_with("A:")),
+                "a different boundary must not carry A's evidence: {evidence:?}"
+            );
+            assert_eq!(
+                evidence.operational_unavailable,
+                vec!["B: reviewer unavailable".to_string()]
+            );
+        };
+        let b_evidence =
+            || OperationalReviewEvidence::new(&[], &["B: reviewer unavailable".into()]);
+
+        // Step B's outage after A passed: its own counter AND its own evidence.
+        let step_b = next_step_review_checkpoint(
+            Some(&step_a),
+            "b".to_string(),
+            Some("tree-2".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            false,
+            b_evidence(),
+        );
+        assert_eq!(step_b.effective_outages(), 1);
+        only_b(&step_b);
+        // The final gate's outage after step A's pause: the same separation.
+        let final_gate = next_final_review_checkpoint(
+            Some(&step_a),
+            Some("tree-2".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            None,
+            b_evidence(),
+        );
+        assert_eq!(final_gate.effective_outages(), 1);
+        only_b(&final_gate);
+
+        // The SAME boundary retried over the same inputs keeps its trail.
+        let step_a_again = next_step_review_checkpoint(
+            Some(&step_a),
+            "a".to_string(),
+            Some("tree-1".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            false,
+            OperationalReviewEvidence::new(&[], &["A: still timing out".to_string()]),
+        );
+        assert_eq!(step_a_again.effective_outages(), 2);
+        assert_eq!(
+            step_a_again.evidence().semantic_blocking,
+            vec!["A: missing input validation".to_string()]
+        );
+        assert_eq!(
+            step_a_again.evidence().operational_unavailable,
+            vec![
+                "A: qa reviewer timed out".to_string(),
+                "A: still timing out".to_string()
+            ]
+        );
     }
 
     #[cfg(unix)]

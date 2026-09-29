@@ -25,6 +25,9 @@ fn dirty_git_repo() -> tempfile::TempDir {
         root.path(),
         &["config", "user.email", "umadev-test@example.invalid"],
     );
+    // The lane refuses signed commits; keep a developer's global signing
+    // setting out of these fixtures.
+    git(root.path(), &["config", "commit.gpgSign", "false"]);
     for path in ["one.txt", "two.txt", "three.txt"] {
         std::fs::write(root.path().join(path), "before\n").unwrap();
     }
@@ -96,6 +99,34 @@ fn out_of_scope_final_write_is_blocking_not_success() {
     assert!(blocked.contains("execution-path-out-of-scope"));
     assert!(blocked.contains("package.json"));
     assert!(!blocked.contains("[ok]"));
+}
+
+#[tokio::test]
+async fn fallback_edit_of_a_path_glued_to_chinese_words_passes_the_contract() {
+    // Chinese users often write a path with no space around it. When routing
+    // falls back, the scope must claim that file rather than the whole run of
+    // glued words, so the requested edit settles instead of failing the
+    // execution contract.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src/pages")).unwrap();
+    std::fs::write(root.path().join("src/pages/index.tsx"), "<h1>Home</h1>\n").unwrap();
+    let text = "把src/pages/index.tsx的标题改成欢迎";
+    let routed = umadev_agent::route_with_context_and_source(
+        None,
+        &crate::route_floor_options(root.path(), text, umadev_agent::TrustMode::Guarded),
+        text,
+        "",
+    )
+    .await;
+    assert!(routed.plan.class.mutates_workspace(), "{:?}", routed.plan);
+    let postcondition =
+        ResidentExecutionPostcondition::capture(root.path(), &routed.plan, text).unwrap();
+
+    std::fs::write(root.path().join("src/pages/index.tsx"), "<h1>欢迎</h1>\n").unwrap();
+    assert_eq!(
+        postcondition.validate_final(root.path()).unwrap(),
+        ["src/pages/index.tsx"]
+    );
 }
 
 #[test]
@@ -383,6 +414,39 @@ async fn bare_commit_excludes_untracked_umadev_runtime_state() {
         .iter()
         .any(|path| path.starts_with(".umadev/")));
     assert!(root.path().join(".umadev/state.json").exists());
+}
+
+#[tokio::test]
+async fn common_commit_phrasings_run_the_host_transaction_and_its_preflight() {
+    // `提交代码` and `commit it` once reached the AI base, which could stage a
+    // dirty `.env` itself. They now run the host transaction: one commit of the
+    // dirty set, and the credential preflight still refuses a secret.
+    for request in ["提交代码", "帮我提交一下代码", "commit it"] {
+        let root = dirty_git_repo();
+        let reply = crate::host_git::execute_host_git_commit(root.path(), request)
+            .await
+            .unwrap_or_else(|note| panic!("{request}: {note}"));
+        assert!(reply.contains("[ok]"), "{request}: {reply}");
+        assert_eq!(git_count(root.path(), "HEAD").unwrap(), 2, "{request}");
+        let dirty = git_dirty_paths(root.path()).unwrap();
+        assert!(
+            ["one.txt", "two.txt", "three.txt"]
+                .iter()
+                .all(|path| !dirty.contains(*path)),
+            "{request}: {dirty:?}"
+        );
+
+        let root = dirty_git_repo();
+        std::fs::write(root.path().join(".env"), "TOKEN=secret\n").unwrap();
+        let note = crate::host_git::execute_host_git_commit(root.path(), request)
+            .await
+            .unwrap_err();
+        assert!(
+            note.contains("git-sensitive-path-blocked"),
+            "{request}: {note}"
+        );
+        assert_eq!(git_count(root.path(), "HEAD").unwrap(), 1, "{request}");
+    }
 }
 
 #[test]
@@ -969,7 +1033,6 @@ async fn malicious_fsmonitor_and_signing_programs_are_not_executed() {
         ],
     );
     git(root.path(), &["config", "core.fsmonitorHookVersion", "2"]);
-    git(root.path(), &["config", "commit.gpgSign", "true"]);
     git(
         root.path(),
         &["config", "gpg.program", signer.to_string_lossy().as_ref()],
@@ -999,6 +1062,257 @@ async fn malicious_fsmonitor_and_signing_programs_are_not_executed() {
         !signer_marker.exists(),
         "the configured signing program must not run"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn host_commit_with_gpgsign_true_is_refused() {
+    let root = dirty_git_repo();
+    let (signer, signer_marker) = install_malicious_git_program(root.path(), "signer");
+    git(root.path(), &["config", "commit.gpgSign", "true"]);
+    git(
+        root.path(),
+        &["config", "gpg.program", signer.to_string_lossy().as_ref()],
+    );
+    let head = git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap();
+    let index = GitIndexSnapshot::capture(root.path()).unwrap();
+
+    let note = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap_err()
+    .into_note();
+
+    assert!(note.contains("git-signing-requires-native-git"), "{note}");
+    assert!(note.contains("commit.gpgSign"), "{note}");
+    assert_eq!(
+        git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap(),
+        head
+    );
+    assert!(index.matches_current().unwrap());
+    assert!(
+        !signer_marker.exists(),
+        "the configured signing program must not run"
+    );
+}
+
+/// Rewrite `path` with `bytes` and move its mtime forward, so Git has to
+/// compare contents the way it does after an editor rewrites a file.
+fn rewrite_later(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+}
+
+fn autocrlf_git_repo() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "UmaDev Test"),
+        ("user.email", "umadev-test@example.invalid"),
+        ("commit.gpgSign", "false"),
+    ] {
+        git(root.path(), &["config", key, value]);
+    }
+    root
+}
+
+/// Git for Windows defaults to `core.autocrlf=true`: native `git add` stores
+/// LF, and a CRLF file rewritten with identical bytes is clean. The host
+/// commit must record exactly what native Git would.
+#[tokio::test]
+async fn host_commit_honours_autocrlf_like_native_git() {
+    let root = autocrlf_git_repo();
+    git(root.path(), &["config", "core.autocrlf", "true"]);
+    std::fs::write(root.path().join("edited.txt"), b"line1\r\nline2\r\n").unwrap();
+    std::fs::write(root.path().join("touched.txt"), b"same\r\nbytes\r\n").unwrap();
+    git(root.path(), &["add", "edited.txt", "touched.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "initial"]);
+    std::fs::write(
+        root.path().join("edited.txt"),
+        b"line1\r\nline2 changed\r\n",
+    )
+    .unwrap();
+    rewrite_later(&root.path().join("touched.txt"), b"same\r\nbytes\r\n");
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["edited.txt"]);
+    let blob = git_output(root.path(), &["cat-file", "blob", "HEAD:edited.txt"]).unwrap();
+    assert_eq!(blob.stdout, b"line1\nline2 changed\n");
+    assert!(git_dirty_paths(root.path()).unwrap().is_empty());
+}
+
+/// An editor or agent that rewrites a tracked file with identical bytes leaves
+/// it stat-dirty only. `git diff` would refresh the index for it even under
+/// `--no-optional-locks`, and the lane would then refuse its own commit as
+/// "index changed after the baseline".
+#[tokio::test]
+async fn a_rewritten_but_unchanged_file_does_not_break_the_commit() {
+    let root = dirty_git_repo();
+    git(root.path(), &["add", "two.txt", "three.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "second"]);
+    rewrite_later(&root.path().join("two.txt"), b"ready to commit\n");
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["one.txt"]);
+}
+
+/// "Safer autocrlf": a file whose stored blob already has CRLF is committed
+/// as it is, exactly like native `git add`, instead of rewriting every line.
+#[tokio::test]
+async fn host_commit_keeps_crlf_that_is_already_stored() {
+    let root = autocrlf_git_repo();
+    std::fs::write(root.path().join("legacy.txt"), b"a\r\nb\r\n").unwrap();
+    git(root.path(), &["add", "legacy.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "initial"]);
+    git(root.path(), &["config", "core.autocrlf", "true"]);
+    std::fs::write(root.path().join("legacy.txt"), b"a\r\nb changed\r\n").unwrap();
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["legacy.txt"]);
+    let blob = git_output(root.path(), &["cat-file", "blob", "HEAD:legacy.txt"]).unwrap();
+    assert_eq!(blob.stdout, b"a\r\nb changed\r\n");
+    assert!(git_dirty_paths(root.path()).unwrap().is_empty());
+}
+
+/// A `text` attribute from the user's own attributes file converts line
+/// endings in native Git just like one in `.gitattributes`, so it is refused.
+#[tokio::test]
+async fn attributes_from_the_users_attributes_file_fail_closed() {
+    let root = dirty_git_repo();
+    let attributes = root.path().join(".git").join("user-attributes");
+    std::fs::write(&attributes, "*.txt text=auto\n").unwrap();
+    git(
+        root.path(),
+        &[
+            "config",
+            "core.attributesFile",
+            attributes.to_string_lossy().as_ref(),
+        ],
+    );
+    std::fs::write(root.path().join("one.txt"), b"ready\r\nto commit\r\n").unwrap();
+    let before = git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap();
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap();
+    let note = postcondition
+        .execute_git_commit(root.path(), "提交git记录: one.txt")
+        .await
+        .unwrap_err()
+        .into_note();
+
+    assert!(
+        note.contains("git-content-transformation-blocked"),
+        "{note}"
+    );
+    assert_eq!(
+        git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap(),
+        before
+    );
+}
+
+/// The host commit decides line endings like the user's own Git, including
+/// `-text` (or `binary`) from the user's attributes file, which its other
+/// children skip: with it, a script whose blob was normalized now differs from
+/// its CRLF copy, and `git add` stores such a file byte for byte.
+#[tokio::test]
+async fn line_endings_follow_the_users_attributes_file_like_native_git() {
+    let root = autocrlf_git_repo();
+    git(root.path(), &["config", "core.autocrlf", "true"]);
+    for path in ["build.bat", "notes.txt"] {
+        std::fs::write(root.path().join(path), b"one\r\ntwo\r\n").unwrap();
+    }
+    git(root.path(), &["add", "build.bat", "notes.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "initial"]);
+    let attributes = root.path().join(".git").join("user-attributes");
+    std::fs::write(&attributes, "*.bat -text\n").unwrap();
+    git(
+        root.path(),
+        &[
+            "config",
+            "core.attributesFile",
+            attributes.to_string_lossy().as_ref(),
+        ],
+    );
+    // Both tracked files are rewritten with the same bytes; two new files arrive.
+    for path in ["build.bat", "notes.txt"] {
+        rewrite_later(&root.path().join(path), b"one\r\ntwo\r\n");
+    }
+    for path in ["deploy.bat", "readme.txt"] {
+        std::fs::write(root.path().join(path), b"new\r\nfile\r\n").unwrap();
+    }
+    let native = Command::new("git")
+        .arg("-C")
+        .arg(root.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        " M build.bat\n?? deploy.bat\n?? readme.txt\n"
+    );
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["build.bat", "deploy.bat", "readme.txt"]);
+    for (path, bytes) in [
+        ("build.bat", &b"one\r\ntwo\r\n"[..]),
+        ("deploy.bat", &b"new\r\nfile\r\n"[..]),
+        ("readme.txt", &b"new\nfile\n"[..]),
+    ] {
+        let blob = git_output(root.path(), &["cat-file", "blob", &format!("HEAD:{path}")]).unwrap();
+        assert_eq!(blob.stdout, bytes, "{path}");
+    }
+    assert!(git_dirty_paths(root.path()).unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1167,6 +1481,74 @@ async fn batch_index_info_preserves_split_index_semantics() {
         git_dirty_paths(root.path()).unwrap(),
         BTreeSet::from(["three.txt".to_string(), "two.txt".to_string()])
     );
+}
+
+#[tokio::test]
+async fn early_git_failure_reports_its_own_error_instead_of_a_broken_pipe() {
+    let root = dirty_git_repo();
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap();
+    let baseline = postcondition.git_commit.as_ref().unwrap();
+    let mut transaction = GitTransactionGuard::new(root.path(), baseline);
+
+    // Git rejects the option and exits before reading any of the 1 MiB input.
+    let output = git_mutating_output_with_input(
+        root.path(),
+        &["hash-object", "--umadev-no-such-option", "--stdin"],
+        &vec![b'x'; 1024 * 1024],
+        Duration::from_secs(5),
+        "test-input-timeout",
+        "git hash-object",
+        &mut transaction,
+    )
+    .await
+    .unwrap();
+    transaction.disarm();
+
+    assert!(!output.status.success());
+    let note = git_command_failed("test-hash-failed", "git hash-object", &output).into_note();
+    assert!(note.contains("umadev-no-such-option"), "{note}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_commit_honors_core_file_mode_false_like_native_git() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Filesystems without a usable executable bit (WSL `/mnt/c`, exFAT, SMB)
+    // report every file as 0777; Git keeps the recorded mode there.
+    let root = dirty_git_repo();
+    git(root.path(), &["config", "core.fileMode", "false"]);
+    std::fs::write(root.path().join("new.txt"), "new\n").unwrap();
+    for path in ["one.txt", "new.txt"] {
+        std::fs::set_permissions(
+            root.path().join(path),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+    }
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt", "new.txt"]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["new.txt", "one.txt"]);
+    for path in ["one.txt", "new.txt"] {
+        let entry =
+            git_required_text(root.path(), &["ls-tree", "HEAD", "--", path], "test-tree").unwrap();
+        assert!(entry.starts_with("100644 blob "), "{entry}");
+    }
 }
 
 #[cfg(unix)]
@@ -1492,9 +1874,32 @@ fn commit_receipt_sanitizes_control_characters_in_paths() {
         paths: vec!["safe\u{1b}[31m\n\tname.txt".to_string()],
     };
     let reply = receipt.reply();
-    let paths = reply.split_once("提交文件: ").unwrap().1;
+    let paths = reply.split_once('\n').unwrap().1;
     assert!(!paths.chars().any(char::is_control), "{reply:?}");
     assert!(!paths.contains("\u{1b}[31m"), "{reply:?}");
+}
+
+#[test]
+fn git_commit_receipt_uses_the_active_language() {
+    let receipt = GitCommitReceipt {
+        commit: "c".repeat(40),
+        paths: vec!["src/main.rs".to_string()],
+    };
+    let english = receipt.reply_in(umadev_i18n::Lang::En);
+    assert!(english.contains("cccccccccccc"), "{english}");
+    assert!(english.contains("src/main.rs"), "{english}");
+    assert!(
+        !english
+            .chars()
+            .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)),
+        "{english}"
+    );
+    assert!(receipt
+        .reply_in(umadev_i18n::Lang::ZhCn)
+        .contains("已创建本地提交"));
+    assert!(receipt
+        .reply_in(umadev_i18n::Lang::ZhTw)
+        .contains("已建立本機提交"));
 }
 
 #[test]

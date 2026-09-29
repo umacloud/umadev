@@ -626,8 +626,8 @@ async fn review_with_team(
 ///
 /// - [`VerifyKind::BuildTest`] runs the project's real build/test/lint via
 ///   [`crate::verify::run_verify`] and reports pass/fail per step.
-/// - [`VerifyKind::Contract`] runs the continuous runner's quality floor — frontend↔
-///   backend contract drift + requirement coverage gaps.
+/// - [`VerifyKind::Contract`] checks the planned API endpoints against the backend's
+///   real route registrations + frontend↔backend contract drift.
 /// - [`VerifyKind::SourcePresent`] greps the workspace for real source files via
 ///   [`crate::acceptance::source_files`] — the "did anything get built" floor.
 ///
@@ -737,28 +737,47 @@ pub(crate) fn bounded_log_tail(s: &str) -> String {
     tail.chars().skip(n - RAW_LOG_TAIL_CHARS).collect()
 }
 
-/// Run the contract + coverage floor and report drift as factual evidence. An
-/// empty floor (no architecture doc / no gaps) → available + passed with no
-/// evidence; any drift → `passed = false` with each finding as evidence.
+/// Run the contract floor and report drift as factual evidence. An empty floor (no
+/// architecture doc / no gaps) → available + passed with no evidence; any drift →
+/// `passed = false` with each finding as evidence. An endpoint check that could not
+/// read the whole source tree proves nothing either way: with no other finding it is
+/// a neutral skip (`available = false`), never a failure the step's doer is asked to
+/// repair. Requirement coverage is not part of it: tracing every PRD requirement is a
+/// whole-build property the final gate judges, not something one step can satisfy.
 fn verify_contract(options: &RunOptions) -> VerifyResult {
-    let (qa_floor, _security_floor) = continuous::quality_floor(options);
-    let lines: Vec<String> = qa_floor
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    if lines.is_empty() {
+    let slug = options.effective_slug();
+    let root = &options.project_root;
+    let mut lines: Vec<String> = Vec::new();
+    let acceptance_unavailable = match crate::acceptance::endpoint_acceptance(root, &slug) {
+        crate::acceptance::EndpointAcceptance::Checked(gaps) => {
+            lines.extend(gaps.into_iter().map(|g| format!("acceptance gap: {g}")));
+            None
+        }
+        crate::acceptance::EndpointAcceptance::Unavailable(reason) => Some(reason),
+    };
+    lines.extend(
+        continuous::frontend_contract_drift(options, &slug)
+            .into_iter()
+            .map(|v| format!("contract drift: {v}")),
+    );
+    if !lines.is_empty() {
         return VerifyResult {
+            available: true,
+            passed: false,
+            evidence: lines,
+        };
+    }
+    match acceptance_unavailable {
+        Some(reason) => VerifyResult {
+            available: false,
+            passed: true,
+            evidence: vec![format!("acceptance unavailable: {reason}")],
+        },
+        None => VerifyResult {
             available: true,
             passed: true,
             evidence: Vec::new(),
-        };
-    }
-    VerifyResult {
-        available: true,
-        passed: false,
-        evidence: lines,
+        },
     }
 }
 
@@ -1742,6 +1761,66 @@ mod tests {
         assert!(r.available);
         assert!(r.passed, "an empty contract floor passes");
         assert!(r.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_contract_does_not_fail_a_step_on_requirement_coverage() {
+        // A backend step judged by `contract` cannot trace every PRD requirement;
+        // coverage is a whole-build property the final gate judges. A PRD whose FR
+        // ids nothing traces must not fail the step (its doer could not fix that).
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-prd.md"),
+            "| FR-001 | login |\n",
+        )
+        .unwrap();
+        let o = opts(tmp.path());
+        let ev = sink();
+        let r = verify(&o, &ev, VerifyKind::Contract).await;
+        assert!(r.available && r.passed, "{r:?}");
+        assert!(r.evidence.is_empty(), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_contract_is_neutral_when_the_endpoint_check_cannot_run() {
+        // A backend step judged by `contract` must not fail on a source scan that
+        // could not read the whole tree (the doer cannot fix that), while a planned
+        // endpoint that is genuinely missing from a readable tree still fails it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# API\n\n| Method | Path | Description | Auth |\n|---|---|---|---|\n\
+             | GET | /api/items | list items | none |\n\
+             | GET | /api/orders | list orders | none |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/server.js"),
+            "app.get('/api/items', listItems);\n",
+        )
+        .unwrap();
+        let o = opts(tmp.path());
+        let ev = sink();
+        let r = verify(&o, &ev, VerifyKind::Contract).await;
+        assert!(r.available && !r.passed, "a real gap fails: {r:?}");
+        assert!(
+            r.evidence.iter().any(|e| e.contains("/api/orders")),
+            "{r:?}"
+        );
+
+        for i in 0..crate::acceptance::MAX_SOURCE_FILES {
+            std::fs::write(
+                tmp.path().join(format!("src/m{i}.js")),
+                format!("export const v{i} = {i};\n"),
+            )
+            .unwrap();
+        }
+        let r = verify(&o, &ev, VerifyKind::Contract).await;
+        assert!(!r.available, "an unreadable tree is a neutral skip: {r:?}");
+        assert!(r.passed, "{r:?}");
     }
 
     #[test]

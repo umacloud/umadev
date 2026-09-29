@@ -379,8 +379,8 @@ fn run_budget() -> std::time::Duration {
 /// run in `root`. Two snapshots taken around a code phase let the runner detect
 /// "the base reported it implemented things, but the working tree did not
 /// change" — the file-level reality check the agentic chat already does, lifted
-/// into the `run` pipeline. Returns the raw porcelain output (one `XY path`
-/// line per changed path).
+/// into the `run` pipeline. Returns one `XY path<TAB>size mtime` line per
+/// changed path, with untracked directories expanded to their files.
 ///
 /// **Fail-open** (load-bearing): a non-git directory, a missing `git`, a
 /// non-zero exit, or any IO error returns `None`. The caller then SKIPS the
@@ -400,7 +400,13 @@ async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
         .await
         .ok()?;
     command
-        .args(["status", "--porcelain", IGNORE_DIRTY_SUBMODULES])
+        .args([
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            IGNORE_DIRTY_SUBMODULES,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -423,7 +429,25 @@ async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
     {
         return None; // not a git repo (or git refused) → fail-open, skip check
     }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    // Porcelain alone is not a change detector: re-editing an already-dirty
+    // file leaves its `XY path` line identical. Append each listed path's
+    // size + mtime (the same cheap fingerprint as the director loop's source
+    // snapshot) so a second edit reads as a change.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut entries = stdout.split('\0').filter(|entry| !entry.is_empty());
+    let mut snapshot = String::new();
+    while let Some(entry) = entries.next() {
+        let (status, path) = entry.split_at_checked(3).unwrap_or((entry, ""));
+        if status.contains(['R', 'C']) {
+            // `-z` emits a rename/copy's source path as its own entry.
+            entries.next();
+        }
+        let fingerprint = std::fs::symlink_metadata(root.join(path))
+            .map(|meta| format!("{} {:?}", meta.len(), meta.modified().ok()))
+            .unwrap_or_else(|_| "-".to_string());
+        snapshot.push_str(&format!("{status}{path}\t{fingerprint}\n"));
+    }
+    Some(snapshot)
 }
 
 /// `true` when the two `git status --porcelain` snapshots are byte-for-byte the
@@ -3022,9 +3046,9 @@ impl<R: Runtime> AgentRunner<R> {
     /// Try to generate content via the worker. Retries on transient errors
     /// (timeout / 429 / 5xx / connection blips) with exponential backoff
     /// (2s, 4s, 8s, …) so a rate-limited or briefly-unreachable host recovers
-    /// instead of failing the whole phase. Permanent errors (401, config) are
-    /// NOT retried. The base delay is overridable via `UMADEV_RETRY_BASE_MS`
-    /// (default 2000) so tests can shrink it.
+    /// instead of failing the whole phase. Permanent errors (401, an exhausted
+    /// quota, config) are NOT retried. The base delay is overridable via
+    /// `UMADEV_RETRY_BASE_MS` (default 2000) so tests can shrink it.
     async fn try_generate(&self, phase: Phase, prompt: Prompt) -> Option<String> {
         self.try_generate_on(&self.runtime, phase, prompt).await
     }
@@ -3166,32 +3190,16 @@ impl<R: Runtime> AgentRunner<R> {
                     return None;
                 }
                 Err(err) => {
-                    // Retry on timeout AND on transient host errors (the
-                    // provider returning 429/5xx, or a connection blip). We
-                    // can't fully distinguish transient from permanent for
-                    // HostProcess, so match on the error string for the
-                    // well-known transient signals — matches the retry
-                    // policy in vector.rs::http_embed for consistency.
-                    let is_timeout = matches!(err, umadev_runtime::RuntimeError::Timeout(_, _));
-                    let err_str = err.to_string().to_ascii_lowercase();
-                    let is_transient = is_timeout
-                        || err_str.contains("429")
-                        || err_str.contains("too many requests")
-                        || err_str.contains("502")
-                        || err_str.contains("503")
-                        || err_str.contains("504")
-                        || err_str.contains("529")
-                        || err_str.contains("service unavailable")
-                        || err_str.contains("bad gateway")
-                        || err_str.contains("connection reset")
-                        || err_str.contains("connection refused")
-                        || err_str.contains("timed out")
-                        // Host-CLI rate-limit / overload wording (claude/codex
-                        // print these to stderr, sometimes while still exiting 0).
-                        || err_str.contains("overloaded")
-                        || err_str.contains("rate limit")
-                        || err_str.contains("rate_limit")
-                        || err_str.contains("quota");
+                    // Retry on a timeout and on a transient host error (a rate
+                    // limit, an overloaded base, a connection blip, a gateway
+                    // 5xx). Each retry re-spawns the base CLI, so an exhausted
+                    // quota or a bad login fails at once: neither clears in
+                    // seconds. The shared base-failure classifier decides, so a
+                    // status code counts only as a whole token, never inside a
+                    // model name or a request id.
+                    let err_text = err.to_string();
+                    let is_transient = matches!(err, umadev_runtime::RuntimeError::Timeout(_, _))
+                        || worker_failure_is_transient(&err_text);
                     if is_transient && attempt + 1 < max_retries {
                         // Exponential backoff: base * 2^attempt (2s → 4s → 8s).
                         // Sleeping here lets a rate-limited provider recover
@@ -3204,11 +3212,11 @@ impl<R: Runtime> AgentRunner<R> {
                             "diag.transient_retry",
                             &[
                                 phase.id(),
-                                &err.to_string(),
+                                &err_text,
                                 &delay_ms.to_string(),
                                 &(attempt + 2).to_string(),
                                 &max_retries.to_string(),
-                                umadev_i18n::tl(diagnose_failure(&err_str)),
+                                umadev_i18n::tl(diagnose_failure(&err_text)),
                             ],
                         )));
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -3228,8 +3236,8 @@ impl<R: Runtime> AgentRunner<R> {
                         "diag.call_failed",
                         &[
                             phase.id(),
-                            &err.to_string(),
-                            umadev_i18n::tl(diagnose_failure(&err_str)),
+                            &err_text,
+                            umadev_i18n::tl(diagnose_failure(&err_text)),
                         ],
                     )));
                     return None;
@@ -6686,56 +6694,66 @@ fn phase_progress_hint(phase: Phase) -> &'static str {
 /// concrete next step, returned as a localised string (so a bare `{err}` no
 /// longer leaves the user with no direction).
 ///
-/// Pattern-matches the lower-cased error text against the well-known failure
-/// signatures (rate-limit / quota, network unreachable, not-logged-in, timeout,
-/// empty body) and returns the matching i18n hint. Fail-open: an unrecognised
-/// error falls through to a generic "run `umadev doctor`" hint — it never panics
-/// and never blocks, so the worst case is still the original `{err}` plus a
-/// generic pointer, never less information than before.
-fn diagnose_failure(err_lower: &str) -> &'static str {
-    if err_lower.contains("429")
-        || err_lower.contains("too many requests")
-        || err_lower.contains("rate limit")
-        || err_lower.contains("rate_limit")
-        || err_lower.contains("quota")
-        || err_lower.contains("overloaded")
-        || err_lower.contains("529")
-    {
-        "diag.rate_limit"
-    } else if err_lower.contains("not logged in")
-        || err_lower.contains("not authenticated")
-        || err_lower.contains("unauthorized")
-        || err_lower.contains("401")
-        || err_lower.contains("403")
-        || err_lower.contains("login")
-        || err_lower.contains("auth")
-        || err_lower.contains("api key")
-        || err_lower.contains("credential")
-    {
-        "diag.not_logged_in"
-    } else if err_lower.contains("connection refused")
-        || err_lower.contains("connection reset")
-        || err_lower.contains("dns")
-        || err_lower.contains("network")
-        || err_lower.contains("unreachable")
-        || err_lower.contains("502")
-        || err_lower.contains("503")
-        || err_lower.contains("504")
-        || err_lower.contains("bad gateway")
-        || err_lower.contains("service unavailable")
-    {
-        "diag.network"
-    } else if err_lower.contains("timed out") || err_lower.contains("timeout") {
-        "diag.timeout"
-    } else if err_lower.contains("no such file")
-        || err_lower.contains("command not found")
-        || err_lower.contains("not found")
-        || err_lower.contains("enoent")
-    {
-        "diag.base_missing"
-    } else {
-        "diag.generic"
+/// The shared [`crate::base_error::classify`] names the failure family, so an
+/// exhausted quota is told apart from a rate limit and a status code counts
+/// only as a whole token (the `403` inside `claude-3-haiku-20240307` is not an
+/// auth failure). Wording the classifier leaves unknown (a gateway 5xx, a DNS
+/// error, a missing base CLI) falls back to the runner's own signatures.
+/// Fail-open: an unrecognised error falls through to a generic "run
+/// `umadev doctor`" hint — it never panics and never blocks, so the worst case
+/// is still the original `{err}` plus a generic pointer, never less information
+/// than before.
+fn diagnose_failure(err: &str) -> &'static str {
+    use crate::base_error::BaseFailure;
+    let lower = err.to_ascii_lowercase();
+    let timed_out = lower.contains("timed out") || lower.contains("timeout");
+    match crate::base_error::classify(None, None, Some(err)) {
+        BaseFailure::RateLimit | BaseFailure::Quota | BaseFailure::Overloaded => "diag.rate_limit",
+        BaseFailure::Auth => "diag.not_logged_in",
+        BaseFailure::Network { .. }
+            if timed_out && !crate::base_error::is_gateway_failure(&lower) =>
+        {
+            "diag.timeout"
+        }
+        BaseFailure::Network { .. } => "diag.network",
+        BaseFailure::Context | BaseFailure::CapabilityUnsupported => "diag.generic",
+        BaseFailure::Exited(_) | BaseFailure::Unknown => {
+            if [
+                "not logged in",
+                "not authenticated",
+                "login",
+                "auth",
+                "api key",
+                "credential",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                "diag.not_logged_in"
+            } else if ["dns", "network", "unreachable"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+            {
+                "diag.network"
+            } else if timed_out {
+                "diag.timeout"
+            } else if ["no such file", "command not found", "not found", "enoent"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+            {
+                "diag.base_missing"
+            } else {
+                "diag.generic"
+            }
+        }
     }
+}
+
+/// Whether a failed worker call is worth an automatic retry: what the shared
+/// classifier calls transient (a rate limit, an overloaded base, a network blip
+/// or a gateway 502/503/504). An exhausted quota or a login failure is final.
+fn worker_failure_is_transient(err: &str) -> bool {
+    crate::base_error::is_transient(&crate::base_error::classify(None, None, Some(err)))
 }
 
 /// Read the exponential-retry base delay (ms) from
@@ -7596,6 +7614,68 @@ error TS2304: Cannot find name 'Foo'
         assert!(out.is_none(), "should give up after max_retries");
     }
 
+    /// Always fails with a fixed error and counts how often it was called.
+    struct CountingFailRuntime {
+        msg: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Runtime for CountingFailRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(RuntimeError::HostProcess(self.msg.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn try_generate_does_not_retry_exhausted_quota() {
+        // An exhausted plan does not clear in seconds, and a status code inside
+        // a request id is not a gateway error: neither is worth a retry that
+        // re-spawns the base CLI.
+        set_retry_base_ms_for_tests(1);
+        // A rate limit, an overloaded base and a gateway 5xx still earn the
+        // full three attempts.
+        for (msg, expected_calls) in [
+            (
+                "You exceeded your current quota, please check your plan and billing details.",
+                1,
+            ),
+            ("usage limit reached for this account", 1),
+            (
+                "unexpected response for request req_5031a7 from claude-3-haiku-20240307",
+                1,
+            ),
+            ("429 Too Many Requests", 3),
+            ("provider overloaded, try again later", 3),
+            ("HTTP 502 Bad Gateway", 3),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let runner = AgentRunner::new(
+                CountingFailRuntime {
+                    msg,
+                    calls: Arc::clone(&calls),
+                },
+                opts(tmp.path()),
+            );
+            runner.start().unwrap();
+            let p = crate::experts::research_prompt("demo", "req", "");
+            assert!(runner.try_generate(Phase::Research, p).await.is_none());
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_calls,
+                "{msg}"
+            );
+        }
+    }
+
     #[test]
     fn start_writes_initial_state() {
         let tmp = TempDir::new().unwrap();
@@ -8124,6 +8204,27 @@ error TS2304: Cannot find name 'Foo'
         ] {
             assert!(!umadev_i18n::tl(key).is_empty(), "{key} must be localized");
         }
+    }
+
+    #[test]
+    fn diagnose_ignores_status_digits_inside_ids() {
+        // A model name or request id that happens to contain 403 or 503 is not
+        // an auth failure or a gateway outage.
+        assert_ne!(
+            diagnose_failure("unexpected response from claude-3-haiku-20240307"),
+            "diag.not_logged_in"
+        );
+        assert_ne!(
+            diagnose_failure("request req_5031a7 returned an unexpected payload"),
+            "diag.network"
+        );
+        // The same codes as whole tokens still classify.
+        assert_eq!(diagnose_failure("http 403 forbidden"), "diag.not_logged_in");
+        assert_eq!(diagnose_failure("503 service unavailable"), "diag.network");
+        assert_eq!(
+            diagnose_failure("you exceeded your current quota"),
+            "diag.rate_limit"
+        );
     }
 
     #[tokio::test]
@@ -10086,6 +10187,44 @@ error TS2304: Cannot find name 'Foo'
             !worktree_unchanged("", "?? new.ts\n"),
             "going from clean to having a new file is a change"
         );
+    }
+
+    #[tokio::test]
+    async fn git_worktree_snapshot_sees_files_inside_untracked_dirs_and_re_edits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        git_init_repo(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let before = git_worktree_snapshot(root).await.unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
+        let after = git_worktree_snapshot(root).await.unwrap();
+        assert!(
+            !worktree_unchanged(&before, &after),
+            "a new file inside an already-untracked dir is a change"
+        );
+
+        std::fs::write(root.join("lib.rs"), "v1\n").unwrap();
+        for args in [vec!["add", "lib.rs"], vec!["commit", "-qm", "init"]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(&args)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(root.join("lib.rs"), "v2\n").unwrap();
+        let before = git_worktree_snapshot(root).await.unwrap();
+        std::fs::write(root.join("lib.rs"), "v3 edited again\n").unwrap();
+        let after = git_worktree_snapshot(root).await.unwrap();
+        assert!(
+            !worktree_unchanged(&before, &after),
+            "re-editing an already-dirty file is a change"
+        );
+        assert!(worktree_unchanged(
+            &after,
+            &git_worktree_snapshot(root).await.unwrap()
+        ));
     }
 
     #[tokio::test]

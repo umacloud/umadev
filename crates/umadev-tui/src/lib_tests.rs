@@ -93,7 +93,7 @@ fn live_queue_ui_clears_when_its_worker_registration_ends_without_a_keypress() {
         prompt_queue: umadev_runtime::PromptQueueCapability::ServerAuthoritativeVersioned,
         ..SessionCapabilities::default()
     };
-    let (_receiver, registration) = hub.register("grok-build", capabilities);
+    let registration = hub.register("grok-build", capabilities);
     let tmp = tempfile::TempDir::new().unwrap();
     let mut app = App::new(
         "queue-registration",
@@ -146,25 +146,25 @@ fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
 
     let codex = same_turn_capabilities();
     assert_eq!(codex.steer, SteerSemantics::SameTurn);
-    let (mut codex_rx, _codex_registration) = hub.register("codex", codex);
+    let mut codex_lane = hub.register("codex", codex);
     assert!(matches!(
         hub.dispatch(turn.clone()),
         LiveInputDispatch::EnqueuedSameTurn
     ));
     assert!(matches!(
-        codex_rx.try_recv().unwrap(),
+        codex_lane.receiver.try_recv().unwrap(),
         LiveInputRequest::Steer { turn: received } if received == turn
     ));
 
     let grok = safe_point_capabilities();
     assert_eq!(grok.steer, SteerSemantics::SameTurnOrImmediateNext);
-    let (mut grok_rx, _grok_registration) = hub.register("grok-build", grok);
+    let mut grok_lane = hub.register("grok-build", grok);
     assert!(matches!(
         hub.dispatch(turn.clone()),
         LiveInputDispatch::EnqueuedSafePointOrNext
     ));
     assert!(matches!(
-        grok_rx.try_recv().unwrap(),
+        grok_lane.receiver.try_recv().unwrap(),
         LiveInputRequest::Steer { turn: received } if received == turn
     ));
 }
@@ -172,7 +172,7 @@ fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
 #[test]
 fn live_same_turn_lane_backpressures_into_the_visible_fifo() {
     let hub = LiveInputHub::default();
-    let (_receiver, _registration) = hub.register("codex", same_turn_capabilities());
+    let _registration = hub.register("codex", same_turn_capabilities());
 
     for index in 0..LIVE_INPUT_CHANNEL_CAP {
         assert!(matches!(
@@ -199,7 +199,7 @@ fn live_same_turn_lane_backpressures_into_the_visible_fifo() {
 #[test]
 fn live_safe_point_lane_backpressures_without_claiming_same_turn() {
     let hub = LiveInputHub::default();
-    let (_receiver, _registration) = hub.register("grok-build", safe_point_capabilities());
+    let _registration = hub.register("grok-build", safe_point_capabilities());
 
     for index in 0..LIVE_INPUT_CHANNEL_CAP {
         assert!(matches!(
@@ -332,8 +332,10 @@ fn delivery_receipt_shows_actual_modes_sizes_and_mime_without_paths() {
     };
     let status = delivery_report_status(&report);
 
-    assert!(status.contains("Native"));
-    assert!(status.contains("MaterializedText"));
+    // The delivery labels are localized (e.g. 原生 / 转为文本 in zh-CN), and the
+    // UI language is process-wide, so compare against the active catalog.
+    assert!(status.contains(umadev_i18n::tl("input.delivery.native")));
+    assert!(status.contains(umadev_i18n::tl("input.delivery.materialized_text")));
     assert!(status.contains("2.0 KiB"));
     assert!(status.contains("1.0 MiB"));
     assert!(status.contains("image/png"));
@@ -418,50 +420,67 @@ fn live_trust_round_trips_and_publishes() {
 }
 
 #[test]
-fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
+fn a_resume_names_only_a_saved_tier_wider_than_the_session_that_trust_honours() {
+    use crate::run_options::saved_run_mode_wider_than;
     use umadev_agent::TrustMode;
     use umadev_runtime::BasePermissionProfile;
 
     let tmp = tempfile::TempDir::new().unwrap();
-    // A missing state means there is nothing to inherit: keep the user's
-    // current explicit choice rather than inventing a different tier.
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Plan),
-        TrustMode::Plan
-    );
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Auto),
-        TrustMode::Auto
-    );
-
-    // A saved Auto tier resumes only in a project the user trusts.
-    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
-    state.permission_profile = Some(BasePermissionProfile::Auto);
-    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Guarded),
-        TrustMode::Guarded
-    );
-    crate::app::workspace_trust::trust_for_test(tmp.path());
-
-    for (profile, expected) in [
-        (BasePermissionProfile::Plan, TrustMode::Plan),
-        (BasePermissionProfile::Auto, TrustMode::Auto),
-    ] {
+    let save = |profile| {
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
         state.permission_profile = Some(profile);
         umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
-        assert_eq!(persisted_run_mode(tmp.path(), TrustMode::Guarded), expected);
-    }
+    };
+    // Trust is per project: trusting another one keeps this test's state
+    // directory private without trusting this project.
+    let other = tempfile::TempDir::new().unwrap();
+    crate::app::workspace_trust::trust_for_test(other.path());
 
-    // A currently selected Plan mode is a non-widening ceiling even when the
-    // old workflow was created under Auto.
+    // Nothing saved: nothing to report.
+    assert_eq!(saved_run_mode_wider_than(tmp.path(), TrustMode::Plan), None);
+
+    // In a project the user does not trust, a saved Auto asks for no more
+    // than Guarded.
+    save(BasePermissionProfile::Auto);
     assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Plan),
-        TrustMode::Plan
+        saved_run_mode_wider_than(tmp.path(), TrustMode::Guarded),
+        None
+    );
+    assert_eq!(
+        saved_run_mode_wider_than(tmp.path(), TrustMode::Plan),
+        Some(TrustMode::Guarded)
     );
 
-    // A pre-profile workflow remains readable and resumes conservatively.
+    crate::app::workspace_trust::trust_for_test(tmp.path());
+    for (saved, current, wider) in [
+        (
+            BasePermissionProfile::Auto,
+            TrustMode::Guarded,
+            Some(TrustMode::Auto),
+        ),
+        (
+            BasePermissionProfile::Auto,
+            TrustMode::Plan,
+            Some(TrustMode::Auto),
+        ),
+        (
+            BasePermissionProfile::Guarded,
+            TrustMode::Plan,
+            Some(TrustMode::Guarded),
+        ),
+        (BasePermissionProfile::Guarded, TrustMode::Auto, None),
+        (BasePermissionProfile::Plan, TrustMode::Guarded, None),
+        (BasePermissionProfile::Auto, TrustMode::Auto, None),
+    ] {
+        save(saved);
+        assert_eq!(
+            saved_run_mode_wider_than(tmp.path(), current),
+            wider,
+            "{saved:?} resumed in {current:?}"
+        );
+    }
+
+    // A pre-profile workflow reads as Guarded, which never outranks Auto.
     let legacy = r#"{
             "phase": "frontend",
             "active_gate": "preview_confirm",
@@ -473,10 +492,58 @@ fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
             "spec_version": "UMADEV_HOST_SPEC_V1"
         }"#;
     std::fs::write(tmp.path().join(".umadev/workflow-state.json"), legacy).unwrap();
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Auto),
-        TrustMode::Guarded
+    assert_eq!(saved_run_mode_wider_than(tmp.path(), TrustMode::Auto), None);
+}
+
+#[test]
+fn a_resume_never_runs_with_more_authority_than_the_session_tier() {
+    use umadev_agent::TrustMode;
+    use umadev_runtime::BasePermissionProfile;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    crate::app::workspace_trust::trust_for_test(tmp.path());
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+    state.permission_profile = Some(BasePermissionProfile::Auto);
+    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
+    let mut app = App::new(
+        "resume-tier",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
     );
+    let launch = LaunchOptions {
+        project_root: tmp.path().to_path_buf(),
+        slug: "resume-tier".into(),
+        model: String::new(),
+    };
+    assert_eq!(
+        app.effective_trust_mode(),
+        TrustMode::Guarded,
+        "every session starts Guarded"
+    );
+
+    // The run saved in Auto continues in the session's Guarded, and the user
+    // is told how to give it its saved tier back.
+    let options = resume_run_options(&mut app, &launch);
+    assert_eq!(options.mode, TrustMode::Guarded);
+    assert_eq!(
+        base_permissions(options.mode),
+        BasePermissionProfile::Guarded
+    );
+    assert!(
+        app.transcript_plaintext().contains("/mode auto"),
+        "the user is told how to resume with the saved tier"
+    );
+
+    // A tier the user picks at the paused gate applies from that gate on.
+    app.trust_mode_override = Some(TrustMode::Auto);
+    let options = resume_run_options(&mut app, &launch);
+    assert_eq!(options.mode, TrustMode::Auto);
+    assert_eq!(base_permissions(options.mode), BasePermissionProfile::Auto);
+
+    // A currently selected Plan stays a ceiling for a run saved in Auto.
+    app.trust_mode_override = Some(TrustMode::Plan);
+    assert_eq!(resume_run_options(&mut app, &launch).mode, TrustMode::Plan);
 }
 
 #[test]
@@ -1076,6 +1143,36 @@ fn typed_host_questions_return_protocol_values_and_correlated_ids() {
 }
 
 #[test]
+fn secret_host_answers_keep_surrounding_whitespace() {
+    let umadev_runtime::HostRequest::UserInput { questions, .. } = secret_host_request() else {
+        unreachable!();
+    };
+    let response = parse_user_input_response(&questions, " p@ss word \n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, [" p@ss word "]);
+
+    let questions = vec![
+        umadev_runtime::HostQuestion {
+            id: "name".to_string(),
+            header: None,
+            prompt: "Name".to_string(),
+            kind: umadev_runtime::HostQuestionKind::Text,
+            required: true,
+            options: Vec::new(),
+        },
+        questions[0].clone(),
+    ];
+    let response = parse_user_input_response(&questions, "  alice  \r\n  s3cret \r\n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, ["alice"]);
+    assert_eq!(answers[1].values, ["  s3cret "]);
+}
+
+#[test]
 fn kimi_plan_review_picker_returns_exact_option_and_headless_paths_cancel() {
     let request = umadev_runtime::HostRequest::UserInput {
         questions: vec![umadev_runtime::HostQuestion {
@@ -1145,6 +1242,33 @@ fn mcp_elicitation_enforces_top_level_schema_without_losing_draft() {
             content: Some(_)
         }
     ));
+}
+
+#[test]
+fn mcp_string_elicitation_takes_json_looking_text_as_the_string() {
+    let request = umadev_runtime::HostRequest::McpElicitation {
+        server_name: Some("shipping".to_string()),
+        message: "Provide the ZIP code".to_string(),
+        requested_schema: serde_json::json!({"type":"string"}),
+        metadata: serde_json::Value::Null,
+    };
+    for (raw, expected) in [
+        ("94107", "94107"),
+        ("true", "true"),
+        ("null", "null"),
+        ("[1]", "[1]"),
+        ("plain text", "plain text"),
+        (r#""quoted""#, "quoted"),
+    ] {
+        assert_eq!(
+            parse_host_input_response(&request, raw).unwrap(),
+            umadev_runtime::HostResponse::McpElicitation {
+                action: umadev_runtime::HostElicitationAction::Accept,
+                content: Some(serde_json::Value::String(expected.to_string())),
+            },
+            "{raw}"
+        );
+    }
 }
 
 #[test]
@@ -4497,6 +4621,9 @@ fn init_git_repo() -> tempfile::TempDir {
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.t"]);
     run(&["config", "user.name", "t"]);
+    // The host commit lane refuses signed commits; keep a developer's global
+    // signing setting out of these fixtures.
+    run(&["config", "commit.gpgSign", "false"]);
     tmp
 }
 
@@ -4846,6 +4973,26 @@ fn url_host_port_extracts_127_0_0_1_3000() {
 }
 
 #[test]
+fn url_host_port_defaults_port_and_strips_path_query_fragment() {
+    for (url, expected) in [
+        ("http://localhost/", "localhost:80"),
+        ("http://localhost", "localhost:80"),
+        ("https://example.com/app", "example.com:443"),
+        ("http://h:5173?x=1", "h:5173"),
+        ("http://h:5173#top", "h:5173"),
+        ("http://h?x=1", "h:80"),
+        ("http://[::1]:5173/", "[::1]:5173"),
+        ("https://[::1]", "[::1]:443"),
+        ("http://user@h:5173/", "h:5173"),
+    ] {
+        assert_eq!(url_host_port(url), Some(expected.into()), "{url}");
+    }
+    assert_eq!(url_host_port("http://"), None);
+    assert_eq!(url_host_port("http://h:/"), None);
+    assert_eq!(url_host_port("http://h:abc/"), None);
+}
+
+#[test]
 fn url_host_port_none_for_garbage() {
     assert_eq!(url_host_port("not a url"), None);
     assert_eq!(url_host_port("ftp://example.com"), None);
@@ -4883,6 +5030,37 @@ fn parse_run_command_cd_form() {
     exp_args.extend(["run".to_string(), "dev".into()]);
     assert_eq!(prog, exp_prog);
     assert_eq!(args, exp_args);
+}
+
+#[test]
+fn parse_run_command_cd_form_shells_out_for_chains_and_env_assignments() {
+    // Only the leading `cd` is peeled off; on Unix anything that needs a shell
+    // (a further `&&` chain, an env assignment, quotes, redirects) runs via
+    // `sh -c` in the `cd` directory instead of becoming argv. Windows never
+    // hands a run to `cmd /c`, so it spawns the resolved program directly.
+    let root = std::path::PathBuf::from("/proj");
+    for (command, rest) in [
+        (
+            "cd web && npm install && npm run dev",
+            "npm install && npm run dev",
+        ),
+        ("cd web && PORT=3000 npm run dev", "PORT=3000 npm run dev"),
+        (
+            "cd web && npm run dev -- --host \"0.0.0.0\"",
+            "npm run dev -- --host \"0.0.0.0\"",
+        ),
+        ("cd web && npm run dev > dev.log", "npm run dev > dev.log"),
+    ] {
+        let (dir, prog, args) = parse_run_command(command, &root);
+        assert_eq!(dir, std::path::PathBuf::from("/proj/web"), "{command}");
+        assert_ne!(prog, "cmd", "{command}");
+        if cfg!(windows) {
+            assert_eq!((prog, args), expected_root_run(rest), "{command}");
+        } else {
+            assert_eq!(prog, "sh", "{command}");
+            assert_eq!(args, vec!["-c".to_string(), rest.into()], "{command}");
+        }
+    }
 }
 
 #[test]
@@ -9381,7 +9559,16 @@ async fn drive_resident_readonly_turn(
 fn ran_governance_qc(events: &[EngineEvent]) -> bool {
     events
         .iter()
-        .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("构建执行已结束，尚未验收")))
+        .any(|e| matches!(e, EngineEvent::Note(n) if is_post_build_qc_note(n)))
+}
+
+/// Whether `note` is the post-build QC start note. The note is localized and
+/// the UI language follows the machine's locale (English on macOS and Windows CI
+/// runners), so match the catalog text in every language.
+fn is_post_build_qc_note(note: &str) -> bool {
+    umadev_i18n::Lang::ALL
+        .iter()
+        .any(|&lang| note.contains(umadev_i18n::t(lang, "team.post_build_qc_started")))
 }
 
 /// True if a BUILD-shaped intent card was emitted (`react_to_first_write` promoted
@@ -11667,3 +11854,9 @@ async fn interactive_askuserquestion_parks_and_waits_same_session() {
 
 #[path = "tests/resident_chat_terminal_tests.rs"]
 mod resident_chat_terminal_tests;
+
+#[path = "tests/director_resume_tests.rs"]
+mod director_resume_tests;
+
+#[path = "tests/runtime_glue_tests.rs"]
+mod runtime_glue_tests;

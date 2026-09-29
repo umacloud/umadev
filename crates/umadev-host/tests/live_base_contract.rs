@@ -142,7 +142,23 @@ async fn run_read_only_turn(session: &mut dyn BaseSession, token: &str) -> Strin
     .await
 }
 
-async fn run_full_access_turn(session: &mut dyn BaseSession, token: &str) {
+/// The one approval a Claude Auto session may ask for in the full-access probe:
+/// Claude asks UmaDev before every tool outside its read-only allowlist, and
+/// UmaDev's floor allows these reversible in-workspace steps without a prompt.
+fn claude_auto_step_is_reversible(workspace: &Path, action: &str, target: &str) -> bool {
+    match action {
+        "Write" | "Edit" | "MultiEdit" => Path::new(target).starts_with(workspace),
+        "Bash" => target.contains("cargo") && !target.contains("publish"),
+        _ => false,
+    }
+}
+
+async fn run_full_access_turn(
+    session: &mut dyn BaseSession,
+    backend: &str,
+    workspace: &Path,
+    token: &str,
+) {
     session
         .send_turn(format!(
             "Perform this isolated development acceptance task using real tools. First create `write-probe.txt` with exactly `{token}` and one trailing newline. Then run exactly `cargo run --quiet --manifest-path port-probe/Cargo.toml`. The supplied Rust program binds an ephemeral 127.0.0.1 port, connects to it, and writes `port-probe.ok` only after the round trip succeeds. Do not modify any other source file. Finish with a brief confirmation."
@@ -169,8 +185,20 @@ async fn run_full_access_turn(session: &mut dyn BaseSession, token: &str) {
                 }
                 tool_evidence.push(format!("{name}: {input}"));
             }
-            SessionEvent::NeedApproval { action, target, .. } => {
-                panic!("Auto profile unexpectedly requested approval for {action}: {target}");
+            SessionEvent::NeedApproval {
+                req_id,
+                action,
+                target,
+            } => {
+                assert!(
+                    backend == "claude-code"
+                        && claude_auto_step_is_reversible(workspace, &action, &target),
+                    "Auto profile unexpectedly requested approval for {action}: {target}"
+                );
+                session
+                    .respond(&req_id, ApprovalDecision::Allow)
+                    .await
+                    .expect("allow a reversible Auto step");
             }
             SessionEvent::HostRequest { request, .. } => {
                 panic!("Auto profile unexpectedly requested host input: {request:?}");
@@ -303,7 +331,7 @@ fn main() {{
     .expect("full-access base did not finish opening in time")
     .unwrap_or_else(|error| panic!("failed to open Auto `{backend}` session: {error}"));
 
-    run_full_access_turn(session.as_mut(), &token).await;
+    run_full_access_turn(session.as_mut(), &backend, workspace.path(), &token).await;
     session.end().await.expect("close live full-access session");
 
     assert_eq!(
@@ -411,6 +439,84 @@ async fn installed_base_resumes_native_context_without_writing() {
         std::fs::read_to_string(workspace.path().join("sentinel.txt"))
             .expect("read resume sentinel"),
         "resume sentinel\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "makes a real Claude model call and writes one file in a tempdir"]
+async fn installed_claude_guarded_write_raises_need_approval() {
+    if selected_backend() != "claude-code" {
+        eprintln!("skipped: this vendor-private acceptance check requires claude-code");
+        return;
+    }
+    let workspace = TempDir::new().expect("create isolated Guarded workspace");
+    let target = workspace.path().join("approval-probe.txt");
+    let token = format!("UMADEV_GUARDED_WRITE_{}", std::process::id());
+
+    let mut session = timeout(
+        OPEN_TIMEOUT,
+        umadev_host::session_for_with_policy(
+            "claude-code",
+            workspace.path(),
+            "",
+            BasePermissionProfile::Guarded,
+            Some("Operate only inside the supplied isolated acceptance workspace."),
+            SessionOpenPolicy::NonInteractive,
+        ),
+    )
+    .await
+    .expect("Guarded Claude session did not finish opening in time")
+    .unwrap_or_else(|error| panic!("failed to open Guarded claude-code session: {error}"));
+    session
+        .send_turn(format!(
+            "Use the Write tool once to create `{}` containing exactly `{token}`. Do not run any other tool. Finish with a brief confirmation.",
+            target.display()
+        ))
+        .await
+        .expect("send Guarded write turn");
+
+    let deadline = Instant::now() + TURN_TIMEOUT;
+    let mut approved = Vec::new();
+    loop {
+        let event = timeout_at(deadline, session.next_event())
+            .await
+            .expect("Guarded write turn exceeded its acceptance deadline")
+            .expect("Guarded session ended before TurnDone");
+        match event {
+            SessionEvent::NeedApproval { req_id, action, .. } => {
+                assert!(
+                    !target.exists(),
+                    "Claude wrote before UmaDev answered its `{action}` request"
+                );
+                approved.push(action);
+                session
+                    .respond(&req_id, ApprovalDecision::Allow)
+                    .await
+                    .expect("allow the Guarded write");
+            }
+            SessionEvent::HostRequest { req_id, request } => session
+                .respond_host(
+                    &req_id,
+                    request.safe_rejection("the Guarded write probe answers only approvals"),
+                )
+                .await
+                .expect("reject unexpected host request"),
+            SessionEvent::TurnDone { status, .. } => {
+                assert_eq!(status, TurnStatus::Completed, "Guarded write turn failed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    session.end().await.expect("close Guarded session");
+
+    assert!(
+        approved.iter().any(|action| action == "Write"),
+        "a Guarded write never asked UmaDev: {approved:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the approved write did not land"),
+        token
     );
 }
 

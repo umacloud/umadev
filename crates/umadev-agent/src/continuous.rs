@@ -962,11 +962,11 @@ async fn drive_phase(
         // the absolute cap; a streaming turn keeps `eff` ahead.
         let eff = crate::director_loop::sliding_deadline(deadline, last_progress, idle_window);
         if std::time::Instant::now() >= eff {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
+            // An interrupt that did not settle closes the session, so the next turn
+            // fails to send instead of reading this turn's late end as its own.
+            let bound =
+                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS);
+            crate::turn_interrupt::interrupt_or_close(session, bound).await;
             events.emit(EngineEvent::Note(
                 "team · run budget reached mid-turn — interrupted the base and finalizing \
                  on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
@@ -1796,7 +1796,7 @@ pub(crate) fn quality_floor(options: &RunOptions) -> (String, String) {
 /// the mismatch details (a fetch URL with no matching backend route). Reuses
 /// `umadev_contract` exactly like the single-shot quality gate. Fail-open: an
 /// unreadable architecture doc → empty contract → no drift.
-fn frontend_contract_drift(options: &RunOptions, slug: &str) -> Vec<String> {
+pub(crate) fn frontend_contract_drift(options: &RunOptions, slug: &str) -> Vec<String> {
     let arch_path = options
         .project_root
         .join("output")
@@ -2385,6 +2385,9 @@ async fn run_review_team_with_establish_budget(
         }
         return result;
     }
+    // A reduced (declared-sample) payload is still reviewed; say so where the user
+    // is watching, so a pass is never read as a full review of every change.
+    emit_reduced_review_note(events, kind, arts.coverage);
 
     // Fork one read-only session per seat up front. `fork()` takes `&mut self`, so
     // the N establishments are necessarily SERIAL (you can't hold N `&mut` borrows
@@ -2506,6 +2509,35 @@ async fn run_review_team_with_establish_budget(
         }
     }
     result
+}
+
+/// Surface a reduced review scope (see [`ReviewPayloadCoverage::is_reduced`]):
+/// how many required changed files were reviewed whole, and whether the changed
+/// set itself could not be read. Silent for a full-scope review.
+fn emit_reduced_review_note(
+    events: &Arc<dyn EventSink>,
+    kind: ReviewKind,
+    coverage: ReviewPayloadCoverage,
+) {
+    if coverage.reduced_reason().is_none() {
+        return;
+    }
+    if coverage.represented_focus_files < coverage.required_focus_files {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.team.review_reduced_files",
+            &[
+                kind_label(kind),
+                &coverage.represented_focus_files.to_string(),
+                &coverage.required_focus_files.to_string(),
+            ],
+        )));
+    }
+    if coverage.discovery_incomplete {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.team.review_reduced_scope",
+            &[kind_label(kind)],
+        )));
+    }
 }
 
 struct ReviewEstablishBudget {
@@ -2927,11 +2959,11 @@ async fn drive_rework_turn_with_idle_and_memories(
         // turn keeps `eff` ahead, so only a stalled turn or the absolute cap settles.
         let eff = crate::director_loop::sliding_deadline(deadline, last_progress, idle_window);
         if std::time::Instant::now() >= eff {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
+            // An interrupt that did not settle closes the session, so the next turn
+            // fails to send instead of reading this turn's late end as its own.
+            let bound =
+                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS);
+            crate::turn_interrupt::interrupt_or_close(session, bound).await;
             crate::director_loop::record_estimated_usage(&options.backend, est_tokens);
             events.emit(EngineEvent::Note(
                 "team · run budget reached mid-turn — interrupted the base and finalizing \
@@ -3420,6 +3452,10 @@ fn source_digest(options: &RunOptions, kind: ReviewKind) -> SourceDigest {
     source_digest_with_stats(options, kind)
 }
 
+/// A file represented in the review bundle: its path, the sampled `(chars, bytes)`
+/// when it is not included whole, and whether it is a required focus file.
+type IncludedFile = (String, Option<(usize, u64)>, bool);
+
 /// Build the bounded review bundle. Tests also observe the exact source bytes read
 /// so the I/O ceiling remains mechanically enforceable.
 fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDigest {
@@ -3452,16 +3488,18 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         .filter(|required| !files.iter().any(|file| &file.rel == *required))
         .cloned()
         .collect::<Vec<_>>();
-    // Only files that actually exist can require byte-for-byte representation.
-    // A missing plan path or an intentional deletion is a semantic fact, not an
-    // operational reviewer outage: carry both as explicit tombstones below so
-    // the reviewer can judge them without routing the run into the outage
-    // circuit (which deliberately never starts a source-repair turn).
+    // Only files that actually exist can be represented. A missing plan path or an
+    // intentional deletion is a semantic fact, not an operational reviewer outage:
+    // carry both as explicit tombstones below so the reviewer can judge them
+    // without routing the run into the outage circuit (which deliberately never
+    // starts a source-repair turn). Likewise a required file too large to fit whole
+    // is a declared bounded sample that marks the scope reduced, never an outage.
     let required_focus_files = mandatory.len();
+    let mandatory_shares = mandatory_char_shares(&files, &mandatory, CONTENT_CHARS * 3 / 4);
     let mut order = sampling_focus.clone();
     order.extend((0..files.len()).filter(|index| !sampling_focus.contains(index)));
-    let mut included: Vec<(String, Option<(usize, u64)>)> = Vec::new();
-    let mut omitted = Vec::new();
+    let mut included: Vec<IncludedFile> = Vec::new();
+    let mut omitted: Vec<(String, &str, bool)> = Vec::new();
     let mut sections = String::new();
     let mut used = 0usize;
     let mut bytes_read = 0usize;
@@ -3477,11 +3515,11 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         let framing_chars = header.chars().count() + 1;
         let remaining_chars = CONTENT_CHARS.saturating_sub(used);
         if framing_chars >= remaining_chars {
-            omitted.push((rel, "sampled out; bundle budget exhausted"));
+            omitted.push((rel, "sampled out; bundle budget exhausted", is_mandatory));
             continue;
         }
         let focus_file_chars = if is_mandatory {
-            ((CONTENT_CHARS * 3 / 4) / mandatory.len().max(1)).max(96)
+            mandatory_shares[index]
         } else {
             REVIEW_BUNDLE_FILE_CHARS
         };
@@ -3493,14 +3531,14 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         let remaining_read_budget = REVIEW_BUNDLE_MAX_READ_BYTES.saturating_sub(bytes_read);
         let read_limit = candidate_byte_budget.min(remaining_read_budget);
         if read_limit == 0 {
-            omitted.push((rel, "sampled out; read budget exhausted"));
+            omitted.push((rel, "sampled out; read budget exhausted", is_mandatory));
             continue;
         }
 
         let Ok((bytes, observed_len)) =
             crate::bounded_fs::read_prefix_beneath(&options.project_root, &file.path, read_limit)
         else {
-            omitted.push((rel, "unreadable"));
+            omitted.push((rel, "unreadable", is_mandatory));
             continue;
         };
         bytes_read = bytes_read.saturating_add(bytes.len());
@@ -3521,7 +3559,7 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
                 )
             }
             Err(_) => {
-                omitted.push((rel, "unreadable text"));
+                omitted.push((rel, "unreadable text", is_mandatory));
                 continue;
             }
         };
@@ -3532,7 +3570,7 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         let sample_char_budget = content_char_budget.saturating_sub(marker_chars);
         let selected = content.chars().take(sample_char_budget).collect::<String>();
         if selected.is_empty() {
-            omitted.push((rel, "sampled out; no text fit in bundle"));
+            omitted.push((rel, "sampled out; no text fit in bundle", is_mandatory));
             continue;
         }
         let selected_chars = selected.chars().count();
@@ -3551,36 +3589,45 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         sections.push('\n');
         // A required source counts as represented only when its complete
         // contents fit. A prefix proves the file exists, but cannot prove the
-        // changed hunk in its unseen tail was reviewed.
+        // changed hunk in its unseen tail was reviewed — the manifest declares it
+        // as a required sample and the coverage record says `reduced`.
         if is_mandatory && !sampled {
             represented_focus_files += 1;
         }
-        included.push((rel, sampled.then_some((selected_chars, observed_len))));
+        included.push((
+            rel,
+            sampled.then_some((selected_chars, observed_len)),
+            is_mandatory,
+        ));
     }
 
+    let discovery_incomplete = scan.incomplete || plan_scope.change_scope_unavailable.is_some();
+    // The coverage record never claims a full review of a partial payload: any
+    // required file sent as a sample/omission, or an unknown change scope, is
+    // `reduced` — disclosed here and in `ReviewPayloadCoverage::is_reduced`.
+    let reduced = discovery_incomplete || represented_focus_files < required_focus_files;
     let mut manifest = format!(
         "# Review bundle manifest\nsampling: requirement-and-review-priority; bounded-prefixes\n\
          scope: bounded sample, not full-workspace coverage\ndiscovery-complete: {}\nchange-scope: {}\ndiscovered: {}\nrepresented: {}\n\
-         required-focus: {}\nrepresented-focus: {}\nomitted: {}\nsensitive-omitted: {}\ndeleted-changes: {}\n",
-        if scan.incomplete || plan_scope.change_scope_unavailable.is_some() {
-            "no"
-        } else {
-            "yes"
-        },
+         required-focus: {}\nrepresented-focus: {}\ncoverage: {}\nomitted: {}\nsensitive-omitted: {}\ndeleted-changes: {}\n",
+        if discovery_incomplete { "no" } else { "yes" },
         plan_scope.change_scope_unavailable.as_deref().unwrap_or("available"),
         files.len(),
         included.len(),
         required_focus_files,
         represented_focus_files,
+        if reduced { "reduced" } else { "complete" },
         omitted.len(),
         scan.sensitive_omitted,
         plan_scope.deleted_changed.len()
     );
-    for (path, sample) in &included {
+    let required_tag = |required: bool| if required { "; required" } else { "" };
+    for (path, sample, required) in &included {
         let line = match sample {
-            Some((chars, bytes)) => {
-                format!("~ {path} (prefix {chars} chars sampled from {bytes} bytes)\n")
-            }
+            Some((chars, bytes)) => format!(
+                "~ {path} (prefix {chars} chars sampled from {bytes} bytes{})\n",
+                required_tag(*required)
+            ),
             None => format!("+ {path}\n"),
         };
         if manifest.chars().count() + line.chars().count() > MANIFEST_CHARS {
@@ -3588,8 +3635,8 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         }
         manifest.push_str(&line);
     }
-    for (path, reason) in &omitted {
-        let line = format!("- {path} ({reason})\n");
+    for (path, reason, required) in &omitted {
+        let line = format!("- {path} ({reason}{})\n", required_tag(*required));
         if manifest.chars().count() + line.chars().count() > MANIFEST_CHARS {
             let remaining = omitted.len().saturating_sub(
                 manifest
@@ -3620,6 +3667,12 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         "Omitted files were not reviewed by the model. Judge only represented source; \
          deterministic floors separately inspect their own bounded workspace surfaces.\n",
     );
+    if reduced {
+        manifest.push_str(
+            "Coverage is reduced: the unseen remainder of a `~` file and every `-` file were \
+             not supplied, so never report them as missing or broken; note the limit in advisory.\n",
+        );
+    }
     SourceDigest {
         bundle: format!("{manifest}{sections}"),
         #[cfg(test)]
@@ -3629,8 +3682,39 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
         represented_files: included.len(),
         required_focus_files,
         represented_focus_files,
-        discovery_incomplete: scan.incomplete || plan_scope.change_scope_unavailable.is_some(),
+        discovery_incomplete,
     }
+}
+
+/// Split the required-file character `budget` by need ("water-filling"). Required
+/// files are served smallest-first, each taking the lesser of its own size and an
+/// equal share of what is still unspent, so a small changed file never strands
+/// budget a larger one needs to fit whole. Every required file keeps the floor
+/// that makes it visibly represented. Returns one share per `files` index.
+fn mandatory_char_shares(files: &[RankedSource], mandatory: &[usize], budget: usize) -> Vec<usize> {
+    const FLOOR_CHARS: usize = 96;
+    // The byte length bounds the character count from above, so a file whose
+    // share covers its size is always represented whole.
+    let mut by_need = mandatory
+        .iter()
+        .map(|&index| {
+            let size = std::fs::symlink_metadata(&files[index].path).map_or(usize::MAX, |meta| {
+                usize::try_from(meta.len()).unwrap_or(usize::MAX)
+            });
+            (size, index)
+        })
+        .collect::<Vec<_>>();
+    by_need.sort_unstable();
+    let mut shares = vec![0; files.len()];
+    let mut remaining = budget;
+    let mut left = by_need.len();
+    for (need, index) in by_need {
+        let share = need.min(remaining / left).max(FLOOR_CHARS);
+        shares[index] = share;
+        remaining = remaining.saturating_sub(share);
+        left -= 1;
+    }
+    shares
 }
 
 fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
@@ -3776,6 +3860,19 @@ fn is_review_source_path(path: &std::path::Path) -> bool {
         .unwrap_or("");
     if matches!(name, "Dockerfile" | "Makefile" | "Procfile") {
         return true;
+    }
+    // Package-manager lockfiles are generated machine output (UmaDev's own verify
+    // runs `npm install`), not reviewable intent: a changed lockfile must never join
+    // the required review set or spend the bundle budget the product source needs.
+    if matches!(
+        name,
+        "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "packages.lock.json"
+            | ".terraform.lock.hcl"
+    ) {
+        return false;
     }
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -4746,6 +4843,11 @@ mod tests {
         /// Count of `interrupt()` calls — a test asserts the idle watchdog issued
         /// its best-effort interrupt before settling.
         interrupts: Arc<Mutex<usize>>,
+        /// When true, `interrupt()` reports the turn as still running
+        /// (`InterruptPending`), as a real driver does when the turn did not end.
+        interrupt_pending: bool,
+        /// Count of `end()` calls.
+        ends: Arc<Mutex<usize>>,
         realtime_governance: bool,
     }
 
@@ -4764,6 +4866,8 @@ mod tests {
                 next_event_hangs: false,
                 active_forever: false,
                 interrupts: Arc::new(Mutex::new(0)),
+                interrupt_pending: false,
+                ends: Arc::new(Mutex::new(0)),
                 realtime_governance: false,
             }
         }
@@ -4796,6 +4900,14 @@ mod tests {
         }
         fn interrupts_handle(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.interrupts)
+        }
+        /// Every interrupt leaves the turn running (`InterruptPending`).
+        fn with_unsettled_interrupt(mut self) -> Self {
+            self.interrupt_pending = true;
+            self
+        }
+        fn ends_handle(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.ends)
         }
         /// A session whose every `fork()` hangs forever (a wedged fork handshake).
         fn fork_wedged() -> Self {
@@ -4929,9 +5041,15 @@ mod tests {
         }
         async fn interrupt(&mut self) -> Result<(), SessionError> {
             *self.interrupts.lock().unwrap() += 1;
+            if self.interrupt_pending {
+                return Err(SessionError::InterruptPending(
+                    "the turn has not ended".into(),
+                ));
+            }
             Ok(())
         }
         async fn end(&mut self) -> Result<(), SessionError> {
+            *self.ends.lock().unwrap() += 1;
             Ok(())
         }
     }
@@ -7629,9 +7747,243 @@ mod tests {
             !bundle.contains("changed-after-900-chars"),
             "the test must actually exercise a change beyond the represented prefix"
         );
+        // S02-1: the shortfall is a deterministic host budget, not a reviewer
+        // outage. The review still runs, but the coverage record and the manifest
+        // the critics read both say it was reduced and which file was sampled.
         assert!(
-            !blackboard.coverage.is_reviewable(),
-            "a mandatory changed source whose unseen tail contains the change must fail closed"
+            blackboard.coverage.is_reviewable() && blackboard.coverage.is_reduced(),
+            "a sampled required source is a disclosed reduced review, never an outage: {:?}",
+            blackboard.coverage
+        );
+        assert!(
+            bundle.contains("coverage: reduced")
+                && bundle.contains("bytes; required)")
+                && bundle.contains("never report them as missing or broken"),
+            "the critics are told exactly which required file was sampled: {bundle}"
+        );
+        assert!(blackboard
+            .coverage
+            .reduced_reason()
+            .is_some_and(|reason| reason.contains("0 of 1 required")));
+    }
+
+    /// The files a base writes for a small Vite + React todo app, plus the 20 KB
+    /// `package-lock.json` UmaDev's own `npm install` verify step creates.
+    fn write_vite_react_greenfield(root: &Path) {
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{
+  "name": "todo-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": { "react": "^18.3.1", "react-dom": "^18.3.1" },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.3",
+    "vite": "^5.4.1",
+    "vitest": "^2.0.5"
+  }
+}
+"#,
+        )
+        .unwrap();
+        let mut lock = String::from(
+            "{\n  \"name\": \"todo-app\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n",
+        );
+        let mut index = 0usize;
+        while lock.len() < 20 * 1024 {
+            lock.push_str(&format!(
+                "    \"node_modules/dep-{index}\": {{ \"version\": \"1.{index}.0\", \"resolved\": \"https://registry.npmjs.org/dep-{index}/-/dep-{index}-1.{index}.0.tgz\", \"integrity\": \"sha512-{index:0>40}\" }},\n"
+            ));
+            index += 1;
+        }
+        lock.push_str("    \"\": {}\n  }\n}\n");
+        std::fs::write(root.join("package-lock.json"), lock).unwrap();
+        let mut app = String::from(
+            "import { useState } from 'react';\nimport './index.css';\n\n\
+             type Todo = { id: number; title: string; done: boolean };\n\n\
+             export default function App() {\n  const [todos, setTodos] = useState<Todo[]>([]);\n  \
+             const [draft, setDraft] = useState('');\n\n",
+        );
+        for handler in ["add", "toggle", "remove", "rename", "clear", "restore"] {
+            app.push_str(&format!(
+                "  function {handler}Todo(id: number) {{\n    setTodos((current) =>\n      \
+                 current.map((todo) => (todo.id === id ? {{ ...todo, done: !todo.done }} : todo)),\n    \
+                 );\n    // {handler}: keep the list ordered and persist the draft state.\n    \
+                 setDraft((value) => value.trim());\n  }}\n\n"
+            ));
+        }
+        while app.len() < 3_400 {
+            app.push_str("  // render helpers keep the list accessible and keyboard friendly\n");
+        }
+        app.push_str(
+            "  return (\n    <main className=\"todo\">\n      <h1>Todos</h1>\n      \
+             <input value={draft} onChange={(e) => setDraft(e.target.value)} />\n      \
+             <ul>{todos.map((todo) => <li key={todo.id}>{todo.title}</li>)}</ul>\n    \
+             </main>\n  );\n}\n",
+        );
+        std::fs::write(root.join("src/App.tsx"), app).unwrap();
+        std::fs::write(
+            root.join("src/main.tsx"),
+            "import { StrictMode } from 'react';\nimport { createRoot } from 'react-dom/client';\n\
+             import App from './App';\n\ncreateRoot(document.getElementById('root')!).render(\n  \
+             <StrictMode>\n    <App />\n  </StrictMode>,\n);\n",
+        )
+        .unwrap();
+        let mut css = String::from(
+            ":root {\n  --color-bg: oklch(98% 0.01 90);\n  --color-on-bg: oklch(22% 0.02 90);\n  \
+             --color-primary: oklch(55% 0.12 160);\n  --color-on-primary: oklch(98% 0.01 160);\n  \
+             --font-sans: system-ui, sans-serif;\n}\n\n",
+        );
+        for rule in [
+            "body",
+            ".todo",
+            ".todo h1",
+            ".todo input",
+            ".todo ul",
+            ".todo li",
+        ] {
+            css.push_str(&format!(
+                "{rule} {{\n  color: var(--color-on-bg);\n  font-family: var(--font-sans);\n  \
+                 margin: 0 auto;\n  padding: 8px 12px;\n}}\n\n"
+            ));
+        }
+        std::fs::write(root.join("src/index.css"), css).unwrap();
+        std::fs::write(
+            root.join("index.html"),
+            "<!doctype html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    \
+             <title>Todos</title>\n  </head>\n  <body>\n    <div id=\"root\"></div>\n    \
+             <script type=\"module\" src=\"/src/main.tsx\"></script>\n  </body>\n</html>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vite.config.ts"),
+            "import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\n\n\
+             export default defineConfig({ plugins: [react()] });\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn quality_review_payload_is_reviewable_for_a_typical_greenfield_change() {
+        // S02-1: the default `/run` records its run baseline in the EMPTY workspace
+        // BEFORE the base writes anything, so every file of a greenfield build is a
+        // run-changed (mandatory) review source — plus the lockfile UmaDev's own
+        // `npm install` verify creates. A fixed host character budget must never
+        // turn that into a reviewer outage: the team must actually review it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        if crate::checkpoint::create_run_baseline(root, "greenfield").is_none() {
+            return; // no `git`: the baseline-less path has its own reduced-scope test
+        }
+        write_vite_react_greenfield(root);
+        let options = raw_opts(root, "做一个待办事项应用", TrustMode::Auto);
+
+        let blackboard = Blackboard::read(&options, ReviewKind::Quality);
+        assert!(
+            blackboard.coverage.is_reviewable(),
+            "a typical greenfield change must be reviewable: {:?}\n{}",
+            blackboard.coverage.unavailable_reason(),
+            blackboard.code
+        );
+        assert!(
+            blackboard.code.contains("+ src/App.tsx"),
+            "a 3.5 KB component of a small change fits the bundle whole: {}",
+            blackboard.code
+        );
+        assert!(
+            !blackboard.code.contains("package-lock.json"),
+            "a generated lockfile is neither required nor spends the source budget: {}",
+            blackboard.code
+        );
+        assert!(
+            !blackboard.coverage.is_reduced() && blackboard.code.contains("coverage: complete"),
+            "every changed product file of a small build is reviewed whole: {:?}",
+            blackboard.coverage
+        );
+
+        let team: Vec<Box<dyn RoleCritic>> = vec![
+            Box::new(crate::critics::QaCritic),
+            Box::new(crate::critics::SecurityCritic),
+            Box::new(crate::critics::FrontendCritic),
+        ];
+        // An empty fork script hands every seat an accepting verdict.
+        let mut session = FakeBaseSession::new(vec![]);
+        let forks = session.forks_handle();
+        let (events, _rec) = sink();
+        let review = run_review_team(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+        )
+        .await;
+        assert_eq!(review.status(), ReviewStatus::Pass, "{review:?}");
+        assert_eq!(
+            *forks.lock().unwrap(),
+            team.len(),
+            "every seat actually reviewed the change on its own fork"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_without_a_run_baseline_is_a_disclosed_reduced_sample() {
+        // S02-1: no run baseline (e.g. `git` is missing) means the host cannot list
+        // what this run changed. That is a deterministic host limit, so the team
+        // still reviews a declared priority sample instead of pausing the run for
+        // a `/continue` that would rebuild the identical payload.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "pub fn app() -> bool { true }\n").unwrap();
+        let options = raw_opts(root, "build an API", TrustMode::Auto);
+
+        let blackboard = Blackboard::read(&options, ReviewKind::Quality);
+        assert!(blackboard.coverage.is_reviewable());
+        assert!(blackboard.coverage.is_reduced());
+        assert!(
+            blackboard.code.contains("change-scope: unavailable")
+                && blackboard.code.contains("coverage: reduced"),
+            "{}",
+            blackboard.code
+        );
+
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![]);
+        let forks = session.forks_handle();
+        let (events, rec) = sink();
+        let review = run_review_team(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+        )
+        .await;
+        assert_eq!(review.status(), ReviewStatus::Pass, "{review:?}");
+        assert_eq!(*forks.lock().unwrap(), 1, "the seat really reviewed");
+        let reduced_note = umadev_i18n::tlf(
+            "continuous.team.review_reduced_scope",
+            &[kind_label(ReviewKind::Quality)],
+        );
+        assert!(
+            rec.events()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Note(note) if *note == reduced_note)),
+            "the reduced scope is surfaced to the user"
         );
     }
 
@@ -8771,6 +9123,94 @@ mod tests {
             .memory_receipt
             .expect("sent memory receipt")
             .settle(crate::knowledge_feedback::TurnOutcome::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_budget_settle_closes_a_session_whose_interrupt_does_not_settle() {
+        // The interrupted turn could still end later, and the next phase or rework
+        // turn on this session would read that end as its own. Closed, that next
+        // turn fails to send instead. The settle itself stays graceful.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let past_deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let idle = crate::director_loop::IdleBudget::new(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        );
+
+        let mut phase_session = FakeBaseSession::active_forever().with_unsettled_interrupt();
+        let phase_ends = phase_session.ends_handle();
+        let phase = drive_phase(
+            &mut phase_session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            idle,
+            past_deadline,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(phase, PhaseResult::Done), "{phase:?}");
+        assert_eq!(
+            *phase_ends.lock().unwrap(),
+            1,
+            "the phase session is closed"
+        );
+
+        let mut rework_session = FakeBaseSession::active_forever().with_unsettled_interrupt();
+        let rework_ends = rework_session.ends_handle();
+        let turn = drive_rework_turn_with_idle(
+            &mut rework_session,
+            &options,
+            &events,
+            "build it".to_string(),
+            idle,
+            past_deadline,
+        )
+        .await;
+        assert!(turn.done);
+        assert_eq!(
+            *rework_ends.lock().unwrap(),
+            1,
+            "the rework session is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_phase_idle_watchdog_closes_a_session_whose_interrupt_does_not_settle() {
+        // The hung turn could still end later and end the next phase's turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::hanging().with_unsettled_interrupt();
+        let ends = session.ends_handle();
+        let result = drive_phase(
+            &mut session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(80),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(
+            matches!(&result, PhaseResult::Failed(reason) if reason.contains("UMADEV_IDLE_TIMEOUT_SECS")),
+            "a hung base still settles as an idle failure: {result:?}"
+        );
+        assert_eq!(*ends.lock().unwrap(), 1, "the unsettled session is closed");
     }
 
     #[tokio::test]

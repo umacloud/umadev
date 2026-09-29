@@ -105,7 +105,8 @@ trusted_manifest() {
         fileCount: 5,
         signatures: [{ keyid: "test", sig: "test" }],
         attestations: {
-          url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@${version}`,
+          // npmjs.org percent-encodes the scope separator in this URL.
+          url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@${version}`,
           provenance: { predicateType: "https://slsa.dev/provenance/v1" },
         },
       },
@@ -609,3 +610,42 @@ if [[ "$MISSING_OWNER_OUT" == *"npm-called: install"* ]]; then
   exit 1
 fi
 echo "✓ smoke.sh: a missing owner manager cannot create a shadow npm install"
+
+# ── 11. A full `umadev uninstall` of a package-managed install: the REAL binary
+# removes the hooks and global state (in a sandboxed HOME here), then the shim
+# removes the scoped package through the manager that owns it and reports success
+# only once the package is gone. The retired unscoped name must never be used.
+UNINSTALL_ROOT="$UPD_TMP/uninstall/node_modules"
+make_install "$UNINSTALL_ROOT"
+mkdir -p "$UPD_TMP/uninstall-bin" "$UPD_TMP/uninstall-home" "$UPD_TMP/uninstall-project/.git"
+UNINSTALL_NPM="$UPD_TMP/uninstall-bin/npm"
+cat > "$UNINSTALL_NPM" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) echo "9.9.9"; exit 0 ;;
+  uninstall) rm -rf "$UNINSTALL_ROOT/@umatech/umadev" ;;
+esac
+echo "npm-called: \$*"
+STUB
+chmod +x "$UNINSTALL_NPM"
+set +e
+UNINSTALL_OUT="$(cd "$UPD_TMP/uninstall-project" && PATH="$UPD_TMP/uninstall-bin:$PATH" \
+  HOME="$UPD_TMP/uninstall-home" USERPROFILE="$UPD_TMP/uninstall-home" \
+  XDG_CONFIG_HOME="$UPD_TMP/uninstall-home/.config" \
+  node "$UNINSTALL_ROOT/@umatech/umadev/bin/cli.js" uninstall --yes 2>&1)"
+UNINSTALL_RC=$?
+set -e
+if [[ "$UNINSTALL_RC" -ne 0 ]] ||
+   [[ "$UNINSTALL_OUT" != *"npm-called: uninstall -g @umatech/umadev"* ]] ||
+   [[ "$UNINSTALL_OUT" != *"UmaDev uninstalled"* ]] ||
+   [[ -e "$UNINSTALL_ROOT/@umatech/umadev/package.json" ]]; then
+  echo "✗ smoke.sh: a full uninstall did not remove @umatech/umadev through npm" >&2
+  echo "$UNINSTALL_OUT" >&2
+  exit 1
+fi
+if [[ "$UNINSTALL_OUT" == *"uninstall -g umadev"* ]]; then
+  echo "✗ smoke.sh: a full uninstall used the retired unscoped package name" >&2
+  echo "$UNINSTALL_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: a full uninstall removes @umatech/umadev through its owner manager"
