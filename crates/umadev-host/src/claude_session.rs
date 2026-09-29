@@ -115,6 +115,15 @@ const INTERRUPT_RECEIPT_BUDGET: std::time::Duration = std::time::Duration::from_
 /// interrupt ACK; the bound stays below the 5-second limit callers put on the
 /// whole interrupt.
 const INTERRUPT_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long [`ClaudeSession::resume`] waits for a resumed Claude to answer its
+/// readiness probe. A slow start is not a failure: past this bound the session
+/// is handed out as before.
+const RESUME_CONFIRM_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The terminal reason the stdout pump reports when the stream ends without
+/// Claude's own `result` frame.
+const STREAM_ENDED_REASON: &str = "base session ended unexpectedly";
+/// How long a resume that ended early waits for Claude's own reason frame.
+const RESUME_EXIT_REASON_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 const MAX_INPUT_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// A single stdout NDJSON record may be large (for example a tool result), but
 /// it must not be able to grow the reader buffer without bound.
@@ -496,7 +505,10 @@ impl ClaudeSession {
     ///
     /// `UMADEV_CLAUDE_BIN` override honored. A spawn or resume failure surfaces as
     /// [`SessionError::Start`]; the caller must decide explicitly whether this task
-    /// may start fresh or must preserve its existing conversation identity.
+    /// may start fresh or must preserve its existing conversation identity. A
+    /// conversation Claude cannot find is such a failure: the session is handed
+    /// out only once Claude has answered a readiness probe, and Claude's own
+    /// "No conversation found with session ID …" becomes the error.
     pub async fn resume(
         workspace: &Path,
         append_system: Option<&str>,
@@ -514,8 +526,30 @@ impl ClaudeSession {
         // makes kill/exit-status target cmd.exe while the real node `claude` orphans. Using
         // the real binary directly fixes both on the continuous (default) path.
         let program = crate::claude::resolve_claude_program();
-        Self::spawn_with_args(
+        Self::resume_with_program(
             &program,
+            workspace,
+            append_system,
+            session_id,
+            permissions,
+            max_turns,
+            model,
+        )
+        .await
+    }
+
+    /// [`Self::resume`] against an explicit `program` (a test fake).
+    async fn resume_with_program(
+        program: &str,
+        workspace: &Path,
+        append_system: Option<&str>,
+        session_id: &str,
+        permissions: BasePermissionProfile,
+        max_turns: Option<u32>,
+        model: &str,
+    ) -> Result<Self, SessionError> {
+        let mut session = Self::spawn_with_args(
+            program,
             workspace,
             &resume_session_args_for_profile(
                 session_id,
@@ -527,7 +561,70 @@ impl ClaudeSession {
             session_id,
         )
         .await
-        .map_err(crate::redaction::sanitize_session_error)
+        .map_err(crate::redaction::sanitize_session_error)?;
+        session
+            .confirm_resumed()
+            .await
+            .map_err(crate::redaction::sanitize_session_error)?;
+        Ok(session)
+    }
+
+    /// Prove the resumed conversation exists before handing the session out.
+    ///
+    /// When Claude cannot find the conversation (its 30-day transcript sweep, a
+    /// moved project, another config dir) it prints a `result` frame naming the
+    /// id and exits at startup, before reading any input. A side-effect-free
+    /// control request (`mcp_status`) is answered as soon as a resumed session
+    /// is ready (an unknown subtype is answered with an error just as promptly);
+    /// an exit before that answer becomes [`SessionError::Start`] with Claude's
+    /// reason, so callers apply their stale-id fallback at once.
+    async fn confirm_resumed(&mut self) -> Result<(), SessionError> {
+        let request_id = new_session_id();
+        let answered = self
+            .protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register_client_control(request_id.clone());
+        let probe = serde_json::json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": { "subtype": "mcp_status" }
+        })
+        .to_string();
+        let outcome = match self.write_line(&probe).await {
+            Ok(()) => tokio::time::timeout(RESUME_CONFIRM_BUDGET, answered)
+                .await
+                .map(|answer| answer.is_ok()),
+            Err(_) => Ok(false),
+        };
+        self.protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget_client_control(&request_id);
+        match outcome {
+            // Answered, or still starting: the conversation is not known missing.
+            Ok(true) | Err(_) => Ok(()),
+            // The stream ended before an answer: Claude exited during startup.
+            Ok(false) => Err(SessionError::Start(self.early_exit_reason().await)),
+        }
+    }
+
+    /// Claude's own reason for exiting before the first turn: the `result`
+    /// frame it printed, else its stderr.
+    async fn early_exit_reason(&mut self) -> String {
+        let deadline = tokio::time::Instant::now() + RESUME_EXIT_REASON_BUDGET;
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, self.events.recv()).await {
+            if let SessionEvent::TurnDone { status, .. } = event {
+                match status {
+                    TurnStatus::Failed(reason) if reason != STREAM_ENDED_REASON => return reason,
+                    _ => break,
+                }
+            }
+        }
+        self.stderr_drain.shutdown().await;
+        self.stderr.snapshot().unwrap_or_else(|| {
+            "Claude exited before the resumed conversation was ready".to_string()
+        })
     }
 
     /// Spawn a `claude` child with an explicit argument vector and wire up the
@@ -1491,7 +1588,7 @@ async fn pump_stdout(
             Ok(Some(ClaudeFrameRead::Oversized)) => {
                 break "Claude stream-json frame exceeded the 32 MiB safety limit";
             }
-            Ok(None) => break "base session ended unexpectedly",
+            Ok(None) => break STREAM_ENDED_REASON,
             Err(_) => break "base session stdout could not be read",
         }
     };
@@ -3360,24 +3457,37 @@ fn terminal_reason_status(v: &Value, reason: &str, is_error: bool) -> Option<Tur
 
 /// The human-readable error text off an errored `result` envelope. Prefers the
 /// base's own `result` string (where claude writes the API error, e.g. "API Error:
-/// Request rejected (429) …") so the user sees the REAL cause; falls back to naming
-/// the `subtype` when no message text is present. Never empty → never a silent
-/// failure.
+/// Request rejected (429) …") so the user sees the REAL cause, then its
+/// `errors[]` (where claude writes every other failure, e.g. "No conversation
+/// found with session ID: …"), and finally names the `subtype`. Never empty →
+/// never a silent failure.
 fn result_error_text(v: &Value, subtype: &str) -> String {
-    v.get("result")
+    if let Some(result) = v
+        .get("result")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map_or_else(
-            || {
-                if subtype.is_empty() {
-                    "base error".to_string()
-                } else {
-                    format!("base error ({subtype})")
-                }
-            },
-            str::to_string,
-        )
+    {
+        return result.to_string();
+    }
+    let errors = v
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !errors.is_empty() {
+        return truncate(&errors, 500);
+    }
+    if subtype.is_empty() {
+        "base error".to_string()
+    } else {
+        format!("base error ({subtype})")
+    }
 }
 
 /// Extract the per-turn token usage from a stream-json `result` envelope.
@@ -6240,6 +6350,126 @@ cat >/dev/null
             matches!(error, SessionError::InterruptPending(_)),
             "an unsettled turn must not be reported as terminal: {error:?}"
         );
+        let _ = session.end().await;
+    }
+
+    /// Claude 2.1.42 resuming an id it cannot find (captured live): the only
+    /// diagnostic, printed at startup before any input, then exit 1.
+    const STALE_RESUME_RESULT: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"48eca61a-ad11-4418-9c6f-f827d9f53490","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"1d8aacb4-5c38-4270-9882-2bcc4084b3ac","errors":["No conversation found with session ID: bfadf6d3-65ac-49d5-b0a3-31f5ce7e53e3"]}"#;
+    /// The same failure from Claude 2.1.284 (captured live).
+    const STALE_RESUME_RESULT_2_1_284: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"8896fa3b-5b67-451a-9364-456c92f1b98a","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"55f65831-0d0d-4832-8aac-fcc770436664","errors":["No conversation found with session ID: 8896fa3b-5b67-451a-9364-456c92f1b98a"],"result_index":0}"#;
+
+    #[test]
+    fn stale_resume_error_text_reaches_turn_failure() {
+        for frame in [STALE_RESUME_RESULT, STALE_RESUME_RESULT_2_1_284] {
+            let events = parse_stdout_line(frame);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [SessionEvent::TurnDone { status: TurnStatus::Failed(reason), .. }]
+                        if reason.contains("No conversation found with session ID")
+                ),
+                "Claude's errors[] must name the failure: {events:?}"
+            );
+        }
+        // Without result text or errors the subtype still names the failure.
+        assert_eq!(
+            result_error_text(
+                &serde_json::json!({"subtype":"error_during_execution","errors":[]}),
+                "error_during_execution"
+            ),
+            "base error (error_during_execution)"
+        );
+    }
+
+    /// Resume against a fake, bounded so a regression fails instead of hanging.
+    #[cfg(unix)]
+    async fn resume_fake(
+        fake: &std::path::Path,
+        workspace: &std::path::Path,
+        session_id: &str,
+    ) -> Result<ClaudeSession, SessionError> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ClaudeSession::resume_with_program(
+                fake.to_str().unwrap(),
+                workspace,
+                None,
+                session_id,
+                BasePermissionProfile::Guarded,
+                None,
+                "",
+            ),
+        )
+        .await
+        .expect("resume returns in time")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_of_missing_conversation_is_a_start_error() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            &format!("#!/bin/sh\nprintf '%s\\n' '{STALE_RESUME_RESULT}'\nexit 1\n"),
+        );
+        let outcome = resume_fake(&fake, &tmp, "bfadf6d3-65ac-49d5-b0a3-31f5ce7e53e3").await;
+        let Err(SessionError::Start(reason)) = outcome else {
+            panic!("a missing conversation must fail the resume itself");
+        };
+        assert!(
+            reason.contains("No conversation found with session ID"),
+            "the caller learns why: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_that_exits_without_a_result_reports_its_stderr() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\necho 'Error: the configured model is not available' 1>&2\nexit 1\n",
+        );
+        let outcome = resume_fake(&fake, &tmp, "11111111-2222-4333-8444-555555555555").await;
+        let Err(SessionError::Start(reason)) = outcome else {
+            panic!("a base that exits at startup must fail the resume itself");
+        };
+        assert!(
+            reason.contains("the configured model is not available"),
+            "the caller learns why: {reason}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_of_a_live_conversation_is_confirmed_then_usable() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            r#"#!/bin/sh
+IFS= read -r probe
+request_id=$(printf '%s\n' "$probe" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mcpServers":[]}}}\n' "$request_id"
+IFS= read -r _turn
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"resumed"}'
+cat >/dev/null
+"#,
+        );
+        let mut session = resume_fake(&fake, &tmp, "11111111-2222-4333-8444-555555555555")
+            .await
+            .expect("a live conversation resumes");
+        session
+            .send_turn("continue".to_string())
+            .await
+            .expect("send");
+        assert!(matches!(
+            first_terminal(&mut session).await,
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ));
         let _ = session.end().await;
     }
 
