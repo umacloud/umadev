@@ -110,6 +110,11 @@ const REPLAY_ACK_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 /// Claude advertises `interrupt_receipt_v1` before returning a typed receipt.
 /// Waiting is bounded so a broken/newer peer can never hold Esc hostage.
 const INTERRUPT_RECEIPT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// How long [`BaseSession::interrupt`] waits in total, receipt included, for the
+/// interrupted turn's terminal frame. Claude emits it milliseconds after its
+/// interrupt ACK; the bound stays below the 5-second limit callers put on the
+/// whole interrupt.
+const INTERRUPT_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 const MAX_INPUT_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// A single stdout NDJSON record may be large (for example a tool result), but
 /// it must not be able to grow the reader buffer without bound.
@@ -395,6 +400,11 @@ pub struct ClaudeSession {
     program: String,
     /// The workspace this session runs in, so a fork operates in the same dir.
     workspace: std::path::PathBuf,
+    /// The client UUID of the user frame whose turn has not reached its
+    /// terminal event yet. [`BaseSession::interrupt`] consumes that turn's
+    /// remaining frames through its `TurnDone`, so the next turn never reads the
+    /// aborted turn's terminal as its own.
+    turn_in_flight: Option<String>,
     /// `true` when Claude runs in its `plan` permission mode (the Plan profile
     /// and every read-only fork). With the stdio permission channel, `plan` mode
     /// asks the host before a write instead of refusing it, so this session
@@ -638,6 +648,7 @@ impl ClaudeSession {
             session_id: session_id.to_string(),
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
+            turn_in_flight: None,
             read_only: runs_in_plan_mode(&args),
             _firmware_file: firmware_file,
         })
@@ -759,6 +770,7 @@ impl ClaudeSession {
             self.forget_command(uuid);
             return Err(error);
         }
+        self.turn_in_flight = Some(uuid.to_string());
         let acknowledged = matches!(
             tokio::time::timeout(REPLAY_ACK_BUDGET, receiver).await,
             Ok(Ok(()))
@@ -787,6 +799,7 @@ impl ClaudeSession {
             self.forget_command(uuid);
             return Err(error);
         }
+        self.turn_in_flight = Some(uuid.to_string());
         let pending = Arc::clone(&self.pending_replay_acks);
         let uuid = uuid.to_string();
         tokio::spawn(async move {
@@ -804,6 +817,82 @@ impl ClaudeSession {
             );
         });
         Ok(())
+    }
+
+    /// Cancel the exact UmaDev commands a typed interrupt receipt still lists
+    /// as queued, and return their UUIDs.
+    async fn cancel_still_queued(
+        &mut self,
+        request_id: &str,
+        receipt: oneshot::Receiver<Value>,
+    ) -> Result<Vec<String>, SessionError> {
+        let Ok(Ok(payload)) = tokio::time::timeout(INTERRUPT_RECEIPT_BUDGET, receipt).await else {
+            self.protocol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget_client_control(request_id);
+            tracing::warn!("Claude advertised interrupt_receipt_v1 but no typed receipt arrived");
+            return Ok(Vec::new());
+        };
+        let still_queued = self
+            .protocol
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .known_still_queued(&payload);
+        // The official receipt may include Claude-internal UUIDs. Never cancel
+        // those; cancel every exact UmaDev UUID promptly, including all members
+        // of a coalesced batch, before returning control to the interactive loop.
+        for message_uuid in &still_queued {
+            let cancel = serde_json::json!({
+                "type": "control_request",
+                "request_id": new_session_id(),
+                "request": {
+                    "subtype": "cancel_async_message",
+                    "message_uuid": message_uuid
+                }
+            })
+            .to_string();
+            self.write_line(&cancel)
+                .await
+                .map_err(crate::redaction::sanitize_session_error)?;
+        }
+        tracing::debug!(
+            cancelled_queued_commands = still_queued.len(),
+            "Claude interrupt receipt settled"
+        );
+        Ok(still_queued)
+    }
+
+    /// Consume the interrupted turn's remaining frames through its terminal
+    /// event. Claude acknowledges an interrupt first and emits the aborted
+    /// turn's `result` just after; left unread, that `result` would end the NEXT
+    /// turn as a failure and keep the conversation one turn out of step. With no
+    /// turn in flight there is nothing to wait for.
+    async fn settle_interrupted_turn(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), SessionError> {
+        if self.turn_in_flight.is_none() {
+            return Ok(());
+        }
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                // The stream's end is terminal too: nothing of the turn remains.
+                Ok(Some(SessionEvent::TurnDone { .. }) | None) => {
+                    self.turn_in_flight = None;
+                    return Ok(());
+                }
+                // The aborted turn's own output; its caller has stopped reading.
+                // A permission request it raised is withdrawn by Claude itself.
+                Ok(Some(_)) => {}
+                Err(_) => {
+                    return Err(SessionError::InterruptPending(format!(
+                        "Claude did not end the interrupted turn within {}s",
+                        INTERRUPT_SETTLE_BUDGET.as_secs()
+                    )))
+                }
+            }
+        }
     }
 }
 
@@ -921,6 +1010,9 @@ impl BaseSession for ClaudeSession {
                     continue;
                 }
             }
+            if matches!(event, SessionEvent::TurnDone { .. }) {
+                self.turn_in_flight = None;
+            }
             return Some(crate::redaction::sanitize_session_event(event));
         }
     }
@@ -961,6 +1053,7 @@ impl BaseSession for ClaudeSession {
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
+        let deadline = tokio::time::Instant::now() + INTERRUPT_SETTLE_BUDGET;
         let request_id = new_session_id();
         // Old Claude builds return an untyped empty ACK. Feature-detect the
         // receipt so Esc never acquires a new 1.5-second delay on those builds.
@@ -987,44 +1080,18 @@ impl BaseSession for ClaudeSession {
             return Err(crate::redaction::sanitize_session_error(error));
         }
 
-        let Some(receipt) = receipt else {
-            return Ok(());
-        };
-        let Ok(Ok(payload)) = tokio::time::timeout(INTERRUPT_RECEIPT_BUDGET, receipt).await else {
-            self.protocol
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .forget_client_control(&request_id);
-            tracing::warn!("Claude advertised interrupt_receipt_v1 but no typed receipt arrived");
-            return Ok(());
-        };
-        let still_queued = self
-            .protocol
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .known_still_queued(&payload);
-        // The official receipt may include Claude-internal UUIDs. Never cancel
-        // those; cancel every exact UmaDev UUID promptly, including all members
-        // of a coalesced batch, before returning control to the interactive loop.
-        for message_uuid in &still_queued {
-            let cancel = serde_json::json!({
-                "type": "control_request",
-                "request_id": new_session_id(),
-                "request": {
-                    "subtype": "cancel_async_message",
-                    "message_uuid": message_uuid
-                }
-            })
-            .to_string();
-            self.write_line(&cancel)
-                .await
-                .map_err(crate::redaction::sanitize_session_error)?;
+        if let Some(receipt) = receipt {
+            let cancelled = self.cancel_still_queued(&request_id, receipt).await?;
+            if self
+                .turn_in_flight
+                .as_ref()
+                .is_some_and(|uuid| cancelled.contains(uuid))
+            {
+                // The turn never started; its cancelled command has no terminal.
+                self.turn_in_flight = None;
+            }
         }
-        tracing::debug!(
-            cancelled_queued_commands = still_queued.len(),
-            "Claude interrupt receipt settled"
-        );
-        Ok(())
+        self.settle_interrupted_turn(deadline).await
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
@@ -5981,6 +6048,197 @@ cat >/dev/null
                 .known_commands
                 .contains(cancelled_uuid),
             "the cancellation targets an exact UUID registered before send"
+        );
+        let _ = session.end().await;
+    }
+
+    /// Claude 2.1.42's frames for an interrupted turn, captured live: the
+    /// interruption marker, then an `error_during_execution` result that
+    /// arrives milliseconds AFTER the interrupt's control_response.
+    #[cfg(unix)]
+    const INTERRUPTED_USER_FRAME: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","uuid":"25f58a8d-9051-4aaa-bbb1-d441d5ebbfb9"}"#;
+    #[cfg(unix)]
+    const INTERRUPTED_RESULT_FRAME: &str = r#"{"type":"result","subtype":"error_during_execution","duration_ms":1855,"duration_api_ms":0,"is_error":false,"num_turns":2,"stop_reason":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"41942427-d2f8-4de9-8bec-22088352e641","errors":[]}"#;
+
+    /// Claude 2.1.284's frames after a typed interrupt receipt that lists no
+    /// queued command (captured live): the started turn's aborted aggregate,
+    /// the interruption marker, and its `aborted_streaming` result about 80 ms
+    /// after the receipt.
+    #[cfg(unix)]
+    const RECEIPT_MESSAGE_START_FRAME: &str = r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1_5ef852","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","parent_tool_use_id":null,"uuid":"43c0ac3c-4d2e-4ed6-b4a9-b357d1630e7f","ttft_ms":8,"user_message_uuid":"ebc6a384-64ce-4531-b1d1-47ac09181cac","user_message_uuids":["ebc6a384-64ce-4531-b1d1-47ac09181cac"]}"#;
+    #[cfg(unix)]
+    const RECEIPT_ABORTED_ASSISTANT_FRAME: &str = r#"{"type":"assistant","message":{"id":"msg_1_5ef852","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"slow0 "}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1},"context_management":null},"parent_tool_use_id":null,"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","uuid":"01d29d90-dd3b-4776-8d6e-8ce73a3c71cd","timestamp":"2026-09-29T11:28:48.291Z","aborted":true,"user_message_uuid":"ebc6a384-64ce-4531-b1d1-47ac09181cac","user_message_uuids":["ebc6a384-64ce-4531-b1d1-47ac09181cac"]}"#;
+    #[cfg(unix)]
+    const RECEIPT_INTERRUPTED_USER_FRAME: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","uuid":"67473f30-aba4-45d5-bddd-0995f51f1564","timestamp":"2026-09-29T11:28:48.326Z"}"#;
+    #[cfg(unix)]
+    const RECEIPT_INTERRUPTED_RESULT_FRAME: &str = r#"{"duration_api_ms":0,"stop_reason":null,"session_id":"6b2b43f3-2b38-491e-a53b-be43c4d2240b","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"terminal_reason":"aborted_streaming","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":2,"subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"user_message_uuid":"ebc6a384-64ce-4531-b1d1-47ac09181cac","type":"result","duration_ms":166,"uuid":"540bb414-f47a-4dd3-bbd3-8e8810c8b9a4","user_message_uuids":["ebc6a384-64ce-4531-b1d1-47ac09181cac"],"queued_turn_count":0,"result_index":0}"#;
+
+    /// Read events until the first `TurnDone`, bounded so a regression fails
+    /// instead of hanging the suite.
+    #[cfg(unix)]
+    async fn first_terminal(session: &mut ClaudeSession) -> SessionEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let done @ SessionEvent::TurnDone { .. } =
+                    session.next_event().await.expect("the turn's events")
+                {
+                    break done;
+                }
+            }
+        })
+        .await
+        .expect("a terminal event")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_consumes_aborted_turn_terminal_before_next_turn() {
+        let tmp = tempfile_dir();
+        let body = format!(
+            "#!/bin/sh\n\
+             IFS= read -r _turn_a\n\
+             printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"working on A\"}}}}}}'\n\
+             IFS= read -r _interrupt\n\
+             printf '%s\\n' '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"ack\"}}}}'\n\
+             sleep 0.2\n\
+             printf '%s\\n' '{INTERRUPTED_USER_FRAME}'\n\
+             printf '%s\\n' '{INTERRUPTED_RESULT_FRAME}'\n\
+             IFS= read -r _turn_b\n\
+             printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"B done\"}}'\n\
+             cat >/dev/null\n"
+        );
+        let fake = write_fake_claude(&tmp, &body);
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-interrupt-settle",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("A".to_string()).await.expect("send A");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("working on A".to_string()))
+        );
+        session
+            .interrupt()
+            .await
+            .expect("the interrupted turn settles");
+
+        session.send_turn("B".to_string()).await.expect("send B");
+        let first_terminal = first_terminal(&mut session).await;
+        assert!(
+            matches!(
+                first_terminal,
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    ..
+                }
+            ),
+            "B must not end with A's aborted terminal: {first_terminal:?}"
+        );
+
+        // Nothing is in flight now, so a further interrupt does not wait.
+        let started = tokio::time::Instant::now();
+        session.interrupt().await.expect("idle interrupt");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn typed_interrupt_receipt_still_settles_a_started_turn() {
+        // A receipt that lists no queued command means the turn had started:
+        // its aborted terminal follows the receipt and must not end turn B.
+        let tmp = tempfile_dir();
+        let body = format!(
+            r#"#!/bin/sh
+printf '%s\n' '{{"type":"system","subtype":"init","model":"fixture","capabilities":["interrupt_receipt_v1"]}}'
+IFS= read -r _turn_a
+printf '%s\n' '{RECEIPT_MESSAGE_START_FRAME}'
+printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"slow0 "}}}}}}'
+IFS= read -r interrupt_line
+request_id=$(printf '%s\n' "$interrupt_line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+printf '{{"type":"control_response","response":{{"subtype":"success","request_id":"%s","response":{{"still_queued":[]}}}}}}\n' "$request_id"
+sleep 0.1
+printf '%s\n' '{RECEIPT_ABORTED_ASSISTANT_FRAME}'
+printf '%s\n' '{RECEIPT_INTERRUPTED_USER_FRAME}'
+printf '%s\n' '{RECEIPT_INTERRUPTED_RESULT_FRAME}'
+IFS= read -r _turn_b
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"B done","terminal_reason":"completed"}}'
+cat >/dev/null
+"#
+        );
+        let fake = write_fake_claude(&tmp, &body);
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-receipt-settle",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(15), session.next_event())
+                .await
+                .expect("init frame observed"),
+            Some(SessionEvent::SessionModel(_))
+        ));
+        session.send_turn("A".to_string()).await.expect("send A");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("slow0 ".to_string()))
+        );
+        session
+            .interrupt()
+            .await
+            .expect("the started turn settles after the receipt");
+
+        session.send_turn("B".to_string()).await.expect("send B");
+        let first_terminal = first_terminal(&mut session).await;
+        assert!(
+            matches!(
+                first_terminal,
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    ..
+                }
+            ),
+            "B must not end with A's aborted terminal: {first_terminal:?}"
+        );
+        let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_reports_a_turn_that_never_ends_as_pending() {
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nIFS= read -r _turn\nIFS= read -r _interrupt\n\
+             printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"ack\"}}'\n\
+             cat >/dev/null\n",
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-interrupt-pending",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("hang".to_string()).await.expect("send");
+        let error = session.interrupt().await.unwrap_err();
+        assert!(
+            matches!(error, SessionError::InterruptPending(_)),
+            "an unsettled turn must not be reported as terminal: {error:?}"
         );
         let _ = session.end().await;
     }
