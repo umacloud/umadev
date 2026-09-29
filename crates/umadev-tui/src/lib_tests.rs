@@ -9491,7 +9491,16 @@ async fn drive_resident_readonly_turn(
 fn ran_governance_qc(events: &[EngineEvent]) -> bool {
     events
         .iter()
-        .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("构建执行已结束，尚未验收")))
+        .any(|e| matches!(e, EngineEvent::Note(n) if is_post_build_qc_note(n)))
+}
+
+/// Whether `note` is the post-build QC start note. The note is localized and
+/// the UI language follows the machine's locale (English on macOS and Windows CI
+/// runners), so match the catalog text in every language.
+fn is_post_build_qc_note(note: &str) -> bool {
+    umadev_i18n::Lang::ALL
+        .iter()
+        .any(|&lang| note.contains(umadev_i18n::t(lang, "team.post_build_qc_started")))
 }
 
 /// True if a BUILD-shaped intent card was emitted (`react_to_first_write` promoted

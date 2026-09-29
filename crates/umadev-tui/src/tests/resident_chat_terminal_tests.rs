@@ -1118,7 +1118,7 @@ async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
     let mut saw_build_card = false;
     while let Ok(event) = engine_rx.try_recv() {
         match event {
-            EngineEvent::Note(n) if n.contains("构建执行已结束，尚未验收") => {
+            EngineEvent::Note(n) if is_post_build_qc_note(&n) => {
                 saw_qc = true;
             }
             EngineEvent::IntentDecided { class, .. } if class == "build" => saw_build_card = true,
