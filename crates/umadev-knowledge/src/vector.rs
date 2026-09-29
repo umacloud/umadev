@@ -732,7 +732,10 @@ const EMBED_BATCH_MAX: usize = 100;
 /// provider (a larger OpenAI model, or another OpenAI-compatible provider's).
 #[cfg(feature = "vector")]
 fn embed_request_body(input: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({ "model": active_model(), "input": input })
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_owned(), active_model().into());
+    body.insert("input".to_owned(), input);
+    serde_json::Value::Object(body)
 }
 
 /// Extract the model name the vector layer uses (for cache invalidation).
