@@ -943,6 +943,129 @@ fn full_uninstall_of_a_package_install_without_the_launcher_does_not_claim_succe
     assert!(install.exe.exists());
 }
 
+/// Run git in `dir` and return its trimmed stdout, failing the test on error.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.email=umadev-test@example.invalid",
+            "-c",
+            "user.name=UmaDev Test",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "protocol.file.allow=always",
+        ])
+        .args(args)
+        .output()
+        .expect("invoke git");
+    assert!(
+        output.status.success(),
+        "git {args:?}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A repository with one commit, so worktrees and submodules can be made.
+fn committed_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q"]);
+    git(dir, &["commit", "-q", "--allow-empty", "-m", "seed"]);
+}
+
+/// The pre-commit hook git itself would run for a commit made in `checkout`.
+fn git_pre_commit_hook(checkout: &Path) -> PathBuf {
+    let hooks = PathBuf::from(git(checkout, &["rev-parse", "--git-path", "hooks"]));
+    let hooks = if hooks.is_absolute() {
+        hooks
+    } else {
+        checkout.join(hooks)
+    };
+    hooks.join("pre-commit")
+}
+
+/// REGRESSION: in a linked worktree or a submodule `.git` is a file, so the
+/// hook install and uninstall failed, and a full `umadev uninstall` from there
+/// stopped at "governance hook removal was incomplete". The hook must land
+/// where git runs it for that checkout, and come out again.
+#[test]
+fn pre_commit_hook_installs_where_git_runs_it_in_worktrees_and_submodules() {
+    let tmp = TempDir::new().unwrap();
+    let main = tmp.path().join("main");
+    committed_repo(&main);
+    let worktree = tmp.path().join("wt");
+    git(&main, &["worktree", "add", "-q", worktree.to_str().unwrap()]);
+    let superproject = tmp.path().join("super");
+    committed_repo(&superproject);
+    git(
+        &superproject,
+        &["submodule", "add", "-q", main.to_str().unwrap(), "libs/chart.js"],
+    );
+    let submodule = superproject.join("libs/chart.js");
+
+    for checkout in [&worktree, &submodule] {
+        let hook = git_pre_commit_hook(checkout);
+        let install = hermetic_command(checkout)
+            .args(["install", "--base", "pre-commit"])
+            .output()
+            .expect("install");
+        assert!(install.status.success(), "{checkout:?}: {install:?}");
+        let body = std::fs::read_to_string(&hook).expect("the hook git runs");
+        assert!(body.contains("ci --changed-only"), "{body}");
+
+        for _ in 0..2 {
+            // The second pass finds nothing to remove and still succeeds.
+            let uninstall = hermetic_command(checkout)
+                .args(["uninstall", "--base", "pre-commit"])
+                .output()
+                .expect("uninstall");
+            assert!(uninstall.status.success(), "{checkout:?}: {uninstall:?}");
+            assert!(!hook.exists(), "{checkout:?}: the hook was not removed");
+        }
+    }
+
+    // A full uninstall from inside the worktree completes (the packaged binary
+    // hands its own removal to the launcher instead of deleting itself).
+    let install = package_install();
+    let full = hermetic_command_for(&install.exe, &worktree)
+        .env("PATH", &install.path)
+        .env("UMADEV_UNINSTALL_HANDOFF", worktree.join("handoff"))
+        .args(["uninstall", "--yes"])
+        .output()
+        .expect("full uninstall");
+    assert!(full.status.success(), "{full:?}");
+}
+
+/// REGRESSION: with `core.hooksPath` set (husky, lefthook), git never runs
+/// `.git/hooks`, yet `install --base pre-commit` wrote there and printed
+/// "[ok] ... Every `git commit` will now run ...". It must say what to add
+/// where git does look, and fail instead of claiming an install.
+#[test]
+fn pre_commit_install_refuses_a_hooks_path_git_would_not_read() {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("repo");
+    committed_repo(&repo);
+    git(&repo, &["config", "core.hooksPath", ".husky/_"]);
+    let out = hermetic_command(&repo)
+        .args(["install", "--base", "pre-commit"])
+        .output()
+        .expect("install");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(!text.contains("[ok]"), "{text}");
+    assert!(text.contains(".husky/_") && text.contains("core.hooksPath"), "{text}");
+    assert!(text.contains("ci --changed-only"), "{text}");
+    assert!(!repo.join(".git/hooks/pre-commit").exists());
+    assert!(!repo.join(".husky").exists(), "UmaDev wrote into the hooks path");
+}
+
 /// `umadev report` outputs project health even on an empty workspace.
 #[test]
 fn report_shows_health_on_empty_workspace() {
