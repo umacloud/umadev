@@ -1,10 +1,21 @@
+//! Redaction at the base-adapter boundary.
+//!
+//! What a base produces falls in two groups. Model output (text, thinking, a
+//! proposed plan), tool calls with their inputs, tool output and results, and
+//! the action and target of an approval request pass through unchanged: the
+//! transcript shows them, governance scans them (the hardcoded-secret rule
+//! needs the secret it is looking for), and trust decisions authorize exactly
+//! what the base will run. Everything else a vendor sends, such as errors,
+//! warnings, request metadata, model and command catalogs and background task
+//! labels, is diagnostic text and has its secret values redacted here.
+//! Anything that persists the first group redacts it where it is written.
+
 use serde_json::Value;
 use umadev_runtime::{
-    BackgroundProcessInfo, BackgroundProcessSignal, BackgroundTaskSignal, CompletionResponse,
-    HostApprovalOption, HostApprovalOptionKind, HostPermission, HostQuestion, HostQuestionKind,
-    HostQuestionOption, HostRequest, SessionCommandInfo, SessionError, SessionEvent,
-    SessionModelInfo, SessionPlanEntry, SessionReasoningEffortOption, SessionStateUpdate,
-    StreamEvent, ToolEdit, TurnStatus,
+    BackgroundProcessInfo, BackgroundProcessSignal, BackgroundTaskSignal, HostApprovalOption,
+    HostApprovalOptionKind, HostPermission, HostQuestion, HostQuestionKind, HostQuestionOption,
+    HostRequest, SessionCommandInfo, SessionError, SessionEvent, SessionModelInfo,
+    SessionPlanEntry, SessionReasoningEffortOption, SessionStateUpdate, StreamEvent, TurnStatus,
 };
 
 pub(crate) fn redact_text(text: &str) -> String {
@@ -15,77 +26,12 @@ pub(crate) fn sanitize_value(value: Value) -> Value {
     umadev_governance::redaction::redact_json(value)
 }
 
-fn sanitize_tool_edit(edit: &ToolEdit) -> ToolEdit {
-    ToolEdit {
-        path: redact_text(&edit.path),
-        before: redact_text(&edit.before),
-        after: redact_text(&edit.after),
-    }
-}
-
 pub(crate) fn sanitize_stream_event(event: StreamEvent) -> StreamEvent {
     match event {
-        StreamEvent::Text { delta } => StreamEvent::Text {
-            delta: redact_text(&delta),
-        },
-        StreamEvent::ToolUse { name, detail, edit } => StreamEvent::ToolUse {
-            name: redact_text(&name),
-            detail: redact_text(&detail),
-            edit: edit.as_ref().map(sanitize_tool_edit),
-        },
-        StreamEvent::ToolUseCorrelated {
-            call_id,
-            name,
-            detail,
-            edit,
-        } => StreamEvent::ToolUseCorrelated {
-            call_id: redact_text(&call_id),
-            name: redact_text(&name),
-            detail: redact_text(&detail),
-            edit: edit.as_ref().map(sanitize_tool_edit),
-        },
-        StreamEvent::ToolProgressCorrelated { call_id, title } => {
-            StreamEvent::ToolProgressCorrelated {
-                call_id: redact_text(&call_id),
-                title: redact_text(&title),
-            }
-        }
-        StreamEvent::ToolOutputDelta { delta } => StreamEvent::ToolOutputDelta {
-            delta: redact_text(&delta),
-        },
-        StreamEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
-            StreamEvent::ToolOutputDeltaCorrelated {
-                call_id: redact_text(&call_id),
-                delta: redact_text(&delta),
-            }
-        }
-        StreamEvent::ToolOutputSnapshot { output } => StreamEvent::ToolOutputSnapshot {
-            output: redact_text(&output),
-        },
-        StreamEvent::ToolOutputSnapshotCorrelated { call_id, output } => {
-            StreamEvent::ToolOutputSnapshotCorrelated {
-                call_id: redact_text(&call_id),
-                output: redact_text(&output),
-            }
-        }
-        StreamEvent::ToolResult { ok, summary } => StreamEvent::ToolResult {
-            ok,
-            summary: redact_text(&summary),
-        },
-        StreamEvent::ToolResultCorrelated {
-            call_id,
-            ok,
-            summary,
-        } => StreamEvent::ToolResultCorrelated {
-            call_id: redact_text(&call_id),
-            ok,
-            summary: redact_text(&summary),
-        },
         StreamEvent::Warning { message } => StreamEvent::Warning {
             message: redact_text(&message),
         },
-        StreamEvent::Thinking => StreamEvent::Thinking,
-        StreamEvent::ThinkingDelta(delta) => StreamEvent::ThinkingDelta(redact_text(&delta)),
+        event => event,
     }
 }
 
@@ -146,8 +92,8 @@ fn sanitize_host_request(request: HostRequest) -> HostRequest {
             options,
             metadata,
         } => HostRequest::Approval {
-            action: redact_text(&action),
-            target: redact_text(&target),
+            action,
+            target,
             message: message.map(|value| redact_text(&value)),
             options: options.into_iter().map(sanitize_approval_option).collect(),
             metadata: sanitize_value(metadata),
@@ -184,7 +130,7 @@ fn sanitize_host_request(request: HostRequest) -> HostRequest {
             message,
             metadata,
         } => HostRequest::PlanConfirmation {
-            plan: redact_text(&plan),
+            plan,
             message: message.map(|value| redact_text(&value)),
             metadata: sanitize_value(metadata),
         },
@@ -362,69 +308,10 @@ fn sanitize_session_state_update(update: SessionStateUpdate) -> SessionStateUpda
 
 pub(crate) fn sanitize_session_event(event: SessionEvent) -> SessionEvent {
     match event {
-        SessionEvent::TextDelta(delta) => SessionEvent::TextDelta(redact_text(&delta)),
-        SessionEvent::ThinkingDelta(delta) => SessionEvent::ThinkingDelta(redact_text(&delta)),
         SessionEvent::SessionModel(model) => SessionEvent::SessionModel(redact_text(&model)),
         SessionEvent::StateUpdate(update) => {
             SessionEvent::StateUpdate(sanitize_session_state_update(update))
         }
-        SessionEvent::ToolCall { name, input } => SessionEvent::ToolCall {
-            name: redact_text(&name),
-            input: sanitize_value(input),
-        },
-        SessionEvent::ToolCallCorrelated {
-            call_id,
-            name,
-            input,
-        } => SessionEvent::ToolCallCorrelated {
-            call_id: redact_text(&call_id),
-            name: redact_text(&name),
-            input: sanitize_value(input),
-        },
-        SessionEvent::ToolProgressCorrelated { call_id, title } => {
-            SessionEvent::ToolProgressCorrelated {
-                call_id: redact_text(&call_id),
-                title: redact_text(&title),
-            }
-        }
-        SessionEvent::ToolOutputDelta(delta) => SessionEvent::ToolOutputDelta(redact_text(&delta)),
-        SessionEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
-            SessionEvent::ToolOutputDeltaCorrelated {
-                call_id: redact_text(&call_id),
-                delta: redact_text(&delta),
-            }
-        }
-        SessionEvent::ToolOutputSnapshot(output) => {
-            SessionEvent::ToolOutputSnapshot(redact_text(&output))
-        }
-        SessionEvent::ToolOutputSnapshotCorrelated { call_id, output } => {
-            SessionEvent::ToolOutputSnapshotCorrelated {
-                call_id: redact_text(&call_id),
-                output: redact_text(&output),
-            }
-        }
-        SessionEvent::ToolResult { ok, summary } => SessionEvent::ToolResult {
-            ok,
-            summary: redact_text(&summary),
-        },
-        SessionEvent::ToolResultCorrelated {
-            call_id,
-            ok,
-            summary,
-        } => SessionEvent::ToolResultCorrelated {
-            call_id: redact_text(&call_id),
-            ok,
-            summary: redact_text(&summary),
-        },
-        SessionEvent::NeedApproval {
-            req_id,
-            action,
-            target,
-        } => SessionEvent::NeedApproval {
-            req_id: redact_text(&req_id),
-            action: redact_text(&action),
-            target: redact_text(&target),
-        },
         SessionEvent::HostRequest { req_id, request } => SessionEvent::HostRequest {
             req_id: redact_text(&req_id),
             request: sanitize_host_request(request),
@@ -457,15 +344,7 @@ pub(crate) fn sanitize_session_event(event: SessionEvent) -> SessionEvent {
             status: sanitize_turn_status(status),
             usage,
         },
-    }
-}
-
-pub(crate) fn sanitize_completion_response(response: &CompletionResponse) -> CompletionResponse {
-    CompletionResponse {
-        text: redact_text(&response.text),
-        id: redact_text(&response.id),
-        model: redact_text(&response.model),
-        usage: response.usage,
+        event => event,
     }
 }
 
@@ -559,19 +438,54 @@ mod tests {
     }
 
     #[test]
-    fn session_event_is_safe_before_tool_activity_or_audit_consumes_it() {
-        let event = sanitize_session_event(SessionEvent::ToolCallCorrelated {
-            call_id: "call-1".to_string(),
-            name: "Bash".to_string(),
-            input: json!({
-                "command": format!("curl -H 'Authorization: Bearer {SECRET}' example.test"),
-                "password": SECRET,
-                "nextPageToken": "safe-page"
-            }),
+    fn model_output_tool_traffic_and_approval_subjects_pass_through_unredacted() {
+        let command = format!("export API_TOKEN={SECRET}; rm -rf ~");
+        let events = [
+            SessionEvent::TextDelta("interface User { password: string }".to_string()),
+            SessionEvent::ToolCallCorrelated {
+                call_id: "call-1".to_string(),
+                name: "Write".to_string(),
+                input: json!({
+                    "file_path": "src/config.ts",
+                    "content": format!("export const password = \"{SECRET}\";"),
+                }),
+            },
+            SessionEvent::ToolResult {
+                ok: true,
+                summary: r#"{"nextPageToken":"x","password":"p"}"#.to_string(),
+            },
+            SessionEvent::NeedApproval {
+                req_id: "r1".to_string(),
+                action: "Bash".to_string(),
+                target: command.clone(),
+            },
+            SessionEvent::HostRequest {
+                req_id: "r2".to_string(),
+                request: HostRequest::Approval {
+                    action: "Bash".to_string(),
+                    target: command,
+                    message: None,
+                    options: Vec::new(),
+                    metadata: Value::Null,
+                },
+            },
+        ];
+        for event in events {
+            let rendered = format!("{event:?}");
+            assert_eq!(format!("{:?}", sanitize_session_event(event)), rendered);
+        }
+    }
+
+    #[test]
+    fn stream_text_is_kept_and_warnings_are_redacted() {
+        let text = StreamEvent::Text {
+            delta: format!("password: \"{SECRET}\""),
+        };
+        assert_eq!(sanitize_stream_event(text.clone()), text);
+        let warning = sanitize_stream_event(StreamEvent::Warning {
+            message: format!("GITHUB_TOKEN={SECRET}"),
         });
-        let audit_view = format!("{event:?}");
-        assert!(!audit_view.contains(SECRET));
-        assert!(audit_view.contains("safe-page"));
+        assert!(!format!("{warning:?}").contains(SECRET));
     }
 
     #[test]

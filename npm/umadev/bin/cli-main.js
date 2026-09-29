@@ -1067,6 +1067,28 @@ function detectPackageManager(pkgRoot, env = process.env) {
   return 'npm';
 }
 
+// Every package-manager invocation goes through `cmd.exe` on Windows
+// (`shell: true`, so the `.cmd` shims resolve). cmd.exe searches the current
+// directory before PATH, so running `npm` from inside a cloned repository would
+// execute a committed `npm.cmd`. Run managers from the user's home directory
+// with that lookup disabled; this also keeps a project-level `.npmrc` or
+// `.yarnrc` from configuring a global self-update.
+function packageManagerSpawnOptions(options, env = process.env) {
+  let cwd = os.tmpdir();
+  try {
+    const home = os.homedir();
+    if (home && fs.statSync(home).isDirectory()) cwd = home;
+  } catch (_) {
+    // Fall back to the temp directory.
+  }
+  return {
+    ...options,
+    shell: true,
+    cwd,
+    env: { ...env, NoDefaultCurrentDirectoryInExePath: '1' },
+  };
+}
+
 // Can we actually execute this manager? `shell: true` so Windows resolves the
 // `.cmd` / `.ps1` shims npm-family tools install themselves as.
 function managerRunnable(mgr) {
@@ -1078,12 +1100,10 @@ function managerRunnable(mgr) {
       bun: 'bun --version',
     }[mgr];
     if (!versionCommand) return false;
-    const r = spawnSync(versionCommand, {
-      stdio: 'ignore',
-      shell: true,
-      timeout: 10000,
-      windowsHide: true,
-    });
+    const r = spawnSync(
+      versionCommand,
+      packageManagerSpawnOptions({ stdio: 'ignore', timeout: 10000, windowsHide: true }),
+    );
     return !r.error && r.status === 0;
   } catch (_) {
     return false;
@@ -1326,12 +1346,10 @@ function registryLatestRelease() {
 function npmViewLatestRelease() {
   try {
     const command = `npm view @umatech/umadev@latest --json --registry=${TRUSTED_NPM_REGISTRY}`;
-    const result = spawnSync(command, {
-      encoding: 'utf8',
-      shell: true,
-      timeout: 20000,
-      maxBuffer: 262144,
-    });
+    const result = spawnSync(
+      command,
+      packageManagerSpawnOptions({ encoding: 'utf8', timeout: 20000, maxBuffer: 262144 }),
+    );
     if (result.error || result.status !== 0 || !result.stdout) {
       return { status: 'unavailable', reason: 'npm could not read official release metadata' };
     }
@@ -1510,7 +1528,7 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   sweepAbandonedStagingDirs(pkgRoot);
 
   // A constant command string — nothing from argv reaches the shell.
-  const r = spawnSync(command, { stdio: 'inherit', shell: true });
+  const r = spawnSync(command, packageManagerSpawnOptions({ stdio: 'inherit' }));
   if (r.error || r.status !== 0) {
     console.error(
       '\numadev: the upgrade did not complete. Run it yourself to see why:\n' +
@@ -1546,7 +1564,7 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
     );
     console.warn(`Retrying once via \`${repairCommand}\`.`);
     repairAttempted = true;
-    const repair = spawnSync(repairCommand, { stdio: 'inherit', shell: true });
+    const repair = spawnSync(repairCommand, packageManagerSpawnOptions({ stdio: 'inherit' }));
     if (repair.error || repair.status !== 0) {
       if (process.platform === 'win32') {
         console.error('\numadev: the forced repair did not complete.');
@@ -1681,6 +1699,7 @@ module.exports = {
   registryLatestRelease,
   validateTrustedUpdateManifest,
   exactUpdateCommand,
+  packageManagerSpawnOptions,
   sweepAbandonedStagingDirs,
   ABANDONED_STAGING_MIN_AGE_MS,
   ensureModelCacheDirectory,

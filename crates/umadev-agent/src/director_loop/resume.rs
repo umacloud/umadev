@@ -405,7 +405,9 @@ pub(super) fn save_operational_review_checkpoint(
     umadev_state::fs::atomic_write(
         &dir.join(OPERATIONAL_REVIEW_CHECKPOINT_FILE),
         body.as_slice(),
-    )
+    )?;
+    crate::run_provenance::record(root, crate::run_provenance::REVIEW_CHECKPOINT, &body);
+    Ok(())
 }
 
 pub(super) fn load_operational_review_checkpoint(

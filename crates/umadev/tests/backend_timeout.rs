@@ -42,7 +42,8 @@ fn hermetic_command(cwd: &Path) -> Command {
 fn backend_timeout_pauses_bounded_with_an_explicit_offline_placeholder() {
     // Pass installation/authentication probes, then wedge only the real model
     // invocation. The child sleep proves whole-tree termination, not merely
-    // direct launcher termination.
+    // direct launcher termination. The log paths travel in non-`UMADEV_`
+    // variables because every base spawn scrubs that namespace.
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
     let fake = root.join("fake-claude");
@@ -53,10 +54,10 @@ fn backend_timeout_pauses_bounded_with_an_explicit_offline_placeholder() {
         "#!/bin/sh\n\
          if [ \"$1\" = \"--version\" ]; then echo '2.1.0'; exit 0; fi\n\
          if [ \"$1\" = \"auth\" ]; then echo '{\"loggedIn\":true}'; exit 0; fi\n\
-         printf 'call\\n' >> \"$UMADEV_TEST_CALL_LOG\"\n\
+         printf 'call\\n' >> \"$FAKE_BASE_CALL_LOG\"\n\
          sleep 30 &\n\
          leaf=$!\n\
-         printf '%s\\n' \"$leaf\" >> \"$UMADEV_TEST_PID_LOG\"\n\
+         printf '%s\\n' \"$leaf\" >> \"$FAKE_BASE_PID_LOG\"\n\
          wait \"$leaf\"\n",
     )
     .unwrap();
@@ -75,8 +76,8 @@ fn backend_timeout_pauses_bounded_with_an_explicit_offline_placeholder() {
             "claude-code",
         ])
         .env("UMADEV_CLAUDE_BIN", &fake)
-        .env("UMADEV_TEST_CALL_LOG", &call_log)
-        .env("UMADEV_TEST_PID_LOG", &pid_log)
+        .env("FAKE_BASE_CALL_LOG", &call_log)
+        .env("FAKE_BASE_PID_LOG", &pid_log)
         .env("UMADEV_WORKER_TIMEOUT", "1")
         .env("UMADEV_RETRY_BASE_MS", "1")
         .env("UMADEV_LEGACY_PIPELINE", "1")

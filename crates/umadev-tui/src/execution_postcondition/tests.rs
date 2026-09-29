@@ -131,6 +131,57 @@ fn capture_failure_is_explicitly_unverified() {
     .into_note();
     assert!(note.contains("[blocked]"));
     assert!(note.contains("cannot be marked successful"));
+    assert!(
+        !note.contains(".gitignore"),
+        "only a size limit earns the hint"
+    );
+}
+
+#[test]
+fn snapshot_limit_note_tells_the_user_how_to_recover() {
+    let note = snapshot_blocked(WorkspaceSnapshotError::Limit(
+        "hashed content exceeded 2147483648 bytes; largest top-level entry: `release` \
+         (2048.0 MiB hashed)"
+            .to_string(),
+    ))
+    .into_note();
+    assert!(note.contains("[blocked]"));
+    assert!(note.contains("largest top-level entry: `release`"));
+    assert!(note.contains(".gitignore"));
+    assert!(note.contains("/mode plan"));
+}
+
+#[test]
+fn snapshot_note_in_the_home_directory_says_to_start_from_the_project() {
+    let home = tempfile::tempdir().unwrap();
+    let limit = || WorkspaceSnapshotError::Limit("file count exceeded 100000".to_string());
+
+    let note = snapshot_blocked_in(home.path(), Some(home.path()), limit()).into_note();
+    assert!(note.contains("[blocked]"));
+    assert!(note.contains("home directory or a drive root"), "{note}");
+    assert!(note.contains("File > Open Folder"), "{note}");
+    assert!(
+        !note.contains(".gitignore"),
+        "the launch directory is the fix: {note}"
+    );
+
+    // A project folder below home keeps the ordinary size hint.
+    let project = home.path().join("openschedule");
+    std::fs::create_dir(&project).unwrap();
+    let note = snapshot_blocked_in(&project, Some(home.path()), limit()).into_note();
+    assert!(note.contains(".gitignore"), "{note}");
+    assert!(!note.contains("drive root"), "{note}");
+}
+
+#[test]
+fn snapshot_note_at_a_filesystem_root_says_to_start_from_the_project() {
+    let note = snapshot_blocked_in(
+        Path::new(std::path::MAIN_SEPARATOR_STR),
+        None,
+        WorkspaceSnapshotError::Limit("file count exceeded 100000".to_string()),
+    )
+    .into_note();
+    assert!(note.contains("home directory or a drive root"), "{note}");
 }
 
 #[tokio::test]
@@ -605,13 +656,18 @@ fn git_commit_only_requires_the_project_root_to_equal_the_worktree_root() {
 fn install_active_hook(root: &Path, name: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    let hook = git_required_text(
-        root,
-        &["rev-parse", "--git-path", &format!("hooks/{name}")],
-        "test-hook-path",
-    )
-    .unwrap();
-    let hook = PathBuf::from(hook);
+    // Resolve the hook the way a user's own `git commit` would; the lane's
+    // probes pin `core.hooksPath` to the null device.
+    let mut command = std::process::Command::new("git");
+    umadev_process::git::remove_git_environment(&mut command);
+    let output = command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", &format!("hooks/{name}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "test-hook-path");
+    let hook = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
     let hook = if hook.is_absolute() {
         hook
     } else {

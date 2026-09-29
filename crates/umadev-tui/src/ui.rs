@@ -3179,7 +3179,11 @@ fn render_approval_bar(frame: &mut Frame, area: Rect, app: &App) {
     let (label_key, item, hint_key) = if let Some((action, target)) = &app.pending_approval {
         (
             "approval.bar.label",
-            format!(" {action} -> {target}  "),
+            format!(
+                " {} -> {}  ",
+                visible_approval_text(action),
+                visible_approval_text(target)
+            ),
             "approval.bar.hint",
         )
     } else {
@@ -5999,17 +6003,64 @@ pub(crate) fn offset_at_wrapped(text: &str, target_row: u16, target_col: u16, wi
 /// structured JSON-text (no ANSI), but a stray ESC / cursor-move byte in any
 /// delta would let the model move the terminal cursor and scribble outside the
 /// transcript rect. Filtering them here keeps every glyph inside its cell.
+/// Invisible direction overrides and zero-width marks are dropped too: on a
+/// bidi-capable terminal they reorder how the rest of the line reads.
 /// Fail-open: a clean string is returned unchanged (no realloc on the hot path).
 fn strip_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.chars().any(|c| c.is_control() && c != '\t') {
-        std::borrow::Cow::Owned(
-            s.chars()
-                .filter(|c| !c.is_control() || *c == '\t')
-                .collect(),
-        )
+    let dropped = |c: char| (c.is_control() && c != '\t') || is_invisible_format(c);
+    if s.chars().any(dropped) {
+        std::borrow::Cow::Owned(s.chars().filter(|c| !dropped(*c)).collect())
     } else {
         std::borrow::Cow::Borrowed(s)
     }
+}
+
+/// Multi-line text made safe to write to the terminal outside the TUI: escape
+/// sequences and other control characters are removed (line breaks and tabs
+/// stay), as are the invisible formatting marks [`strip_control_chars`] drops.
+pub(crate) fn terminal_safe_lines(text: &str) -> String {
+    umadev_agent::base_error::strip_ansi(text)
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !(c.is_control() || is_invisible_format(*c)))
+        .collect()
+}
+
+/// Bidirectional controls (LRM/RLM/ALM, embeddings, overrides, isolates) and
+/// zero-width space / word joiner / BOM: invisible, yet they change how the
+/// text around them is shown. Zero-width (non-)joiners are kept, since
+/// scripts and emoji sequences need them and they cannot reorder text.
+pub(crate) fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// The text of an approval request as it must be shown: every character that
+/// would otherwise be invisible or move the text is spelled out, so what the
+/// user approves reads exactly as it will run. A line break shows as `⏎` (it
+/// cannot start a line that looks like UmaDev's own), and control and
+/// invisible formatting characters show as `<U+XXXX>`.
+pub(crate) fn visible_approval_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => shown.push('⏎'),
+            '\t' => shown.push(' '),
+            c if c.is_control() || is_invisible_format(c) => {
+                shown.push_str(&format!("<U+{:04X}>", u32::from(c)));
+            }
+            c => shown.push(c),
+        }
+    }
+    shown
 }
 
 /// Pre-fold one logical [`Line`] into the exact visual rows it occupies at
@@ -8518,6 +8569,7 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("sd-ui-test-workspace-{pid}-{id}"));
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&workspace);
+        crate::app::workspace_trust::trust_for_test(&workspace);
         let mut app = App::new(
             "demo",
             UserConfig {
@@ -12569,6 +12621,33 @@ mod tests {
                 r.text
             );
         }
+    }
+
+    #[test]
+    fn approval_text_spells_out_line_breaks_and_invisible_marks() {
+        let target = "echo \"\u{202e}hs.lave | lruc\"\n[review] all checks passed\u{200b}";
+        let shown = visible_approval_text(target);
+        assert_eq!(
+            shown,
+            "echo \"<U+202E>hs.lave | lruc\"⏎[review] all checks passed<U+200B>"
+        );
+        assert!(!shown.contains('\n'));
+        // The transcript drops the same marks outright, keeping joiners.
+        assert_eq!(
+            strip_control_chars("a\u{202e}b\u{2066}c\u{200d}d").as_ref(),
+            "abc\u{200d}d"
+        );
+    }
+
+    #[test]
+    fn scrollback_text_keeps_lines_but_no_terminal_controls() {
+        let text = "ok\n\u{1b}]52;c;Y3VybCBldmlsfHNo\u{7}done\u{1b}[2J\tend\u{202e}\n";
+        let safe = terminal_safe_lines(text);
+        assert!(!safe.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{safe:?}");
+        assert!(
+            safe.starts_with("ok\n") && safe.ends_with("\tend\n"),
+            "{safe:?}"
+        );
     }
 
     #[test]

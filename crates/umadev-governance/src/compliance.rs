@@ -308,12 +308,16 @@ pub fn file_sha256(path: &std::path::Path) -> Option<String> {
 }
 
 fn file_sha256_beneath(root: &Path, relative: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
     let bytes =
         umadev_state::fs::read_bounded_beneath(root, relative, HASH_INPUT_MAX_BYTES).ok()?;
+    Some(bytes_sha256(&bytes))
+}
+
+fn bytes_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Some(format!("{:x}", hasher.finalize()))
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 /// Compute the SHA-256 hex digest of an in-memory string.
@@ -332,6 +336,11 @@ pub struct ComplianceInputs<'a> {
     pub slug: &'a str,
     /// Parsed quality-gate JSON if present. `None` when missing.
     pub quality_report: Option<&'a serde_json::Value>,
+    /// The exact bytes `quality_report` was parsed from. The quality gate's
+    /// content hash is taken over these bytes and never over a second read of
+    /// the file, so the recorded verdict and its hash describe one document.
+    /// `None` records no quality-gate hash.
+    pub quality_report_raw: Option<&'a [u8]>,
     /// Tool-call audit rows.
     pub tool_calls: &'a [ToolCallRecord],
     /// API-call audit rows.
@@ -442,12 +451,13 @@ pub fn build_compliance_mapping(inputs: &ComplianceInputs<'_>) -> ComplianceMapp
     // Content-hash enrichment: compute SHA-256 of key artifacts for
     // tamper-evident audit. Best-effort — unreadable files are skipped.
     if let Some(root) = inputs.project_root {
-        // Quality gate → UD-EVID-003
+        // Quality gate → UD-EVID-003, hashed over the bytes the verdict was read
+        // from (see `quality_report_raw`).
         let qg_path = format!("output/{}-quality-gate.json", inputs.slug);
-        if let Some(sha) = file_sha256_beneath(root, Path::new(&qg_path)) {
-            if let Some(entry) = evidence.get_mut("UD-EVID-003") {
-                entry.add_content_hash(&qg_path, &sha);
-            }
+        if let (Some(raw), Some(entry)) =
+            (inputs.quality_report_raw, evidence.get_mut("UD-EVID-003"))
+        {
+            entry.add_content_hash(&qg_path, &bytes_sha256(raw));
         }
         // Architecture doc → UD-CODE-003 (API alignment source of truth)
         let arch_path = format!("output/{}-architecture.md", inputs.slug);
@@ -506,17 +516,30 @@ pub fn write_compliance_mapping(
     // containing `..` or path separators would otherwise write outside
     // `output/` (path traversal). The slug derives from the workspace dir
     // name or `--slug`, which we don't fully control.
-    let safe_slug = sanitize_slug(slug);
-    let quality_relative = PathBuf::from("output").join(format!("{safe_slug}-quality-gate.json"));
+    let quality_relative =
+        PathBuf::from("output").join(format!("{}-quality-gate.json", sanitize_slug(slug)));
     let quality_raw = umadev_state::fs::read_bounded_beneath(
         project_root,
         &quality_relative,
         QUALITY_REPORT_MAX_BYTES,
     )
     .ok();
-    let quality_value: Option<serde_json::Value> = quality_raw
-        .as_deref()
-        .and_then(|bytes| serde_json::from_slice(bytes).ok());
+    write_compliance_mapping_with_quality(project_root, slug, quality_raw.as_deref())
+}
+
+/// [`write_compliance_mapping`] for a caller that holds the quality-gate JSON
+/// it just produced: the mapping records that verdict (and hashes those bytes)
+/// instead of reading `output/<slug>-quality-gate.json` back, which anything
+/// able to write the workspace could have replaced in the meantime.
+#[must_use]
+pub fn write_compliance_mapping_with_quality(
+    project_root: &Path,
+    slug: &str,
+    quality_raw: Option<&[u8]>,
+) -> Option<(PathBuf, ComplianceMapping)> {
+    let safe_slug = sanitize_slug(slug);
+    let quality_value: Option<serde_json::Value> =
+        quality_raw.and_then(|bytes| serde_json::from_slice(bytes).ok());
 
     let mut tool_calls =
         read_jsonl::<ToolCallRecord>(project_root, Path::new(".umadev/audit/tool-calls.jsonl"));
@@ -537,6 +560,7 @@ pub fn write_compliance_mapping(
     let doc = build_compliance_mapping(&ComplianceInputs {
         slug: &safe_slug,
         quality_report: quality_value.as_ref(),
+        quality_report_raw: quality_value.as_ref().and(quality_raw),
         tool_calls: &tool_calls,
         api_calls: &api_calls,
         generated_at: None,
@@ -696,6 +720,7 @@ mod tests {
         let doc = build_compliance_mapping(&ComplianceInputs {
             slug: "demo",
             quality_report: None,
+            quality_report_raw: None,
             tool_calls: &calls,
             api_calls: &[],
             generated_at: Some("2026-05-20T00:00:00Z".into()),
@@ -722,6 +747,7 @@ mod tests {
         let doc = build_compliance_mapping(&ComplianceInputs {
             slug: "demo",
             quality_report: None,
+            quality_report_raw: None,
             tool_calls: &[],
             api_calls: &api,
             generated_at: Some("t".into()),
@@ -748,6 +774,7 @@ mod tests {
         let doc = build_compliance_mapping(&ComplianceInputs {
             slug: "demo",
             quality_report: Some(&q),
+            quality_report_raw: None,
             tool_calls: &[],
             api_calls: &[],
             generated_at: Some("t".into()),
@@ -766,6 +793,7 @@ mod tests {
         let doc = build_compliance_mapping(&ComplianceInputs {
             slug: "demo",
             quality_report: None,
+            quality_report_raw: None,
             tool_calls: &calls,
             api_calls: &[],
             generated_at: Some("t".into()),
@@ -851,9 +879,11 @@ mod tests {
         let root = tmp.path();
         fs::create_dir_all(root.join("output")).unwrap();
         fs::create_dir_all(root.join(".umadev/audit")).unwrap();
+        // The file on disk says something else: the hash must describe the
+        // bytes the verdict came from, not a second read of the workspace.
         fs::write(
             root.join("output/demo-quality-gate.json"),
-            r#"{"passed":true,"total_score":95}"#,
+            r#"{"passed":false,"total_score":10}"#,
         )
         .unwrap();
         fs::write(
@@ -863,10 +893,12 @@ mod tests {
         .unwrap();
         fs::write(root.join(".umadev/audit/tool-calls.jsonl"), "").unwrap();
 
-        let q = serde_json::json!({"passed": true, "total_score": 95});
+        let raw = br#"{"passed":true,"total_score":95}"#;
+        let q: serde_json::Value = serde_json::from_slice(raw).unwrap();
         let doc = build_compliance_mapping(&ComplianceInputs {
             slug: "demo",
             quality_report: Some(&q),
+            quality_report_raw: Some(raw),
             tool_calls: &[],
             api_calls: &[],
             generated_at: Some("t".into()),
@@ -875,11 +907,9 @@ mod tests {
         });
         // UD-EVID-003 must carry a content hash for the quality gate file.
         let evid3 = doc.clauses.iter().find(|c| c.id == "UD-EVID-003").unwrap();
+        let expected = format!("output/demo-quality-gate.json:{}", bytes_sha256(raw));
         assert!(
-            evid3
-                .content_hashes
-                .iter()
-                .any(|h| h.starts_with("output/demo-quality-gate.json:")),
+            evid3.content_hashes.contains(&expected),
             "expected quality-gate content hash, got {:?}",
             evid3.content_hashes
         );
@@ -930,6 +960,27 @@ mod tests {
             "compliance mapping escaped output dir: {}",
             path.display()
         );
+    }
+
+    #[test]
+    fn write_compliance_mapping_with_quality_records_the_handed_verdict() {
+        // A passing report left in the workspace must not outvote the verdict
+        // the caller produced in memory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("output")).unwrap();
+        fs::write(
+            root.join("output/demo-quality-gate.json"),
+            r#"{"passed":true,"total_score":95}"#,
+        )
+        .unwrap();
+        let (_, doc) = write_compliance_mapping_with_quality(
+            root,
+            "demo",
+            Some(br#"{"passed":false,"total_score":40}"#),
+        )
+        .unwrap();
+        assert_eq!(doc.quality_gate_passed, Some(false));
     }
 
     #[cfg(unix)]

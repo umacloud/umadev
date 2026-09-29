@@ -48,7 +48,8 @@ impl ResidentExecutionPostcondition {
         route: &RoutePlan,
         objective: &str,
     ) -> Result<Self, ResidentExecutionBlocked> {
-        let baseline = WorkspaceBaseline::capture(root).map_err(snapshot_blocked)?;
+        let baseline =
+            WorkspaceBaseline::capture(root).map_err(|error| snapshot_blocked_at(root, error))?;
         let contract = ExecutionContract::from_route(route, objective);
         let git_commit = (route.class.mutates_workspace() && request_is_git_commit(objective))
             .then(|| GitCommitBaseline::capture(root))

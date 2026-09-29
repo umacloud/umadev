@@ -6166,7 +6166,7 @@ async fn drive_one_turn_with_backoff_and_memories(
                 // Mode-aware floor + self-learning ledger: deny an irreversible
                 // action even headless (the floor the `auto` tier can't skip) plus
                 // the per-mode reversible policy, but honour a class the user has
-                // already approved for this project (`.umadev/trust.json`) so it
+                // already approved for this project (its user approval memory) so it
                 // isn't re-denied. Fail-open: a missing/corrupt ledger behaves as
                 // the bare mode policy. Reversible in-tree edits stay allowed so a
                 // headless build isn't wedged waiting on a human.

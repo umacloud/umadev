@@ -3,8 +3,6 @@ use super::{
     git_output, git_required_text, GitCommitBaseline, GitIndexSnapshot, Path, PathBuf,
     ResidentExecutionBlocked,
 };
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
@@ -342,26 +340,18 @@ impl GitTransactionGuard {
 
     pub(crate) fn record_recovery_warning(&self, error: &ResidentExecutionBlocked) {
         static WARNING_ID: AtomicU64 = AtomicU64::new(1);
-        let runtime = self.root.join(".umadev");
-        if std::fs::symlink_metadata(&runtime)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
-        {
+        // Rooted, link-refusing write: a repository-shipped `.umadev` or
+        // `.umadev/recovery` symlink must not redirect the warning elsewhere.
+        let Ok(root) = umadev_state::fs::RootedDir::open(&self.root) else {
             return;
-        }
-        let directory = runtime.join("recovery");
-        if std::fs::create_dir_all(&directory).is_err() {
-            return;
-        }
+        };
         let id = WARNING_ID.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!(
+        let relative = Path::new(".umadev").join("recovery").join(format!(
             "git-transaction-{}-{id}.warning",
             std::process::id()
         ));
         let note = bounded_text(&error.note, 8_192);
-        if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(path) {
-            let _ = file.write_all(note.as_bytes());
-            let _ = file.sync_all();
-        }
+        let _ = root.publish_new_private(&relative, note.as_bytes(), true);
     }
 }
 

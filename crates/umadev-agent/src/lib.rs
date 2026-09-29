@@ -89,10 +89,12 @@ pub mod pr;
 pub mod project_facts;
 pub mod project_init;
 pub mod recipes;
+pub mod redaction;
 pub(crate) mod retrieval_relevance;
 pub mod review;
 pub mod router;
 pub mod run_lock;
+pub mod run_provenance;
 pub mod runner;
 pub mod runtime_proof;
 pub mod scope_creep;
@@ -109,6 +111,7 @@ pub mod trust;
 pub mod usage_ledger;
 pub mod verify;
 pub mod workspace_diff;
+pub mod workspace_trust;
 
 #[cfg(test)]
 mod test_support;

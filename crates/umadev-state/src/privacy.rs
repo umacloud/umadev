@@ -13,6 +13,21 @@ pub const PROVENANCE_KEY_BYTES: usize = 32;
 const STATE_DIR: &str = ".umadev";
 const KEY_FILE: &str = "provenance.key";
 
+static PINNED_STATE_DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Pin the installation state directory for the rest of this process, ahead of
+/// `UMADEV_HOME` and `HOME`, and return it. The first pin wins.
+///
+/// For test harnesses: the libtest runner shares one process and environment
+/// across parallel tests, so mutating `UMADEV_HOME` races, while a pin keeps
+/// every approval, run stamp and key a test writes out of the developer's real
+/// `~/.umadev`. `make_dir` runs only for the first pin and must return an
+/// existing private directory.
+#[doc(hidden)]
+pub fn pin_state_directory(make_dir: impl FnOnce() -> PathBuf) -> &'static Path {
+    PINNED_STATE_DIRECTORY.get_or_init(make_dir)
+}
+
 /// Resolve the installation state directory selected by the environment.
 ///
 /// `UMADEV_HOME` is the directory itself. Without it, `.umadev` is resolved
@@ -52,7 +67,9 @@ fn open_state_candidate(candidate: &Path, create_if_missing: bool) -> Option<cra
 }
 
 fn state_candidate() -> Option<PathBuf> {
-    if let Some(state) = std::env::var_os("UMADEV_HOME").filter(|value| !value.is_empty()) {
+    if let Some(pinned) = PINNED_STATE_DIRECTORY.get() {
+        Some(pinned.clone())
+    } else if let Some(state) = std::env::var_os("UMADEV_HOME").filter(|value| !value.is_empty()) {
         Some(PathBuf::from(state))
     } else {
         let home = std::env::var_os("HOME")

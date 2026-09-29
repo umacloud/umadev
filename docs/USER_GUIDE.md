@@ -25,6 +25,9 @@ umadev
 
 On first launch, pick one of the five base CLIs and complete that vendor's own login or provider setup before using it. UmaDev reuses the resulting local configuration; it neither performs the login nor stores the credential. Then type your requirement and press Enter.
 
+The first time UmaDev opens a project it also asks whether you trust it; see
+[Workspace trust](#workspace-trust).
+
 UmaDev does not use a base CLI version allowlist. `--version` proves only that
 the selected program can be launched and supplies diagnostics. Authority comes
 from the live protocol, the selected permission profile, and fail-closed runtime
@@ -49,7 +52,7 @@ experience.
 | Base id | Transport | Login/configuration before UmaDev | Permission mapping | Cross-process resume | Vendor CLI platform note |
 |---|---|---|---|---|---|
 | `claude-code` | Vendor-specific bidirectional `stream-json` | Complete Claude Code login/setup in `claude` | Plan=`plan`; Guarded=`default`; Auto=`bypassPermissions`; UmaDev still keeps its irreversible-action floor | Exact `--resume <id>` | Use a platform supported by the installed Claude Code CLI |
-| `codex` | Vendor-specific `codex app-server` JSON-RPC | `codex login` or Codex's own supported credential configuration | Plan=`read-only`; Guarded/Auto default to `danger-full-access`, with on-request/pre-authorized approvals respectively; an explicit project sandbox may only narrow them | Exact `thread/resume` | Use a platform supported by the installed Codex CLI; inherited enterprise/parent sandboxes can still restrict local ports or network |
+| `codex` | Vendor-specific `codex app-server` JSON-RPC | `codex login` or Codex's own supported credential configuration | Plan=`read-only`; Guarded/Auto default to `danger-full-access`, with `untrusted` (every command outside Codex's known read-only set asks)/pre-authorized approvals respectively; a Guarded or Plan one-shot `codex exec` runs `read-only`; an explicit project sandbox may only narrow them | Exact `thread/resume` | Use a platform supported by the installed Codex CLI; inherited enterprise/parent sandboxes can still restrict local ports or network |
 | `opencode` | Vendor-specific loopback HTTP + SSE | `opencode auth login` or OpenCode provider configuration | Plan deny-by-default (including delegation); Guarded ask-by-default; Auto allow, with tool events still audited | Exact persisted-session reattach after permission refresh | Any installed version; use a platform supported by that OpenCode CLI |
 | `grok-build` | ACP v1 via `grok --no-auto-update … agent stdio`; bounded firmware uses the official `--rules` common flag | Headless ACP reuses an existing cached login token or `XAI_API_KEY`; after `initialize`, UmaDev authenticates only with an explicitly available non-interactive method and never auto-selects OAuth or opens a browser | Plan adds `plan` + read-only sandbox + read-only tools and disables subagents; Guarded uses prompts; Auto explicitly pre-approves | Fresh-session handoff today; negotiated resume/load is used only after effective-sandbox attestation and native preflight can both be proved | Any official version; official installers cover macOS/Linux/WSL and native Windows PowerShell |
 | `kimi-code` | Official `kimi acp` v1 JSON-RPC/stdio with live capability negotiation | Run `kimi login` yourself first; UmaDev only revalidates the on-disk token through ACP and never runs a login command or opens a browser | Plan=`plan`; Guarded/Auto keep Kimi `default`; UmaDev locally resolves ordinary Auto approvals, retains the irreversible floor, and renders Kimi's question-over-permission bridge as real choices | Standard `session/resume`, with advertised `session/load` fallback; workspace/profile identity mismatch fails closed | Any official version; Windows tools require Git Bash or `KIMI_SHELL_PATH` |
@@ -221,6 +224,8 @@ research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_con
 | `/cancel` | Stop the active run without resuming it on the next turn |
 | `/run [--slug <slug>] <req>` | Start a new run in Guarded/Auto; use `--slug` to override the project slug; Plan mode remains read-only |
 | `/redo` | Re-run current requirement |
+| `/mode <plan\|guarded\|auto>` | Set the tier for this session (Auto only in a trusted project) |
+| `/trust` | Show whether this project is trusted and change it |
 | `/diff <artifact>` | View an artifact (prd/architecture/uiux) |
 
 ### Inspect
@@ -280,6 +285,38 @@ max_review_rounds = 2       # limit auto-fix cycles (default: 3)
 [experts]
 custom_knowledge = "team-standards/"  # additional knowledge directory
 ```
+
+A repository's `.umadevrc` can keep the gates asking but can never raise the
+tier: `auto_approve_gates = true` is ignored with a warning.
+
+### Workspace trust
+
+A cloned project can carry files that run code or widen permissions: UmaDev's
+own `.umadevrc` and saved run state, and each base's project configuration
+(Claude Code's `.claude/settings*.json` and `.mcp.json`, Codex's
+`.codex/config.toml`, OpenCode's `opencode.json` and `.opencode/`, Kimi Code's
+MCP files). So the first time UmaDev runs in a project it asks whether you
+trust it: a Trust / Don't trust picker in the TUI, a `y/N` question on a CLI
+terminal. The answer is kept in `~/.umadev`, keyed to this installation and the
+project's path, never in the project. Change it with `/trust` or
+`umadev trust [--revoke]`; `umadev doctor` shows where the project stands.
+
+A command nobody can answer (CI, a pipe, a script) treats an undecided project
+as untrusted. `--trust-project` or `UMADEV_TRUST_PROJECT=1` trusts it for that
+one command without recording anything.
+
+| | Trusted | Untrusted |
+|---|---|---|
+| Tier | Guarded by default; Auto by your choice (`shift+Tab`, `/mode auto`, `--mode auto`) | Plan or Guarded; Auto is refused |
+| Resuming a saved run | Its tier, if UmaDev on this machine wrote it or you adopted it | At most Guarded |
+| Claude Code | Project settings, hooks and MCP servers load | `--setting-sources user --strict-mcp-config`; UmaDev's own governance hooks, when installed, are passed with `--settings` |
+| Codex | Codex's own trust decision applies | The project and its parents are marked `untrusted`, so project config, hooks and exec policies stay off |
+| OpenCode | Project config loads | `OPENCODE_DISABLE_PROJECT_CONFIG=1` |
+| Grok Build | Grok's own folder trust applies | Grok's own folder trust applies |
+| Kimi Code | Project MCP files load | Refused when the project ships `.mcp.json` or `.kimi-code/mcp.json` (Kimi cannot skip them) |
+
+MCP servers added to a project with `umadev mcp-manage` load only once the
+project is trusted.
 
 ### `~/.umadev/config.toml` (user-level)
 

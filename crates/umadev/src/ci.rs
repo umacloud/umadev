@@ -1814,6 +1814,7 @@ mod tests {
     /// the product path still wrote nothing.
     #[test]
     fn ci_honours_the_runs_governance_context() {
+        crate::tests::isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         // The hue the user asked for, written as the run wrote it. Named hues, so the ONLY
@@ -1876,6 +1877,7 @@ mod tests {
     /// banned-hue band down for a NEW requirement whose first line is "no purple".
     #[test]
     fn a_stale_context_from_a_different_requirement_does_not_stand_the_rule_down() {
+        crate::tests::isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(
