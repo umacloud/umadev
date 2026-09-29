@@ -3,6 +3,17 @@
 
 use super::{has_reproduction_test, runtime_proof_blocking, RoutePlan, RunOptions};
 use crate::acceptance::EndpointAcceptance;
+use crate::coverage::RequirementCoverage;
+
+/// Whether requirement coverage blocks this run: opted in per run
+/// (`UMADEV_STRICT_COVERAGE=1`, captured on the options) or by the project's
+/// `[pipeline] strict_coverage = true`, exactly as the legacy spec gate reads it.
+fn strict_coverage(options: &RunOptions) -> bool {
+    options.strict_coverage
+        || crate::config::load_project_config(&options.project_root)
+            .pipeline
+            .strict_coverage
+}
 
 /// What the REQUIRED acceptance floor found: the blocking findings a fix turn is
 /// asked to repair, and a note for every check that genuinely could not run. Such a
@@ -16,9 +27,10 @@ pub(super) struct AcceptanceFloor {
 
 /// The REQUIRED acceptance floor for a deliberate build (Wave 4, §L4 / task 2) —
 /// the spec→tasks + spec→code verification, promoted to a blocking signal on the
-/// default deliberate path. Folds in coverage gaps, interface-acceptance gaps,
-/// frontend↔contract drift, an unverified runtime-proof, and (for a Bugfix) a
-/// missing reproduction test. Each contributor is fail-open: a missing artifact /
+/// default deliberate path. Folds in coverage gaps (blocking only under strict
+/// coverage), interface-acceptance gaps, frontend↔contract drift, an unverified
+/// runtime-proof, and (for a Bugfix) a missing reproduction test. Each contributor
+/// is fail-open: a missing artifact /
 /// unparseable doc yields no gap (a neutral skip), so a check that genuinely
 /// cannot run never fabricates a failure. Returns the blocking lines (empty =
 /// the floor is clean OR nothing could be checked).
@@ -50,13 +62,29 @@ pub(super) fn acceptance_floor(
     let mut out: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
-    // spec→tasks: a declared FR-NNN no task covers (a requirement at risk of being
-    // silently dropped). Fail-open: no PRD / no FR ids → empty.
-    for r in crate::coverage::uncovered_requirements(root, &slug) {
-        out.push(format!(
-            "coverage gap: requirement {r} is declared in the PRD but no task implements it — \
-             build it, or remove it from scope honestly"
-        ));
+    // spec→tasks: a declared FR-NNN that no plan step, task list or architecture doc
+    // traces (a requirement at risk of being silently dropped). Advisory by default,
+    // exactly like the legacy spec gate: a note names the untraced ids. Under strict
+    // coverage each one blocks, with a fix the base can make: build it and trace its
+    // id, or drop it from scope. Coverage that cannot be judged is only a note.
+    match crate::coverage::requirement_coverage(root, &slug) {
+        RequirementCoverage::Covered => {}
+        RequirementCoverage::Uncovered(ids) if strict_coverage(options) => {
+            out.extend(ids.iter().map(|r| {
+                format!(
+                    "coverage gap: requirement {r} is declared in the PRD but no plan step, task \
+                     list or architecture doc traces it (strict coverage is on) — build it and \
+                     cite {r} in output/{slug}-execution-plan.md, or remove it from scope honestly"
+                )
+            }));
+        }
+        RequirementCoverage::Uncovered(ids) => notes.push(umadev_i18n::tlf(
+            "qc.coverage_advisory",
+            &[&ids.len().to_string(), &ids.join(", ")],
+        )),
+        RequirementCoverage::Unavailable(reason) => {
+            notes.push(umadev_i18n::tlf("qc.coverage_unavailable", &[&reason]));
+        }
     }
     // spec→code: a planned API endpoint with no implementation evidence on disk.
     // Fail-open: no architecture doc / no endpoints → empty. A scan that could not

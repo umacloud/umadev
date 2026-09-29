@@ -103,7 +103,7 @@ binary).
 | --- | --- | --- |
 | `UMADEV_CONTINUOUS` | Long-session ("continuous") driver. On by default; set an off value (or `UMADEV_LEGACY_RUN`) to opt out to the single-shot driver. | on |
 | `UMADEV_LEGACY_PIPELINE` | Route `/run` through the legacy fixed 9-phase pipeline instead of the default director-driven agentic path. Enable with `1`/`true`/`on`. Also selects the `UMADEV_RUN_BUDGET_SECS` "whole-run soft budget" semantics above. | off (director path) |
-| `UMADEV_STRICT_COVERAGE` | Treat coverage as a strict gate. Enable with `1`. | off |
+| `UMADEV_STRICT_COVERAGE` | Treat PRD requirement coverage as a blocking gate: an `FR-` id that no plan step, task list or architecture doc cites blocks delivery (the legacy pipeline pauses at `spec`). Off, untraced requirements are only reported in a note. Enable with `1`, or with `[pipeline] strict_coverage = true` in `.umadevrc`. | off |
 
 ---
 

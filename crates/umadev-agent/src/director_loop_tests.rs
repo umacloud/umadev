@@ -461,10 +461,9 @@ fn test_step_files(id: &str) -> crate::plan_state::StepFiles {
 /// Seed the three core-doc deliverables the doc-first skeleton requires, so a
 /// deliberate step-driven build's prepended PM/architect/UIUX doc steps pass their
 /// FileContains/FileExists acceptance and the plan proceeds to the code steps.
-/// Also seeds an execution plan citing the PRD's `FR-001` so the requirement-
-/// coverage floor is satisfied — otherwise the PRD's declared `FR-001` reads as an
-/// uncovered requirement, failing the contract floor a backend step verifies against
-/// (`ContractMatches`) and stalling the build at the frontend phase.
+/// Also seeds an execution plan citing the PRD's `FR-001`, so the requirement is
+/// traced and the final gate's coverage check stays clean even under strict
+/// coverage.
 ///
 /// Also seeds the TWO code-phase-prep deliverables the skeleton now guarantees
 /// structurally: an authored test file under `tests/` (the QA test-authoring
@@ -2905,7 +2904,7 @@ fn fix_directive_carries_the_bounded_raw_failure_log_when_captured() {
 // ── Wave 4: required acceptance floor (deliberate only; bugfix repro test) ──
 
 /// Write a PRD declaring FR-001 + FR-002 and a tasks list covering only FR-001,
-/// so `uncovered_requirements` reports FR-002 as a coverage gap.
+/// so requirement coverage reports FR-002 as untraced.
 fn seed_coverage_gap(root: &std::path::Path) {
     std::fs::create_dir_all(root.join("output")).unwrap();
     std::fs::write(
@@ -2963,18 +2962,115 @@ fn a_backend_only_run_is_not_blocked_by_a_leftover_uiux_doc() {
 
 #[test]
 fn acceptance_floor_blocks_a_deliberate_build_with_a_coverage_gap() {
-    // A deliberate build with a declared-but-unimplemented requirement must
-    // surface a coverage gap as a blocking finding (the required floor).
+    // Under strict coverage, a deliberate build with a declared-but-untraced
+    // requirement surfaces it as a blocking finding. By default it is advisory,
+    // like the legacy spec gate: a note, never a finding the base is asked to fix.
     let tmp = tempfile::TempDir::new().unwrap();
     seed_coverage_gap(tmp.path());
-    let o = opts(tmp.path());
+    let mut o = opts(tmp.path());
     let route = build_route();
+    let floor = acceptance_floor(&o, Some(&route), None);
+    assert!(
+        !floor.blocking.iter().any(|b| b.contains("coverage gap")),
+        "{:?}",
+        floor.blocking
+    );
+    assert!(
+        floor.notes.iter().any(|n| n.contains("FR-002")),
+        "{:?}",
+        floor.notes
+    );
+    o.strict_coverage = true;
     let blocking = acceptance_floor_blocking(&o, Some(&route));
     assert!(
         blocking
             .iter()
             .any(|b| b.contains("coverage gap") && b.contains("FR-002")),
         "the uncovered requirement is a blocking finding: {blocking:?}"
+    );
+}
+
+#[tokio::test]
+async fn deliberate_final_gate_is_not_blocked_by_coverage_without_a_task_list() {
+    // Every fresh deliberate build: the PM step writes a PRD numbering FR-001, and
+    // nothing the director writes is a legacy task list. Coverage is advisory unless
+    // strict coverage is on, so the final gate must not tell the base to "build"
+    // FR-001 (a finding no edit could clear); the user sees an advisory note.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_core_docs(tmp.path());
+    std::fs::remove_file(tmp.path().join("output/demo-execution-plan.md")).unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(vec![], true, r#"{"accepts": true, "blocking": []}"#);
+    let o = opts(tmp.path());
+    assert!(!o.strict_coverage);
+    let qc = run_auto_qc(
+        &mut sess,
+        &o,
+        &events,
+        Some(&build_route()),
+        None,
+        false,
+        false,
+    )
+    .await;
+    assert!(
+        !qc.blocking.iter().any(|b| b.contains("coverage gap")),
+        "{:?}",
+        qc.blocking
+    );
+    assert!(
+        rec.events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("FR-001"))),
+        "the untraced requirement is still reported: {:?}",
+        rec.events()
+    );
+}
+
+#[test]
+fn strict_coverage_blocks_an_untraced_requirement_until_it_is_traced() {
+    // The genuine case: with strict coverage on (per run, or `[pipeline]
+    // strict_coverage = true` in `.umadevrc`), an FR-id nothing traces blocks, and
+    // the base can clear it by tracing the id where it is built.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_core_docs(tmp.path());
+    std::fs::remove_file(tmp.path().join("output/demo-execution-plan.md")).unwrap();
+    let mut o = opts(tmp.path());
+    o.strict_coverage = true;
+    let route = build_route();
+    let blocking = acceptance_floor_blocking(&o, Some(&route));
+    assert!(
+        blocking
+            .iter()
+            .any(|b| b.contains("coverage gap") && b.contains("FR-001")),
+        "{blocking:?}"
+    );
+
+    o.strict_coverage = false;
+    std::fs::write(
+        tmp.path().join(".umadevrc"),
+        "[pipeline]\nstrict_coverage = true\n",
+    )
+    .unwrap();
+    assert!(
+        acceptance_floor_blocking(&o, Some(&route))
+            .iter()
+            .any(|b| b.contains("coverage gap") && b.contains("FR-001")),
+        "the project's strict_coverage setting blocks too"
+    );
+
+    // The architecture doc now traces FR-001 → the gap clears.
+    std::fs::write(
+        tmp.path().join("output/demo-architecture.md"),
+        "# Architecture\n\n## API\nGET /api/x — login (FR-001)\n",
+    )
+    .unwrap();
+    assert!(
+        !acceptance_floor_blocking(&o, Some(&route))
+            .iter()
+            .any(|b| b.contains("coverage gap")),
+        "a traced requirement is covered"
     );
 }
 
@@ -2989,9 +3085,11 @@ async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
 
-    // Deliberate route → the floor runs → the coverage gap blocks.
+    // Deliberate route → the floor runs → the coverage gap blocks (strict coverage,
+    // so the gap is a blocking finding rather than an advisory note).
     let mut deliberate = opts(tmp.path());
     deliberate.requirement = "做一个完整的任务管理产品".to_string();
+    deliberate.strict_coverage = true;
     let route = build_route();
     let qc = run_auto_qc(
         &mut sess,
@@ -3012,6 +3110,7 @@ async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
     // Lean requirement → QC returns at the lean short-circuit, BEFORE the floor.
     let mut lean = opts(tmp.path());
     lean.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
+    lean.strict_coverage = true;
     let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None, false, false).await;
     assert!(
         !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
@@ -3032,6 +3131,7 @@ async fn deliberate_route_with_lean_reading_requirement_still_runs_full_gate() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
     let mut o = opts(tmp.path());
+    o.strict_coverage = true;
     // A requirement the keyword classifier would call LEAN…
     o.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
     assert!(

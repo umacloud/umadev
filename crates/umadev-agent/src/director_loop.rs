@@ -6833,7 +6833,7 @@ async fn run_auto_qc(
     // 2b. REQUIRED ACCEPTANCE FLOOR (Wave 4, §L4 / task 2). For a DELIBERATE build
     //     (Standard/Deep) the spec→tasks + spec→code verification becomes a REQUIRED
     //     blocking signal on the default path — not legacy-only. We fold in:
-    //       - coverage gaps   (FR-NNN declared in the PRD but no task cites it),
+    //       - coverage gaps   (an untraced PRD FR-NNN; blocking only when strict),
     //       - acceptance gaps (planned API endpoints with no implementation),
     //       - contract drift  (frontend fetch URLs with no matching backend route),
     //       - runtime-proof   (a written runtime-proof.json that did NOT verify).
