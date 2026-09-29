@@ -1289,17 +1289,13 @@ fn govern_tool_call(
     // call can't pop up a picker and auto-cancels — previously surfaced as a bare
     // "AskUserQuestion" stub with NO options, silently treated as cancelled. Now
     // we render the question + numbered options as a prominent Note and give the
-    // tool row a real one-line detail, so the user SEES what's asked. A2#6: when
-    // this turn is a TUI-HOSTED director step (a steering intake exists), the
-    // hint is the HONEST mid-run variant — the build continues with the base's
-    // default and a typed answer folds in as steering at the next step boundary;
-    // the legacy pipeline keeps its existing relay framing. Fail-open: a
-    // non-question / unreadable call → None.
-    let ask_surface = if crate::interaction::steering_hosted() {
-        crate::ask_question::surface_mid_run(name, input)
-    } else {
-        crate::ask_question::surface(name, input)
-    };
+    // tool row a real one-line detail, so the user SEES what's asked. The hint
+    // must be honest about who can answer: with a live host-request surface the
+    // request waits for the user's reply; without one (the headless CLI, the
+    // unscoped legacy pipeline) the host already declined it with a safe default,
+    // so the note promises no reply. Fail-open: a non-question / unreadable call
+    // → None.
+    let ask_surface = crate::ask_question::surface_for_run(name, input);
     if let Some(surface) = ask_surface {
         target = surface.detail;
         events.emit(EngineEvent::Note(surface.note));
@@ -1966,6 +1962,19 @@ fn gate_for_phase(phase: Phase) -> Gate {
 /// directly, do NOT ask me whether to continue." This is the single fix for the
 /// single-shot path's "base replies a paragraph and asks 'shall I continue?'"
 /// failure — in a live agentic session the base just does it.
+/// The sections the quality gate's UD-ART-002 content check reads in the three
+/// core documents. The legacy Docs directive names them — the contract the
+/// single-shot expert prompts already carry — so a well-written document is not
+/// failed, and the whole gate with it, for structure it was never asked for.
+const DOCS_SECTION_CONTRACT: &str = "Required structure (the quality gate checks it): the PRD \
+     has `## Goal`, `## Scope` (in / out of scope) and `## Acceptance criteria` written as \
+     `- [ ]` checkbox lines that cite FR ids; the architecture has `## API surface` as a \
+     markdown table (`| Method | Path | Request | Response | Auth |`) and `## Data model` with \
+     a field table per entity; the UI/UX spec declares CSS color tokens (`--color-…`) and \
+     typography tokens (`--font-…`), one icon library, and component states (hover / focus \
+     / active / disabled). Write the prose in the user's language; a heading may be \
+     translated (`## 目标`) as long as its section is there.";
+
 fn phase_directive(
     options: &RunOptions,
     phase: Phase,
@@ -2015,7 +2024,7 @@ fn phase_directive(
              - `output/{slug}-uiux.md` (design system: tokens, typography, icon library)\n\
              Use the research you just produced. Follow the UmaDev rules you were given \
              (no emoji icons, design-token colors only, frontend fetch paths must match the \
-             architecture API table).\n\n{no_ask}"
+             architecture API table).\n{DOCS_SECTION_CONTRACT}\n\n{no_ask}"
         ),
         Phase::Spec => format!(
             "{role}The user has APPROVED the three documents. Now translate them into an \
@@ -2727,6 +2736,11 @@ async fn review_one(
         }
         return RoleVerdict::unavailable(&role, reason);
     }
+    // Base-call gate: one permit per judge turn — acquired here, after the fork
+    // handshake and before the judge's own timeout starts — as the single-shot
+    // critics do, so a concurrent team never opens more gateway connections than
+    // the budget (default 1). Released when this seat's review settles.
+    let _base_permit = crate::base_gate::base_permit().await;
     if let Some(surface) = cold {
         let consult = ColdConsult::new(surface, ForkConsult::new(fork));
         let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
@@ -2776,6 +2790,67 @@ pub(crate) struct ReworkTurn {
     /// Receipt for exact reusable-skill blocks in the accepted directive. It is
     /// settled by the same mechanical verifier as the knowledge receipt.
     pub skill_receipt: Option<SkillReceiptGuard>,
+    /// The base itself ended the turn FAILED (after the pump's bounded transient
+    /// backoff): its classified cause and the diagnosed reason already shown to
+    /// the user. `None` for every other settle.
+    pub failure: Option<crate::base_error::TurnFailure>,
+}
+
+/// Timing of one rework/doer turn, hoisted out of the pump so a test can drive
+/// tiny deterministic windows: the idle watchdog, the sliding run-budget window,
+/// and the transient-failure backoff schedule.
+#[derive(Debug, Clone, Copy)]
+struct ReworkPacing {
+    idle: crate::director_loop::IdleBudget,
+    idle_window: std::time::Duration,
+    backoff_base: std::time::Duration,
+    backoff_cap: std::time::Duration,
+}
+
+impl ReworkPacing {
+    /// The production pacing around `idle`: the env-configured sliding run budget
+    /// and the same bounded backoff schedule the director turn pump uses.
+    fn production(idle: crate::director_loop::IdleBudget) -> Self {
+        let (backoff_base, backoff_cap) = transient_backoff_schedule();
+        Self {
+            idle,
+            idle_window: crate::director_loop::run_budget(),
+            backoff_base,
+            backoff_cap,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only backoff schedule for pumps reached through the director's
+    /// `summon`, which cannot thread one in (tokio tests run on one thread).
+    static TEST_BACKOFF: std::cell::Cell<Option<(std::time::Duration, std::time::Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin (or clear) the backoff schedule of pumps this test thread drives.
+#[cfg(test)]
+pub(crate) fn set_test_transient_backoff(
+    schedule: Option<(std::time::Duration, std::time::Duration)>,
+) {
+    TEST_BACKOFF.with(|cell| cell.set(schedule));
+}
+
+#[cfg(test)]
+fn transient_backoff_schedule() -> (std::time::Duration, std::time::Duration) {
+    TEST_BACKOFF.with(std::cell::Cell::get).unwrap_or((
+        crate::director_loop::TRANSIENT_BACKOFF_BASE,
+        crate::director_loop::TRANSIENT_BACKOFF_CAP,
+    ))
+}
+
+#[cfg(not(test))]
+fn transient_backoff_schedule() -> (std::time::Duration, std::time::Duration) {
+    (
+        crate::director_loop::TRANSIENT_BACKOFF_BASE,
+        crate::director_loop::TRANSIENT_BACKOFF_CAP,
+    )
 }
 
 /// Inject the rework directive into the MAIN session and pump its turn through
@@ -2883,10 +2958,41 @@ async fn drive_rework_turn_with_idle_and_memories(
     idle: crate::director_loop::IdleBudget,
     deadline: std::time::Instant,
 ) -> ReworkTurn {
+    drive_rework_turn_paced(
+        session,
+        options,
+        events,
+        directive,
+        memories,
+        skill_candidate,
+        ReworkPacing::production(idle),
+        deadline,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_rework_turn_paced(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    memories: Vec<umadev_knowledge::MemoryRef>,
+    skill_candidate: Option<SkillPromptCandidate>,
+    pacing: ReworkPacing,
+    deadline: std::time::Instant,
+) -> ReworkTurn {
     // Estimate this turn's token cost up front (the session stream carries no usage
     // on TurnDone) so the summon-driven step path records usage on the DEFAULT loop,
     // for every base — recorded once at TurnDone. Mirrors `drive_one_turn`.
     let mut est_tokens: u64 = crate::director_loop::approx_tokens(&directive);
+    // Base-call gate: hold ONE permit for this whole doer/rework turn (the send,
+    // the drain, any transient re-send), exactly like `drive_one_turn` — a plan
+    // step is a real base turn, so a pre-warm or a fork must not open a second
+    // gateway connection meanwhile. Released on return, before the scheduler
+    // verifies or convenes critics (each judge turn takes its own permit), so it
+    // is never held while waiting for another permit.
+    let _base_permit = crate::base_gate::base_permit().await;
     if session.send_turn(directive.clone()).await.is_err() {
         return ReworkTurn {
             done: false,
@@ -2898,6 +3004,7 @@ async fn drive_rework_turn_with_idle_and_memories(
             base_agents: crate::bg_agents::BaseAgentObservation::default(),
             memory_receipt: None,
             skill_receipt: None,
+            failure: None,
         };
     }
     let memory_receipt = commit_sent_memories(&options.project_root, &directive, &memories)
@@ -2920,7 +3027,7 @@ async fn drive_rework_turn_with_idle_and_memories(
     // every productive event so a rework/doer turn that keeps producing (a slow build
     // step writing code / running a long test) runs on up to the absolute cap
     // `deadline` instead of being guillotined at a fixed wall-clock instant.
-    let idle_window = crate::director_loop::run_budget();
+    let idle_window = pacing.idle_window;
     let mut last_progress = std::time::Instant::now();
     // Outstanding-background-agents guard (the premature-final-report fix): this
     // pump drives the director loop's DOER steps (`director::summon`), where the
@@ -2938,6 +3045,9 @@ async fn drive_rework_turn_with_idle_and_memories(
     // this directive's research/planning framing (see the `TurnStatus::Failed` handling
     // in the `TurnDone` arm below); a code rework never matches the framing.
     let mut capability_redriven = false;
+    // Bounded, VISIBLE backoff-retries of a transient base failure (429 /
+    // overloaded / network) already spent on this turn — see the TurnDone arm.
+    let mut transient_retries: u32 = 0;
     // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
     // `review_and_rework` / the director's `summon`) was a naked
     // `next_event().await` — a base that hangs mid-rework would freeze every
@@ -2978,10 +3088,24 @@ async fn drive_rework_turn_with_idle_and_memories(
                 base_agents: bg.observation(),
                 memory_receipt,
                 skill_receipt,
+                failure: None,
             };
         }
-        let ev = match crate::director_loop::next_event_idle(session, idle, in_tool_call, Some(eff))
-            .await
+        // H6: while a tool is in flight the wait is bounded by the ABSOLUTE cap
+        // `deadline` (a live-but-silent build/test must survive to the hard
+        // ceiling); with no tool in flight the sliding `eff` still catches a hung
+        // base after one idle window — the same bound `drive_one_turn` uses.
+        let ev = match crate::director_loop::next_event_idle(
+            session,
+            pacing.idle,
+            in_tool_call,
+            Some(crate::director_loop::idle_wait_deadline(
+                in_tool_call,
+                deadline,
+                eff,
+            )),
+        )
+        .await
         {
             crate::director_loop::IdleEvent::Event(ev) => ev,
             // Session ended mid-rework (incl. a base that died mid-tool, caught by the
@@ -3007,11 +3131,41 @@ async fn drive_rework_turn_with_idle_and_memories(
                     base_agents: bg.observation(),
                     memory_receipt,
                     skill_receipt,
+                    failure: None,
                 };
             }
             crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
+                // M5: the run budget ran out while a live tool was silent — a budget
+                // stop, not a hang. Interrupt the base (bounded) so the next turn does
+                // not read this one's events, and settle gracefully on what's built.
+                if in_tool_call && std::time::Instant::now() >= eff {
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(
+                            crate::director_loop::INTERRUPT_TIMEOUT_SECS,
+                        ),
+                        session.interrupt(),
+                    )
+                    .await;
+                    crate::director_loop::record_estimated_usage(&options.backend, est_tokens);
+                    events.emit(EngineEvent::Note(
+                        "team · run budget reached mid-tool — interrupted the base and \
+                         finalizing on what's built (raise UMADEV_RUN_BUDGET_SECS for a \
+                         longer run)"
+                            .to_string(),
+                    ));
+                    return ReworkTurn {
+                        done: true,
+                        send_failed: false,
+                        text,
+                        pitfalls,
+                        base_agents: bg.observation(),
+                        memory_receipt,
+                        skill_receipt,
+                        failure: None,
+                    };
+                }
                 events.emit(EngineEvent::Note(crate::director_loop::enrich_idle_reason(
-                    &crate::director_loop::idle_reason(idle.window(false)),
+                    &crate::director_loop::idle_reason(pacing.idle.window(false)),
                     exit,
                     stderr_tail,
                     &options.backend,
@@ -3024,6 +3178,7 @@ async fn drive_rework_turn_with_idle_and_memories(
                     base_agents: bg.observation(),
                     memory_receipt,
                     skill_receipt,
+                    failure: None,
                 };
             }
         };
@@ -3152,6 +3307,7 @@ async fn drive_rework_turn_with_idle_and_memories(
                         base_agents: bg.observation(),
                         memory_receipt,
                         skill_receipt,
+                        failure: None,
                     };
                 }
             }
@@ -3168,6 +3324,7 @@ async fn drive_rework_turn_with_idle_and_memories(
                         base_agents: bg.observation(),
                         memory_receipt,
                         skill_receipt,
+                        failure: None,
                     };
                 }
             }
@@ -3187,7 +3344,7 @@ async fn drive_rework_turn_with_idle_and_memories(
             SessionEvent::PromptQueueChanged(_) => {
                 // State-only resident-chat event; rework execution is unchanged.
             }
-            SessionEvent::TurnDone { status, usage } => {
+            SessionEvent::TurnDone { status, mut usage } => {
                 // CAPABILITY DEGRADE (research/planning summon only): the base is ALIVE
                 // and answered, but the gateway refused ONE optional hosted tool it
                 // reached for (a hosted `web_search`). On the research/planning seam,
@@ -3222,6 +3379,50 @@ async fn drive_rework_turn_with_idle_and_memories(
                             continue;
                         }
                         // Send failed → the session is going away; settle honestly below.
+                    }
+                    // Visible bounded backoff-retry of a TRANSIENT base failure (a 429
+                    // rate limit, an overloaded base, a network blip), mirroring
+                    // `drive_one_turn` / `drive_phase`: a countdown Note (never a silent
+                    // wait), back off, re-drive the SAME directive — bounded by
+                    // `MAX_TRANSIENT_RETRIES` and the run deadline. A quota, auth or
+                    // other hard failure is never retried here.
+                    if crate::base_error::is_transient(&crate::base_error::classify(
+                        None,
+                        None,
+                        Some(reason),
+                    )) && transient_retries < crate::director_loop::MAX_TRANSIENT_RETRIES
+                        && std::time::Instant::now() < deadline
+                    {
+                        transient_retries += 1;
+                        // The failed attempt still spent tokens.
+                        crate::director_loop::record_turn_usage(options, events, usage, est_tokens);
+                        let wait = crate::director_loop::transient_backoff_wait(
+                            pacing.backoff_base,
+                            pacing.backoff_cap,
+                            transient_retries,
+                        );
+                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "tui.retry.countdown",
+                            &[
+                                &wait.as_secs().to_string(),
+                                &transient_retries.to_string(),
+                                &crate::director_loop::MAX_TRANSIENT_RETRIES.to_string(),
+                            ],
+                        )));
+                        tokio::time::sleep(wait).await;
+                        if session.send_turn(directive.clone()).await.is_ok() {
+                            // Fresh attempt: the failed turn produced no usable output.
+                            est_tokens = crate::director_loop::approx_tokens(&directive);
+                            text.clear();
+                            pitfalls.clear();
+                            in_tool_call = false;
+                            tool_activity.clear();
+                            last_progress = std::time::Instant::now();
+                            continue;
+                        }
+                        // Send failed → settle honestly below; usage is already recorded.
+                        usage = None;
+                        est_tokens = 0;
                     }
                 }
                 // Outstanding-background-agents guard: a CLEAN finish while the
@@ -3267,6 +3468,19 @@ async fn drive_rework_turn_with_idle_and_memories(
                 // back to the chars/4 estimate (opencode, or any base that didn't
                 // report). Mirrors `director_loop::drive_one_turn`.
                 crate::director_loop::record_turn_usage(options, events, usage, est_tokens);
+                // A base-reported failure is never swallowed: diagnose it (429 →
+                // "rate limit …", quota → "quota used up …") where the user is
+                // watching and carry the cause out, so the step scheduler can stop
+                // on it instead of re-driving an unchanged tree.
+                let failure = match &status {
+                    TurnStatus::Failed(reason) => {
+                        let failure =
+                            crate::base_error::TurnFailure::diagnose(reason, &options.backend);
+                        events.emit(EngineEvent::Note(failure.reason.clone()));
+                        Some(failure)
+                    }
+                    _ => None,
+                };
                 // Completed / Truncated → accept and re-review; Interrupted /
                 // Failed → stop reworking (fail-open, advisory).
                 return ReworkTurn {
@@ -3278,6 +3492,7 @@ async fn drive_rework_turn_with_idle_and_memories(
                     base_agents: bg.observation(),
                     memory_receipt,
                     skill_receipt,
+                    failure,
                 };
             }
         }
@@ -3338,7 +3553,8 @@ impl Blackboard {
             // One host-built file-boundary bundle is shared by every code critic.
             // It is below the smallest downstream critic limit, so no role applies
             // a hidden second mid-file truncation. Its manifest carries both
-            // included and normally sampled-out paths.
+            // included and normally sampled-out paths. (Documents are excerpted
+            // per seat and name every omitted section: `review_doc_excerpt`.)
             source_digest(options, kind)
         } else {
             SourceDigest::default()
@@ -4392,8 +4608,8 @@ const INDEPENDENT_REVIEW_FIREWALL: &str = "You are opening an INDEPENDENT, clean
      and does — not what its author intended, narrated, or claimed. The supplied payload is the \
      ONLY review boundary; its manifest explicitly reports any sampled or omitted files. Do NOT \
      call tools, inspect the workspace, read extra files, or search conversation logs. If the \
-     payload is insufficient, report the review as unavailable \
-     or advisory in the requested JSON instead of expanding scope.";
+     payload is insufficient to judge something, say so in `advisory` instead of expanding \
+     scope; only a concrete defect the payload itself shows belongs in `blocking`.";
 
 const REVIEW_REPLY_MAX_CHARS: usize = 16_000;
 
@@ -4620,6 +4836,12 @@ fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
 /// [`parse_verdict`] without the fail-open collapse: `None` when the reply holds
 /// no JSON object / doesn't deserialize — so a caller with a BETTER fallback than
 /// "empty accept" (the cold consult falls back to the FORK) can take it instead.
+///
+/// A reviewer that answered with `accepts: false` but listed no must-fix item has
+/// raised no blocker: that is an advisory-only acceptance (its notes stay in
+/// `advisory`), never the host-owned "no verdict" state reserved for transport,
+/// parse and timeout failures — which would pause the run for a `/continue` that
+/// only asks the same reviewer the same question again.
 fn try_parse_verdict(role: &str, text: &str) -> Option<RoleVerdict> {
     let json = extract_json_object(text)?;
     let shape = serde_json::from_str::<serde_json::Value>(&json).ok()?;
@@ -4629,9 +4851,13 @@ fn try_parse_verdict(role: &str, text: &str) -> Option<RoleVerdict> {
     {
         return None;
     }
-    serde_json::from_str::<RoleVerdict>(&json)
-        .ok()
-        .map(|v| v.normalized(role))
+    serde_json::from_str::<RoleVerdict>(&json).ok().map(|v| {
+        let mut verdict = v.normalized(role);
+        if verdict.blocking.is_empty() {
+            verdict.accepts = true;
+        }
+        verdict
+    })
 }
 
 /// Extract the first balanced top-level JSON object from `text` (the judge reply
@@ -5209,6 +5435,47 @@ mod tests {
             detail_nonempty,
             "the AskUserQuestion tool row has a real detail"
         );
+    }
+
+    #[test]
+    fn headless_ask_question_note_does_not_promise_a_reply() {
+        // S02-8: with no live answer surface (the headless `umadev run`), the host
+        // declines the base's question with a safe default. The note must still
+        // show the question, but never promise a relay or a paused request the
+        // user could answer — nothing is waiting for them.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Guarded);
+        let (events, rec) = sink();
+        let policy = umadev_governance::Policy::default();
+        govern_tool_call(
+            &options,
+            &events,
+            &policy,
+            Phase::Quality,
+            None,
+            "AskUserQuestion",
+            &serde_json::json!({
+                "questions": [{
+                    "question": "Which database should the API use?",
+                    "options": [{"label": "Postgres"}, {"label": "MongoDB"}]
+                }]
+            }),
+        );
+        let note = rec
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                EngineEvent::Note(note) if note.contains("Which database") => Some(note),
+                _ => None,
+            })
+            .expect("the question is still surfaced");
+        assert!(note.contains("1. Postgres"), "{note}");
+        for promise in ["ask.prompt.relay_hint", "ask.prompt.midrun_hint"] {
+            assert!(
+                !note.contains(&umadev_i18n::tlf(promise, &[])),
+                "a headless run must not promise a reply ({promise}): {note}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5913,6 +6180,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_docs_directive_carries_the_gate_section_contract() {
+        // S02-6: the legacy Docs phase is judged by the UD-ART-002 content gate
+        // (goal / scope / acceptance checkboxes, API + data-model tables, colour and
+        // font tokens, icon library, component states). The directive must ask for
+        // exactly those sections, or a well-meant PRD fails the gate and nothing ships.
+        let options = raw_opts(Path::new("/tmp"), "做一个团队任务看板", TrustMode::Auto);
+        let directive = phase_directive(
+            &options,
+            Phase::Docs,
+            false,
+            crate::planner::TaskKind::Greenfield,
+        );
+        for required in [
+            "## Goal",
+            "## Scope",
+            "- [ ]",
+            "## API surface",
+            "## Data model",
+            "--color",
+            "--font",
+            "hover",
+        ] {
+            assert!(
+                directive.contains(required),
+                "the Docs directive must name `{required}`: {directive}"
+            );
+        }
+    }
+
+    #[test]
     fn lean_phase_directives_carry_an_engineer_role() {
         // A lean (gateless) plan: each phase directive still steps the base into
         // an engineer's seat, without referencing any (never-written) documents.
@@ -6063,6 +6360,53 @@ mod tests {
         );
         assert_eq!(no_context.status(), ReviewStatus::Fail);
         assert_eq!(no_context.blocking.len(), 1);
+    }
+
+    #[test]
+    fn advisory_only_rejection_is_not_an_outage() {
+        // S04-12: the reviewer answered and withheld acceptance, but listed no
+        // must-fix item. It raised no blocker, so this is an advisory-only pass —
+        // never a reviewer outage that pauses the run for a `/continue` retry.
+        let verdict = parse_verdict(
+            "qa-engineer",
+            r#"{"accepts":false,"blocking":[],"advisory":["建议补充边界测试"]}"#,
+        );
+        assert_ne!(verdict.status(), ReviewStatus::Unavailable);
+        assert_eq!(verdict.status(), ReviewStatus::Pass);
+        assert!(verdict.unavailable_reason().is_none());
+        assert_eq!(verdict.advisory, vec!["建议补充边界测试".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn advisory_only_seat_passes_review_without_an_outage_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "pub fn app() -> bool { true }\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![]).with_fork_script(vec![Some(
+            r#"{"accepts":false,"blocking":[],"advisory":["建议补充边界测试"]}"#.into(),
+        )]);
+        let forks = session.forks_handle();
+
+        let review = run_review_team(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+        )
+        .await;
+
+        assert_eq!(review.status(), ReviewStatus::Pass, "{review:?}");
+        assert_eq!(
+            *forks.lock().unwrap(),
+            1,
+            "an answered verdict is final: no outage retry"
+        );
     }
 
     #[tokio::test]
@@ -8923,6 +9267,413 @@ mod tests {
             (backend_id, SessionStateUpdate::ModeChanged { mode: SessionMode::Ask })
                 if backend_id == "grok-build"
         ));
+    }
+
+    fn paced(idle_ms: u64, idle_window_ms: u64, backoff_ms: (u64, u64)) -> ReworkPacing {
+        ReworkPacing {
+            idle: crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_millis(idle_ms),
+                std::time::Duration::from_millis(idle_ms),
+            ),
+            idle_window: std::time::Duration::from_millis(idle_window_ms),
+            backoff_base: std::time::Duration::from_millis(backoff_ms.0),
+            backoff_cap: std::time::Duration::from_millis(backoff_ms.1),
+        }
+    }
+
+    fn failed(reason: &str) -> SessionEvent {
+        SessionEvent::TurnDone {
+            status: TurnStatus::Failed(reason.to_string()),
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rework_pump_backs_off_and_retries_a_transient_turn_failure() {
+        // S02-2 / S01-4: a 429 on a plan-step doer turn is backed off VISIBLY and
+        // the same directive re-driven, exactly like the director turn pump.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, rec) = sink();
+        let mut session = FakeBaseSession::new(vec![
+            vec![failed("API Error: Request rejected (429) — rate limit")],
+            vec![SessionEvent::TextDelta("step implemented".into()), done()],
+        ]);
+        let sent = session.sent_handle();
+
+        let turn = drive_rework_turn_paced(
+            &mut session,
+            &options,
+            &events,
+            "implement step 1".to_string(),
+            Vec::new(),
+            None,
+            paced(5_000, 3_600_000, (1, 10)),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
+
+        assert!(turn.done, "the retried turn completed");
+        assert!(turn.failure.is_none());
+        assert_eq!(turn.text, "step implemented");
+        assert_eq!(sent.lock().unwrap().len(), 2, "one bounded re-drive");
+        assert!(
+            rec.events()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("1/3"))),
+            "the backoff is announced with the shared countdown note"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_pump_reports_a_quota_failure_without_retrying_it() {
+        // S02-2: an exhausted quota does not clear in seconds, so the pump must not
+        // retry it — it surfaces the classified, actionable reason and hands the
+        // cause to the scheduler, which stops instead of burning fix rounds.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![failed(
+            "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota",
+        )]]);
+        let sent = session.sent_handle();
+
+        let turn = drive_rework_turn_paced(
+            &mut session,
+            &options,
+            &events,
+            "implement step 1".to_string(),
+            Vec::new(),
+            None,
+            paced(5_000, 3_600_000, (1, 10)),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
+
+        assert!(!turn.done);
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a quota failure is never retried"
+        );
+        let failure = turn
+            .failure
+            .expect("the failure is carried out of the pump");
+        assert_eq!(failure.class, crate::base_error::BaseFailure::Quota);
+        assert!(failure.stops_the_run());
+        let quota = umadev_i18n::tl("base.fail.quota");
+        assert!(failure.reason.contains(quota), "{}", failure.reason);
+        assert!(
+            rec.events()
+                .iter()
+                .any(|event| matches!(event, EngineEvent::Note(note) if note.contains(quota))),
+            "the diagnosed reason is shown to the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_pump_gives_up_on_a_persistent_rate_limit_with_its_diagnosis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![failed("429 Too Many Requests")]; 6]);
+        let sent = session.sent_handle();
+
+        let turn = drive_rework_turn_paced(
+            &mut session,
+            &options,
+            &events,
+            "implement step 1".to_string(),
+            Vec::new(),
+            None,
+            paced(5_000, 3_600_000, (1, 10)),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
+
+        assert!(!turn.done);
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            (crate::director_loop::MAX_TRANSIENT_RETRIES + 1) as usize,
+            "bounded: the first send plus MAX_TRANSIENT_RETRIES re-drives"
+        );
+        let failure = turn
+            .failure
+            .expect("the failure is carried out of the pump");
+        assert_eq!(failure.class, crate::base_error::BaseFailure::RateLimit);
+        assert!(failure.stops_the_run() && failure.reason.contains("429"));
+    }
+
+    /// A doer session that starts one tool and then stays silent but ALIVE (a long
+    /// build that streams nothing), counting interrupts.
+    struct SilentToolSession {
+        emitted: bool,
+        interrupts: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for SilentToolSession {
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            if !self.emitted {
+                self.emitted = true;
+                return Some(SessionEvent::ToolCall {
+                    name: "Bash".to_string(),
+                    input: serde_json::json!({ "command": "mvn -q package" }),
+                });
+            }
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            *self.interrupts.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rework_pump_keeps_a_live_silent_tool_until_the_absolute_deadline() {
+        // S02-7 / S01-12 (H6 on the doer pump): a live tool that is silent past the
+        // SLIDING window must survive to the ABSOLUTE deadline, then settle as a
+        // graceful budget stop that interrupts the base — never an idle failure
+        // after one window that leaves the base running the old turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, rec) = sink();
+        let interrupts = Arc::new(Mutex::new(0));
+        let mut session = SilentToolSession {
+            emitted: false,
+            interrupts: Arc::clone(&interrupts),
+        };
+        let started = std::time::Instant::now();
+
+        let turn = drive_rework_turn_paced(
+            &mut session,
+            &options,
+            &events,
+            "build it".to_string(),
+            Vec::new(),
+            None,
+            // 40 ms liveness polls, a 150 ms sliding window, a 700 ms absolute cap.
+            paced(40, 150, (1, 10)),
+            started + std::time::Duration::from_millis(700),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(650),
+            "the live tool was cut at the sliding window: {:?}",
+            started.elapsed()
+        );
+        assert!(turn.done, "a budget stop settles gracefully");
+        assert!(*interrupts.lock().unwrap() >= 1, "the base is interrupted");
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note) if note.contains("run budget reached mid-tool")
+        )));
+    }
+
+    /// A doer session that records, on every event it yields, whether a base
+    /// permit was still free — i.e. whether the pump holds one for the turn.
+    struct PermitProbeSession {
+        events: std::collections::VecDeque<SessionEvent>,
+        free_permit_seen: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for PermitProbeSession {
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.free_permit_seen
+                .lock()
+                .unwrap()
+                .push(crate::base_gate::try_base_permit().is_some());
+            self.events.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn rework_pump_holds_a_base_permit() {
+        // S02-4: a plan-step doer turn is a real base turn, so it holds one permit
+        // of the global base gate for its whole drain — a pre-warm or another fork
+        // cannot open a second gateway connection meanwhile.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut session = PermitProbeSession {
+            events: vec![SessionEvent::TextDelta("done".into()), done()].into(),
+            free_permit_seen: Arc::clone(&seen),
+        };
+
+        let turn = crate::base_gate::with_test_gate(
+            1,
+            drive_rework_turn_paced(
+                &mut session,
+                &options,
+                &events,
+                "implement step 1".to_string(),
+                Vec::new(),
+                None,
+                paced(5_000, 3_600_000, (1, 10)),
+                std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+            ),
+        )
+        .await;
+
+        assert!(turn.done);
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|free| !free),
+            "no permit was free while the doer turn ran: {seen:?}"
+        );
+    }
+
+    /// A review fork that counts concurrently open judge turns: `send_turn` opens
+    /// one, its `TurnDone` closes it after a short sleep so overlapping turns meet.
+    struct ConcurrencyProbeFork {
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+        step: u8,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for ConcurrencyProbeFork {
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            use std::sync::atomic::Ordering;
+            let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            self.step = 0;
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.step += 1;
+            match self.step {
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    Some(SessionEvent::TextDelta(r#"{"accepts":true}"#.into()))
+                }
+                2 => {
+                    self.live
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(done())
+                }
+                _ => None,
+            }
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// The main session whose every fork is a [`ConcurrencyProbeFork`].
+    struct ConcurrencyProbeMain {
+        live: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for ConcurrencyProbeMain {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Ok(Box::new(ConcurrencyProbeFork {
+                live: Arc::clone(&self.live),
+                peak: Arc::clone(&self.peak),
+                step: 0,
+            }))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_review_team_never_exceeds_the_base_gate() {
+        // S02-4: with the default budget of one base connection, a quality team's
+        // judge turns run one after another — never three at once on a gateway
+        // that rejects the overflow with 529.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "pub fn app() -> bool { true }\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let team: Vec<Box<dyn RoleCritic>> = vec![
+            Box::new(crate::critics::QaCritic),
+            Box::new(crate::critics::SecurityCritic),
+            Box::new(crate::critics::BackendCritic),
+        ];
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut main = ConcurrencyProbeMain {
+            live: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        };
+
+        let review = crate::base_gate::with_test_gate(
+            1,
+            run_review_team(&mut main, &options, &events, ReviewKind::Quality, &team, 0),
+        )
+        .await;
+
+        assert_eq!(review.status(), ReviewStatus::Pass, "{review:?}");
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "judge turns never exceed the base gate"
+        );
     }
 
     #[tokio::test]

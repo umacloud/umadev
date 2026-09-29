@@ -239,6 +239,7 @@
 # 文字问答模式(question_form = text):把底座的提问以自然语言方式呈现,你用自己的话回答,无需选编号。
 "ask.prompt.text_hint" = "用你自己的话回答即可 —— 直接告诉我你的决定,我会在同一对话里转交给底座(无需选编号)。"
 "ask.prompt.midrun_hint" = "发起问题的底座请求会停在这里。输入答案并按 Enter，将答复原来的同一个请求；Esc 会安全取消。"
+"ask.prompt.headless_hint" = "本次运行没有可以实时作答的界面,这个问题已按安全默认值拒绝,底座会按自己的判断继续——它并不在等你的回复。如果这个默认选择不对,请在下一次请求中说明。"
 
 # 底座自身的计划模式(claude-code 的 ExitPlanMode)—— 底座起草了计划,正请求退出它自己的
 # 计划模式并开始执行。这是底座的计划模式,与 UmaDev 的守护模式不同,必须清楚标注区分。
@@ -382,11 +383,13 @@
 "plan.queue.native" = "  {}. [底座原生队列] {}"
 "plan.review.title" = "团队评审"
 "plan.review.accept" = "通过"
+"plan.review.unavailable" = "评审不可用"
 "plan.approved_promoted" = "[plan] 计划已批准。原会话为只读(计划档),已切换到「手动审核」档 — 下一条消息起即可受控写入实施;每步写入仍会请求你批准。"
 "plan.review.auto_approved" = "[plan] 「计划审阅」已自动批准并开始实施(自动过门)。按 shift+Tab 或 /manual 可转人工逐项审阅。"
 "plan.review.block" = "{} 个必改"
 "plan.review.collapsed" = "团队评审:{} 通过 · {} 拦截 — /plan 展开"
 "plan.review.note.accept" = "团队评审 · [{}] 通过"
+"plan.review.note.unavailable" = "团队评审 · [{}] 评审不可用(未给出结论,不是必改项):{}"
 "plan.review.note.block" = "团队评审 · [{}] {} 个必改:"
 "plan.review.note.summary" = "团队评审已收敛 — {} 通过 · {} 拦截(完整评审见上)。"
 "plan.review.section" = "团队评审 — {} 通过 · {} 拦截"
@@ -1328,6 +1331,7 @@
 "director.run_done" = "UmaDev —— 本次构建已完成。"
 "director.run_paused" = "UmaDev —— 本次运行已暂停在{};请重新打开 UmaDev(`umadev`)确认,或运行 `umadev continue` 继续。"
 "director.no_source_hardstop" = "UmaDev —— 本次构建声称已完成,但工作区没有任何真实源码文件:按客观核对,本次构建判为未完成。"
+"director.base_failure_stop" = "[team] 已在步骤「{}」停止调度:底座这一轮失败的原因无法靠立即重试解决(见上一条提示)。该步骤已保存为待执行,没有替它标记完成或失败。"
 "gate.name.clarify" = "澄清提问检查点"
 "gate.name.docs" = "核心文档确认检查点"
 "gate.name.preview" = "前端预览确认检查点"

@@ -239,6 +239,7 @@
 # 文字問答模式(question_form = text):把底座的提問以自然語言方式呈現,你用自己的話回答,無需選編號。
 "ask.prompt.text_hint" = "用你自己的話回答即可 —— 直接告訴我你的決定,我會在同一對話裡轉交給底座(無需選編號)。"
 "ask.prompt.midrun_hint" = "發起問題的底座請求會停在這裡。輸入答案並按 Enter，將回覆原來的同一個請求；Esc 會安全取消。"
+"ask.prompt.headless_hint" = "本次執行沒有可以即時作答的介面,這個問題已依安全預設值拒絕,底座會依自己的判斷繼續——它並不在等你的回覆。如果這個預設選擇不對,請在下一次請求中說明。"
 
 # 底座自身的計畫模式(claude-code 的 ExitPlanMode)—— 底座起草了計畫,正請求退出它自己的
 # 計畫模式並開始執行。這是底座的計畫模式,與 UmaDev 的守護模式不同,必須清楚標註區分。
@@ -382,11 +383,13 @@
 "plan.queue.native" = "  {}. [底座原生佇列] {}"
 "plan.review.title" = "團隊評審"
 "plan.review.accept" = "通過"
+"plan.review.unavailable" = "評審無法使用"
 "plan.approved_promoted" = "[plan] 計劃已批准。原會話為唯讀(計劃檔),已切換到「手動審核」檔 — 下一條訊息起即可受控寫入實施;每步寫入仍會請求你批准。"
 "plan.review.auto_approved" = "[plan] 「計劃審閱」已自動批准並開始實施(自動過門)。按 shift+Tab 或 /manual 可轉人工逐項審閱。"
 "plan.review.block" = "{} 個必改"
 "plan.review.collapsed" = "團隊評審:{} 通過 · {} 攔截 — /plan 展開"
 "plan.review.note.accept" = "團隊評審 · [{}] 通過"
+"plan.review.note.unavailable" = "團隊評審 · [{}] 評審無法使用(未給出結論,不是必改項):{}"
 "plan.review.note.block" = "團隊評審 · [{}] {} 個必改:"
 "plan.review.note.summary" = "團隊評審已收斂 — {} 通過 · {} 攔截(完整評審見上)。"
 "plan.review.section" = "團隊評審 — {} 通過 · {} 攔截"
@@ -1329,6 +1332,7 @@
 "director.run_done" = "UmaDev —— 本次建置已完成。"
 "director.run_paused" = "UmaDev —— 本次執行已暫停在{};請重新開啟 UmaDev(`umadev`)確認,或執行 `umadev continue` 繼續。"
 "director.no_source_hardstop" = "UmaDev —— 本次建置聲稱已完成,但工作區沒有任何真實原始碼檔案:依客觀核對,本次建置判為未完成。"
+"director.base_failure_stop" = "[team] 已在步驟「{}」停止排程:底座這一輪失敗的原因無法靠立即重試解決(見上一條提示)。該步驟已儲存為待執行,沒有替它標記完成或失敗。"
 "gate.name.clarify" = "釐清提問檢查點"
 "gate.name.docs" = "核心文件確認檢查點"
 "gate.name.preview" = "前端預覽確認檢查點"

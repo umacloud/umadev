@@ -241,6 +241,7 @@ fn terminal_contract_plan_snapshot_is_lossless_and_scrollable_at_44x12() {
             blocking: vec!["review blocker remains reachable".to_string()],
             remediation: vec!["review fix remains reachable".to_string()],
             advisory: vec!["review advisory remains reachable".to_string()],
+            unavailable: None,
         });
 
     assert_eq!(submit(&mut fixture.app, "/plan"), Action::None);

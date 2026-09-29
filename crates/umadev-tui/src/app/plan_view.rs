@@ -107,12 +107,7 @@ impl App {
             if !body.is_empty() {
                 body.push('\n');
             }
-            let accepts = self
-                .critic_verdicts
-                .iter()
-                .filter(|critic| critic.accepts)
-                .count();
-            let blocking = self.critic_verdicts.len() - accepts;
+            let (accepts, blocking) = self.review_tally();
             body.push_str(&umadev_i18n::tf(
                 self.lang,
                 "plan.review.section",
@@ -120,17 +115,12 @@ impl App {
             ));
             body.push('\n');
             for critic in &self.critic_verdicts {
-                let verdict = if critic.accepts {
-                    umadev_i18n::t(self.lang, "plan.review.accept").to_string()
-                } else {
-                    umadev_i18n::tf(
-                        self.lang,
-                        "plan.review.block",
-                        &[&critic.blocking.len().max(1).to_string()],
-                    )
-                };
+                let verdict = critic.verdict_label(self.lang);
                 body.push_str(&format!("  [{}] {verdict}\n", critic.seat));
-                if !critic.accepts {
+                if let Some(reason) = &critic.unavailable {
+                    body.push_str(&format!("    ~ {}\n", reason.trim()));
+                }
+                if critic.is_blocking() {
                     for (index, finding) in critic.blocking.iter().enumerate() {
                         let finding = finding.trim();
                         if finding.is_empty() {

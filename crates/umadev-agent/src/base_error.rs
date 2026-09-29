@@ -274,6 +274,36 @@ pub fn diagnose_turn_failure(reason: &str, backend: &str) -> String {
     }
 }
 
+/// A base turn that ended FAILED after its pump's own bounded recovery (the
+/// transient backoff), carried out of the pump so the caller can act on the
+/// cause instead of treating the turn as merely unfinished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnFailure {
+    /// The classified cause of the base's own error text.
+    pub class: BaseFailure,
+    /// The user-facing reason: [`diagnose_turn_failure`] of the raw error.
+    pub reason: String,
+}
+
+impl TurnFailure {
+    /// Classify and diagnose the base's own turn-failure text.
+    #[must_use]
+    pub fn diagnose(raw: &str, backend: &str) -> Self {
+        Self {
+            class: classify(None, None, Some(raw.trim())),
+            reason: diagnose_turn_failure(raw, backend),
+        }
+    }
+
+    /// Whether driving more turns in this run is futile: the quota is spent, the
+    /// login is gone, or a transient outage outlasted the bounded backoff. The run
+    /// should stop on this reason (resumable later) instead of re-driving.
+    #[must_use]
+    pub fn stops_the_run(&self) -> bool {
+        is_resumable_later(&self.class) || matches!(self.class, BaseFailure::Auth)
+    }
+}
+
 /// Strip ANSI escape sequences from `s`, returning clean, human-readable text.
 ///
 /// A base CLI writes COLORED diagnostics to its stderr (the codex idle banner,

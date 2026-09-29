@@ -186,7 +186,7 @@ fn section(out: &mut String, label: &str, body: &str, budget: usize, sectioned: 
         return;
     }
     let excerpt = if sectioned {
-        crate::experts::excerpt_sections(b, budget)
+        crate::critics::review_doc_excerpt(b, budget)
     } else {
         crate::experts::excerpt(b, budget)
     };

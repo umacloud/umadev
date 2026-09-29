@@ -489,6 +489,8 @@ threshold = 90
 skip_checks = []
 ```
 
+這兩項只作用於傳統固定流程（`UMADEV_LEGACY_PIPELINE=1`）和單次執行器的評分品質門；儲存庫裡的 `.umadevrc` 只能調高 `threshold`，安全類檢查不能略過。預設的 director 建置沒有評分門，而是以確定性的 QC 底線檢查每次建置，`[pipeline] max_review_rounds` 限制它的自動修復輪數（只能調低）。
+
 ---
 
 ## 治理規則
@@ -811,13 +813,13 @@ lang = "zh-TW"
 ```
 
 ```toml
-[quality]
-threshold = 90
-skip_checks = []
+[quality]              # 評分品質門：僅傳統流程 / 單次執行器
+threshold = 90         # 只能調高
+skip_checks = []       # 只能略過非安全類檢查
 
 [pipeline]
-skip_phases = []
-max_review_rounds = 3
+skip_phases = []       # 僅單次執行器
+max_review_rounds = 3  # 自動修復輪數；director 建置只會調低
 
 [knowledge]
 enabled = true

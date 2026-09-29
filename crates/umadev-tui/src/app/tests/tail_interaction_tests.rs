@@ -324,6 +324,7 @@ fn slash_plan_includes_full_team_review_section() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec!["consider a cache".into()],
+        unavailable: None,
     });
     a.apply_engine(EngineEvent::CriticVerdict {
         seat: "qa".into(),
@@ -331,6 +332,7 @@ fn slash_plan_includes_full_team_review_section() {
         blocking: vec!["no tests for login".into(), "no error handling".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert_eq!(a.critic_verdicts.len(), 2);
     let before = a.history.len();
@@ -414,6 +416,7 @@ fn slash_team_with_verdicts_shows_per_seat_verdicts() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     a.apply_engine(EngineEvent::CriticVerdict {
         seat: "qa".into(),
@@ -421,6 +424,7 @@ fn slash_team_with_verdicts_shows_per_seat_verdicts() {
         blocking: vec!["no tests for login".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     let before = a.history.len();
     let _ = a.try_slash_command("/team").unwrap();
@@ -460,6 +464,7 @@ fn slash_team_reports_produced_vs_pending_deliverables() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     let before = a.history.len();
     let _ = a.try_slash_command("/team").unwrap();

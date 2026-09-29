@@ -2254,6 +2254,56 @@ async fn transient_retries_are_bounded_and_fail_open() {
 }
 
 #[tokio::test]
+async fn headless_director_turn_ask_note_does_not_promise_a_reply() {
+    // S02-8: on the headless CLI no live surface can answer the base's question —
+    // the host declines it with a safe default. The director turn's note must not
+    // tell the user to type an answer into a request that no longer waits.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, rec) = sink();
+    let turns = vec![vec![
+        SessionEvent::ToolCall {
+            name: "AskUserQuestion".to_string(),
+            input: serde_json::json!({
+                "questions": [{
+                    "question": "Which database should the API use?",
+                    "options": [{"label": "Postgres"}, {"label": "MongoDB"}]
+                }]
+            }),
+        },
+        SessionEvent::TextDelta("Using Postgres by default.".to_string()),
+        SessionEvent::TurnDone {
+            status: TurnStatus::Completed,
+            usage: None,
+        },
+    ]];
+    let mut sess = FakeSession::new(turns, false, "");
+    let out = drive_one_turn_with_backoff(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        "build it".to_string(),
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+        Duration::from_millis(1),
+        Duration::from_millis(10),
+    )
+    .await;
+    assert!(out.is_ok());
+    let note = rec
+        .events()
+        .into_iter()
+        .find_map(|event| match event {
+            EngineEvent::Note(note) if note.contains("Which database") => Some(note),
+            _ => None,
+        })
+        .expect("the question is still surfaced");
+    assert!(
+        !note.contains(&umadev_i18n::tlf("ask.prompt.midrun_hint", &[])),
+        "no reply is possible on a headless run: {note}"
+    );
+}
+
+#[tokio::test]
 async fn a_hard_failure_is_not_retried() {
     // A HARD failure (auth) is returned at once — retrying it is futile, so NO
     // backoff, NO countdown, exactly ONE send.
@@ -9382,4 +9432,146 @@ async fn run_lane_host_requests_fall_back_to_protocol_shaped_rejection_with_no_s
         ),
         "folder trust with no surface stays KeepGated: {resolved:?}"
     );
+}
+
+fn plan_status(root: &std::path::Path, id: &str) -> Option<crate::plan_state::StepStatus> {
+    crate::plan_state::load(root)?
+        .steps
+        .into_iter()
+        .find(|step| step.id == id)
+        .map(|step| step.status)
+}
+
+#[tokio::test]
+async fn plan_step_surfaces_quota_exhaustion() {
+    // S02-2: an exhausted quota on a scheduled doer turn is not an unfinished
+    // step. The run stops at once on the diagnosed reason — no acceptance
+    // re-drives on an unchanged tree, no later step — and stays resumable.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![fail_turn(
+            "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota",
+        )],
+        false,
+        "",
+    );
+    let sent = sess.sent_handle();
+    let o = opts(tmp.path());
+    let mut plan = upstream_peer_plan();
+
+    let outcome = drive_plan_steps(
+        &mut sess,
+        &o,
+        &events,
+        &build_route(),
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+
+    let quota = umadev_i18n::tl("base.fail.quota");
+    let Some(DirectorLoopOutcome::Failed(reason)) = outcome else {
+        panic!("an exhausted quota ends the run with its reason: {outcome:?}");
+    };
+    assert!(reason.contains(quota), "{reason}");
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "no fix-round re-summons and no second step on a spent quota"
+    );
+    assert_eq!(active_order(&rec), vec!["schema".to_string()]);
+    assert!(rec
+        .events()
+        .iter()
+        .any(|event| matches!(event, EngineEvent::Note(note) if note.contains(quota))));
+    assert_eq!(
+        plan_status(tmp.path(), "schema"),
+        Some(crate::plan_state::StepStatus::Pending),
+        "the interrupted step is re-driven by /continue"
+    );
+    assert!(
+        transient_resume_hint(&reason, tmp.path()).is_some(),
+        "the /continue hint still fires for a quota stop"
+    );
+}
+
+#[tokio::test]
+async fn rate_limited_doer_turn_backs_off_and_is_reported() {
+    // S01-4: a 429 on a scheduled doer turn is backed off visibly and the step
+    // still completes.
+    crate::continuous::set_test_transient_backoff(Some((
+        Duration::from_millis(1),
+        Duration::from_millis(10),
+    )));
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![
+            fail_turn("429 Too Many Requests"),
+            text_turn("schema implemented"),
+        ],
+        false,
+        "",
+    );
+    let o = opts(tmp.path());
+    let mut plan = upstream_peer_plan();
+    let _ = drive_plan_steps(
+        &mut sess,
+        &o,
+        &events,
+        &build_route(),
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(
+        rec.events()
+            .iter()
+            .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("1/3"))),
+        "the backoff is announced with the shared countdown note"
+    );
+    assert!(rec.events().iter().any(|event| matches!(
+        event,
+        EngineEvent::PlanStepStatus { id, status, .. } if id == "schema" && status == "done"
+    )));
+
+    // When the 429 persists past the bounded retries, the run stops on the
+    // diagnosed rate-limit reason and no second step is summoned.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(vec![fail_turn("429 Too Many Requests"); 6], false, "");
+    let sent = sess.sent_handle();
+    let o = opts(tmp.path());
+    let mut plan = upstream_peer_plan();
+    let outcome = drive_plan_steps(
+        &mut sess,
+        &o,
+        &events,
+        &build_route(),
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    crate::continuous::set_test_transient_backoff(None);
+    let Some(DirectorLoopOutcome::Failed(reason)) = outcome else {
+        panic!("a persistent rate limit ends the run: {outcome:?}");
+    };
+    assert!(
+        reason.contains(umadev_i18n::tl("base.fail.ratelimit")) && reason.contains("429"),
+        "{reason}"
+    );
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        (MAX_TRANSIENT_RETRIES + 1) as usize,
+        "only the first step's bounded retries were sent"
+    );
+    assert_eq!(active_order(&rec), vec!["schema".to_string()]);
+    assert!(transient_resume_hint(&reason, tmp.path()).is_some());
 }

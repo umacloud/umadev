@@ -495,13 +495,15 @@ output/<slug>-quality-gate.json
 output/<slug>-quality-gate.md
 ```
 
-默认通过线是 90 分，可以在 `.umadevrc` 调整：
+默认通过线是 90 分，可以在 `.umadevrc` 调高：
 
 ```toml
 [quality]
 threshold = 90
 skip_checks = []
 ```
+
+这两项只作用于传统固定流程（`UMADEV_LEGACY_PIPELINE=1`）和单次运行器的评分质量门；仓库里的 `.umadevrc` 只能调高 `threshold`，安全类检查不能跳过。默认的 director 构建没有评分门，而是用确定性的 QC 底线检查每次构建，`[pipeline] max_review_rounds` 限制它的自动修复轮数（只能调低）。
 
 ## 治理规则是什么
 
@@ -845,13 +847,13 @@ lang = "zh-CN"
 示例：
 
 ```toml
-[quality]
-threshold = 90
-skip_checks = []
+[quality]              # 评分质量门：仅传统流程 / 单次运行器
+threshold = 90         # 只能调高
+skip_checks = []       # 只能跳过非安全类检查
 
 [pipeline]
-skip_phases = []
-max_review_rounds = 3
+skip_phases = []       # 仅单次运行器
+max_review_rounds = 3  # 自动修复轮数；director 构建只会调低
 
 [knowledge]
 enabled = true

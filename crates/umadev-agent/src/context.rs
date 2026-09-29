@@ -373,8 +373,8 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         let app_llm = crate::app_runtime::runtime_model_directive(requirement);
         if !app_llm.trim().is_empty() {
             fw.push_block(&format!(
-                "Runtime guard: use an OpenAI-compatible provider layer; NEVER silently hardcode \
-                 Anthropic / Claude or `ANTHROPIC_API_KEY`.\n{app_llm}"
+                "{}{app_llm}",
+                crate::app_runtime::runtime_guard(requirement)
             ));
         }
 

@@ -243,6 +243,7 @@
 # prose the user answers in their own words rather than by picking a number.
 "ask.prompt.text_hint" = "Answer in your own words — just tell me what you want and I'll pass it to the base in this same conversation (no need to pick a number)."
 "ask.prompt.midrun_hint" = "The originating base request is paused here. Type the requested answer and press Enter to reply to that same request; Esc cancels it safely."
+"ask.prompt.headless_hint" = "No live answer surface is attached to this run, so the question was declined with a safe default and the base continues on its own judgement — it is not waiting for your reply. If that default is wrong, say so in your next request."
 
 # The base CLI's OWN plan mode (claude-code's ExitPlanMode) — the base drafted a
 # plan and is asking to leave ITS plan mode and start executing. This is the BASE's
@@ -388,11 +389,13 @@
 "plan.queue.native" = "  {}. [base-native queue] {}"
 "plan.review.title" = "Team review"
 "plan.review.accept" = "accepts"
+"plan.review.unavailable" = "review unavailable"
 "plan.approved_promoted" = "[plan] Plan approved. This session ran read-only (Plan tier); switched to Guarded — from your next message implementation proceeds with per-write approval."
 "plan.review.auto_approved" = "[plan] Plan review auto-approved and implementation started (auto-pass tier). Press shift+Tab or /manual for per-item human review."
 "plan.review.block" = "{} must-fix"
 "plan.review.collapsed" = "Team review: {} accept · {} blocking — /plan to expand"
 "plan.review.note.accept" = "Team review · [{}] accepts"
+"plan.review.note.unavailable" = "Team review · [{}] review unavailable (no verdict, not a must-fix): {}"
 "plan.review.note.block" = "Team review · [{}] {} must-fix:"
 "plan.review.note.summary" = "Team review settled — {} accept · {} blocking (full verdicts above)."
 "plan.review.section" = "Team review — {} accept · {} blocking"
@@ -1352,6 +1355,7 @@
 "director.run_done" = "UmaDev — this build is finished."
 "director.run_paused" = "UmaDev — this run is paused at {}; reopen UmaDev (`umadev`) to approve it, or run `umadev continue`."
 "director.no_source_hardstop" = "UmaDev — this build reported done, but the workspace has zero real source files: objectively this build is not finished."
+"director.base_failure_stop" = "[team] stopped the schedule at step `{}`: the base failed the turn for a reason retrying now cannot fix (see the note above). The step is saved as pending; nothing was marked done or failed on its behalf."
 "gate.name.clarify" = "the clarifying-questions checkpoint"
 "gate.name.docs" = "the core-docs checkpoint"
 "gate.name.preview" = "the frontend-preview checkpoint"

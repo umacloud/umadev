@@ -2393,8 +2393,8 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
     if !umadevrc.is_file() {
         let template = "# UmaDev project configuration. Edit and re-run to take effect.\n\
 # Docs: https://github.com/umacloud/umadev/blob/main/crates/umadev-agent/src/config.rs\n\
-\n[quality]\nthreshold = 90           # minimum weighted score to pass the quality gate\nskip_checks = []         # e.g. [\"Dark mode support\"]\n\
-\n[pipeline]\nskip_phases = []         # e.g. [\"research\"]\nmax_review_rounds = 3    # doc structural review retries\n\
+\n[quality]                # scored gate of the legacy pipeline / single-shot runner\nthreshold = 90           # minimum weighted score to pass (can only be raised)\nskip_checks = []         # e.g. [\"Dark mode support\"]; security checks always run\n\
+\n[pipeline]\nskip_phases = []         # single-shot runner only, e.g. [\"research\"]\nmax_review_rounds = 3    # auto-fix rounds; the director build can only go lower\n\
 \n[knowledge]\nenabled = true           # enable curated expert-knowledge retrieval\nengine = \"hybrid\"        # local vector + BM25; falls back to BM25 if unavailable\ntop_k = 6                # knowledge chunks injected per phase\n\
 \n[codex]\n# Codex main-worker access: danger-full-access (default) gives normal development\n# access to subprocesses, network, local ports, git, and the filesystem. Set\n# workspace-write or read-only here only when you intentionally want to restrict it.\nsandbox_mode = \"danger-full-access\"\n";
         umadev_state::fs::atomic_write(&umadevrc, template.as_bytes())
@@ -2752,9 +2752,13 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             accepts,
             blocking,
             remediation,
+            unavailable,
             ..
         } => {
-            if *accepts {
+            // A seat that produced no verdict is an outage, not a must-fix.
+            if let Some(reason) = unavailable {
+                eprintln!("  [{seat}] · review unavailable: {reason}");
+            } else if *accepts {
                 eprintln!("  [{seat}] ✓ accepts");
             } else {
                 let first = blocking.first().map_or("", String::as_str);

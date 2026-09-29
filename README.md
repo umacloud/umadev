@@ -454,6 +454,8 @@ threshold = 90
 skip_checks = []
 ```
 
+These scored-gate settings apply to the legacy fixed pipeline (`UMADEV_LEGACY_PIPELINE=1`) and the single-shot runner. A repository `.umadevrc` can only raise `threshold`, and the security checks cannot be skipped. The default director build has no scored gate: it holds every build to its deterministic QC floors, and `[pipeline] max_review_rounds` caps its auto-fix rounds (lower only).
+
 ---
 
 ## Governance
@@ -782,13 +784,13 @@ Project config:
 
 ```toml
 # .umadevrc
-[quality]
-threshold = 90
-skip_checks = []
+[quality]              # scored gate: legacy pipeline / single-shot runner only
+threshold = 90         # can only be raised
+skip_checks = []       # non-security checks only
 
 [pipeline]
-skip_phases = []
-max_review_rounds = 3
+skip_phases = []       # single-shot runner only
+max_review_rounds = 3  # auto-fix rounds; a director build can only go lower
 
 [knowledge]
 enabled = true

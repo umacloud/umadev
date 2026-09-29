@@ -64,10 +64,40 @@ pub fn base_concurrency() -> usize {
     }
 }
 
-/// The process-global semaphore, sized once from [`base_concurrency`].
-fn gate() -> &'static Arc<Semaphore> {
+/// The process-global semaphore, sized once from [`base_concurrency`] (or, in a
+/// test, the task-scoped gate a test pinned with `with_test_gate`).
+fn gate() -> Arc<Semaphore> {
+    if let Some(gate) = scoped_test_gate() {
+        return gate;
+    }
     static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     GATE.get_or_init(|| Arc::new(Semaphore::new(base_concurrency())))
+        .clone()
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only: a task-scoped gate that replaces the process-global one, so a
+    /// test can pin a small budget without racing the parallel test harness
+    /// (under test the global budget is effectively unbounded).
+    static TEST_GATE: Arc<Semaphore>;
+}
+
+#[cfg(test)]
+fn scoped_test_gate() -> Option<Arc<Semaphore>> {
+    TEST_GATE.try_with(Arc::clone).ok()
+}
+
+#[cfg(not(test))]
+fn scoped_test_gate() -> Option<Arc<Semaphore>> {
+    None
+}
+
+/// Run `fut` with a task-scoped base gate of `permits` (tests only). Everything
+/// `fut` awaits on its own task sees that gate instead of the global one.
+#[cfg(test)]
+pub(crate) async fn with_test_gate<F: std::future::Future>(permits: usize, fut: F) -> F::Output {
+    TEST_GATE.scope(Arc::new(Semaphore::new(permits)), fut).await
 }
 
 /// Acquire one base-call permit, held for the duration of ONE base model turn.
@@ -85,7 +115,6 @@ fn gate() -> &'static Arc<Semaphore> {
 /// `acquire_owned` cannot return the closed-semaphore error.
 pub async fn base_permit() -> OwnedSemaphorePermit {
     gate()
-        .clone()
         .acquire_owned()
         .await
         .expect("the global base gate semaphore is never closed")
@@ -98,7 +127,7 @@ pub async fn base_permit() -> OwnedSemaphorePermit {
 /// skip the optimisation this round rather than opening a second connection.
 #[must_use]
 pub fn try_base_permit() -> Option<OwnedSemaphorePermit> {
-    gate().clone().try_acquire_owned().ok()
+    gate().try_acquire_owned().ok()
 }
 
 #[cfg(test)]

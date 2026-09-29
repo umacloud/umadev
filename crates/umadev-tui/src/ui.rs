@@ -3664,8 +3664,9 @@ fn plan_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 
     // ── Collapsible team-review panel ──
     if has_review {
-        let accepts = app.critic_verdicts.iter().filter(|c| c.accepts).count();
-        let blocking: usize = app.critic_verdicts.iter().filter(|c| !c.accepts).count();
+        // An unavailable seat produced no verdict: it is neither an accept nor a
+        // must-fix, so it stays out of both counts and renders as a neutral row.
+        let (accepts, blocking) = app.review_tally();
         if app.critics_collapsed {
             lines.push(Line::from(Span::styled(
                 umadev_i18n::tf(
@@ -3684,26 +3685,22 @@ fn plan_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             )));
             let mut any_blocking = false;
             for c in &app.critic_verdicts {
-                let (mark, color) = if c.accepts {
+                let (mark, color) = if c.is_unavailable() {
+                    (review_unavailable_glyph(), theme::TEXT_MUTED())
+                } else if c.accepts {
                     (review_accept_glyph(), theme::SUCCESS())
                 } else {
                     any_blocking = true;
                     (review_block_glyph(), theme::ERROR())
                 };
-                let verdict = if c.accepts {
-                    umadev_i18n::t(app.lang, "plan.review.accept").to_string()
-                } else {
-                    umadev_i18n::tf(
-                        app.lang,
-                        "plan.review.block",
-                        &[&c.blocking.len().max(1).to_string()],
-                    )
-                };
+                let verdict = c.verdict_label(app.lang);
                 // First must-fix finding inline so a blocker is actionable at a
-                // glance (the full set folds into the rework directive upstream).
+                // glance (the full set folds into the rework directive upstream);
+                // an unavailable seat shows its operational reason instead.
                 let detail = c
-                    .blocking
-                    .first()
+                    .unavailable
+                    .as_ref()
+                    .or_else(|| c.blocking.first())
                     .or_else(|| c.advisory.first())
                     .map(|s| format!(": {}", compact_display(s)))
                     .unwrap_or_default();
@@ -3722,7 +3719,7 @@ fn plan_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 // inline — a blocked run shows WHAT-TO-DO, not just what is wrong.
                 // Fail-open: no suggestion → nothing extra (the blocker still shows
                 // above; the full per-blocker set is in the transcript note).
-                if !c.accepts {
+                if c.is_blocking() {
                     if let Some(fix) = c.fix_for(0) {
                         lines.push(Line::from(Span::styled(
                             format!(
@@ -3837,6 +3834,12 @@ fn review_accept_glyph() -> String {
 /// Blocking mark for the team-review panel (a cross), built from its codepoint.
 fn review_block_glyph() -> String {
     char::from_u32(0x2717).unwrap_or('x').to_string()
+}
+
+/// Neutral mark for a seat that produced no verdict (a middle dot): it is neither
+/// an accept nor a must-fix.
+fn review_unavailable_glyph() -> String {
+    char::from_u32(0x00B7).unwrap_or('-').to_string()
 }
 
 /// Normalize model-owned panel text to one physical terminal row. Width clipping

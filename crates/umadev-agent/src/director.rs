@@ -153,6 +153,10 @@ pub struct SummonResult {
     /// Serial only: exact sent-skill receipt, settled from the same objective
     /// verifier as the knowledge receipt. Abandoned turns settle Unknown.
     pub skill_receipt: Option<crate::skills::SkillReceiptGuard>,
+    /// Serial only: the base ended the doer turn FAILED (after the pump's bounded
+    /// transient backoff) — its cause and the diagnosed reason the user saw. The
+    /// step scheduler stops the run on a failure re-driving cannot fix.
+    pub failure: Option<crate::base_error::TurnFailure>,
 }
 
 /// What a [`review`] produced. Semantic blockers and operationally unavailable
@@ -353,6 +357,7 @@ pub async fn summon(
                 base_agents: turn.base_agents,
                 memory_receipt: turn.memory_receipt,
                 skill_receipt: turn.skill_receipt,
+                failure: turn.failure,
             }
         }
         SummonMode::Parallel => {
@@ -375,6 +380,7 @@ pub async fn summon(
                 base_agents: crate::bg_agents::BaseAgentObservation::default(),
                 memory_receipt: None,
                 skill_receipt: None,
+                failure: None,
             }
         }
     }

@@ -639,15 +639,15 @@ pub(crate) fn gates_hosted() -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the current task carries a steering intake — i.e. a reply the user
-/// types mid-run CAN be folded into the next step's directive. Drives the honest
-/// `AskUserQuestion` hint variant (A2#6): with an intake, "your answer applies as
-/// follow-up steering" is literally true; without one the caller keeps its
-/// existing framing. `false` when unscoped (fail-open).
+/// Whether the current task carries a live host-request surface — i.e. a base's
+/// in-flight question can actually be answered by the user. Drives the honest
+/// `AskUserQuestion` hint: with a surface the request is paused for the user's
+/// reply; without one (the headless CLI) it is declined with a safe default, so
+/// no hint may promise a reply. `false` when unscoped (fail-open).
 #[must_use]
-pub(crate) fn steering_hosted() -> bool {
+pub(crate) fn host_requests_hosted() -> bool {
     RUN_INTERACTION
-        .try_with(|i| i.steer.is_some())
+        .try_with(|i| i.host_request.is_some())
         .unwrap_or(false)
 }
 

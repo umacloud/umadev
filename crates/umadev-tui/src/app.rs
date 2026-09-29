@@ -24,6 +24,7 @@ use crate::prompt_queue_ui::PromptQueueUi;
 mod animation_settings;
 mod backend;
 mod bounded_text;
+mod critic_row;
 mod deploy;
 mod dir_scan;
 mod file_index;
@@ -1220,21 +1221,9 @@ pub struct CriticRow {
     pub remediation: Vec<String>,
     /// Nice-to-have notes (may be empty).
     pub advisory: Vec<String>,
-}
-
-impl CriticRow {
-    /// The suggested one-line fix for the blocking finding at `idx`, if the seat
-    /// emitted one (`remediation` is index-aligned with `blocking`). `None` when no
-    /// matching, non-blank suggestion exists — the caller then shows the blocker
-    /// alone, never a fabricated fix (fail-open).
-    #[must_use]
-    pub fn fix_for(&self, idx: usize) -> Option<&str> {
-        self.remediation
-            .get(idx)
-            .map(String::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    }
+    /// `Some(reason)` when the seat produced no verdict (an operational outage,
+    /// never a finding): rendered neutrally and never counted as blocking.
+    pub unavailable: Option<String>,
 }
 
 /// Live status of one convened teammate in the **team roster** (Wave C). Derived
@@ -5114,7 +5103,7 @@ impl App {
     /// blocked / interrupted run is resumed (`/continue`, `/tasks resume`).
     ///
     /// The resumed run APPENDS its output to the SAME durable [`Self::history`],
-    /// so the earlier steps' per-step notes (plan-posted memo, `push_critic_note`
+    /// so the earlier steps' per-step notes (plan-posted memo, `transcript_note`
     /// verdicts, tool rows) stay in scrollback — a block only clears the LIVE
     /// PANEL state ([`Self::clear_live_panels`]), never the transcript. Without a
     /// marker, though, the transcript auto-sticks to the bottom on resume and the
@@ -8143,14 +8132,7 @@ impl App {
     ///   carrying the seat + verdict + its full blocking findings, so the
     ///   complete set is always in the scrollable history. The panel's compact
     ///   "… +N" tail can clip rows; the transcript never loses content.
-    fn apply_critic_verdict(
-        &mut self,
-        seat: String,
-        accepts: bool,
-        blocking: Vec<String>,
-        remediation: Vec<String>,
-        advisory: Vec<String>,
-    ) {
+    fn apply_critic_verdict(&mut self, row: CriticRow) {
         // A sealed round means this verdict opens a NEW review round — drop the
         // previous round's rows before the new seats land so the panel can't show
         // a half-old / half-new mix.
@@ -8159,63 +8141,13 @@ impl App {
             self.critic_round_open = true;
         }
         // Mirror the full verdict into the transcript (the never-lost source of
-        // truth) before the value is moved into the panel row.
-        self.push_critic_note(&seat, accepts, &blocking, &remediation);
-        let row = CriticRow {
-            seat,
-            accepts,
-            blocking,
-            remediation,
-            advisory,
-        };
+        // truth) before the row moves into the panel.
+        self.push(ChatRole::System, row.transcript_note(self.lang));
         if let Some(existing) = self.critic_verdicts.iter_mut().find(|c| c.seat == row.seat) {
             *existing = row;
         } else {
             self.critic_verdicts.push(row);
         }
-    }
-
-    /// Push one reviewing seat's verdict into the transcript as a `System` note —
-    /// the unbounded, scrollable record that guarantees a blocking critic's full
-    /// findings are never hidden behind the panel's "… +N" clip. An accept is one
-    /// line; a block lists every must-fix finding underneath. Localized.
-    fn push_critic_note(
-        &mut self,
-        seat: &str,
-        accepts: bool,
-        blocking: &[String],
-        remediation: &[String],
-    ) {
-        let mut body = if accepts {
-            umadev_i18n::tf(self.lang, "plan.review.note.accept", &[seat])
-        } else {
-            umadev_i18n::tf(
-                self.lang,
-                "plan.review.note.block",
-                &[seat, &blocking.len().max(1).to_string()],
-            )
-        };
-        for (i, b) in blocking.iter().enumerate() {
-            let item = b.trim();
-            if item.is_empty() {
-                continue;
-            }
-            body.push_str(&format!("\n  - {item}"));
-            // The seat's per-blocker "how to fix" (index-aligned) rides directly
-            // under the problem so the transcript shows a concrete next-step, not
-            // just what is wrong. Fail-open: no matching suggestion → nothing extra.
-            if let Some(fix) = remediation
-                .get(i)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-            {
-                body.push_str(&format!(
-                    "\n    {}",
-                    umadev_i18n::tf(self.lang, "plan.review.fix", &[fix])
-                ));
-            }
-        }
-        self.push(ChatRole::System, body);
     }
 
     /// Build the **live team roster** (Wave C): one [`RosterSeat`] per seat that
@@ -8252,7 +8184,7 @@ impl App {
             let canonical = umadev_agent::Seat::from_alias(&c.seat)
                 .map_or(c.seat.clone(), |s| s.role_id().to_string());
             if let Some(seat) = roster.iter_mut().find(|r| r.role == canonical) {
-                seat.verdict = Some((c.accepts, c.blocking.len()));
+                seat.verdict = (!c.is_unavailable()).then_some((c.accepts, c.blocking.len()));
             }
         }
         roster
@@ -8412,7 +8344,15 @@ impl App {
                 blocking,
                 remediation,
                 advisory,
-            } => self.apply_critic_verdict(seat, accepts, blocking, remediation, advisory),
+                unavailable,
+            } => self.apply_critic_verdict(CriticRow {
+                seat,
+                accepts,
+                blocking,
+                remediation,
+                advisory,
+                unavailable,
+            }),
             EngineEvent::PhaseStarted { phase } => {
                 self.set_phase(phase, PhaseStatus::Running);
                 self.phase_started_at = Some(std::time::Instant::now());
@@ -12174,8 +12114,7 @@ impl App {
     /// stops rendering a stale list. Fail-open: no verdicts → no summary line.
     fn finalize_live_panels(&mut self) {
         if !self.critic_verdicts.is_empty() {
-            let accepts = self.critic_verdicts.iter().filter(|c| c.accepts).count();
-            let blocking = self.critic_verdicts.len() - accepts;
+            let (accepts, blocking) = self.review_tally();
             self.push(
                 ChatRole::System,
                 umadev_i18n::tf(
@@ -14372,15 +14311,7 @@ impl App {
                 // wording), never a blank run section.
                 if has_review {
                     for c in &self.critic_verdicts {
-                        let verdict = if c.accepts {
-                            umadev_i18n::t(self.lang, "plan.review.accept").to_string()
-                        } else {
-                            umadev_i18n::tf(
-                                self.lang,
-                                "plan.review.block",
-                                &[&c.blocking.len().max(1).to_string()],
-                            )
-                        };
+                        let verdict = c.verdict_label(self.lang);
                         body.push_str(&format!(
                             "  {} · {verdict}\n",
                             seat_display_name(self.lang, &c.seat)

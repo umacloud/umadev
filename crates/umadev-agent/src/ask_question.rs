@@ -107,6 +107,36 @@ pub fn note_for(q: &AskUserQuestion) -> String {
 /// [`surface`] (there the pending-ask machinery really does relay the reply).
 #[must_use]
 pub fn surface_mid_run(name: &str, input: &serde_json::Value) -> Option<AskQuestionSurface> {
+    run_surface(name, input, "ask.prompt.midrun_hint")
+}
+
+/// [`surface`] for a run with NO live answer surface (the headless `umadev run`):
+/// the host declines the base's question with a safe default and the base goes on
+/// with its own judgement, so the note shows the question but promises no reply —
+/// nothing is waiting for one.
+#[must_use]
+pub fn surface_headless(name: &str, input: &serde_json::Value) -> Option<AskQuestionSurface> {
+    run_surface(name, input, "ask.prompt.headless_hint")
+}
+
+/// The honest surface for a base question asked inside a run: the mid-run hint
+/// when a live answer surface is attached ([`surface_mid_run`]), otherwise the
+/// headless one ([`surface_headless`]).
+#[must_use]
+pub fn surface_for_run(name: &str, input: &serde_json::Value) -> Option<AskQuestionSurface> {
+    if crate::interaction::host_requests_hosted() {
+        surface_mid_run(name, input)
+    } else {
+        surface_headless(name, input)
+    }
+}
+
+/// Header + question block + the given hint, for the run-time surfaces.
+fn run_surface(
+    name: &str,
+    input: &serde_json::Value,
+    hint_key: &str,
+) -> Option<AskQuestionSurface> {
     let q = AskUserQuestion::from_tool_input(name, input)?;
     let mut note = umadev_i18n::tlf("ask.prompt.header", &[]);
     note.push('\n');
@@ -116,7 +146,7 @@ pub fn surface_mid_run(name: &str, input: &serde_json::Value) -> Option<AskQuest
         note.push_str(&q.prompt_block());
     }
     note.push('\n');
-    note.push_str(&umadev_i18n::tlf("ask.prompt.midrun_hint", &[]));
+    note.push_str(&umadev_i18n::tlf(hint_key, &[]));
     Some(AskQuestionSurface {
         detail: q.summary(),
         note,
@@ -323,6 +353,35 @@ mod tests {
         );
         // Fail-open parity with `surface`.
         assert!(surface_mid_run("Write", &serde_json::json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_surface_promises_a_reply_only_when_one_can_be_given() {
+        // S02-8: the mid-run hint ("the request is paused, type the answer") is
+        // true only when a live host-request surface is attached. Headless, the
+        // host declines the question with a safe default and says so instead.
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Which auth method should the app use?",
+                "options": [{"label": "Email + password"}, {"label": "OAuth (Google)"}]
+            }]
+        });
+        let midrun = umadev_i18n::tlf("ask.prompt.midrun_hint", &[]);
+        let headless = umadev_i18n::tlf("ask.prompt.headless_hint", &[]);
+        let unscoped = surface_for_run("AskUserQuestion", &input).expect("has a surface");
+        assert!(unscoped.note.contains(&headless) && !unscoped.note.contains(&midrun));
+
+        let callback: crate::interaction::HostRequestFn =
+            std::sync::Arc::new(|_, _| Box::pin(async { None }));
+        let hosted = crate::interaction::hosted(
+            crate::interaction::RunInteraction {
+                host_request: Some(callback),
+                ..Default::default()
+            },
+            async { surface_for_run("AskUserQuestion", &input).expect("has a surface") },
+        )
+        .await;
+        assert!(hosted.note.contains(&midrun) && !hosted.note.contains(&headless));
     }
 
     #[test]

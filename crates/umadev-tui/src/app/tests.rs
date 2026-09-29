@@ -4805,6 +4805,7 @@ fn slash_plan_is_the_lossless_view_for_every_convened_team_row() {
         blocking: vec!["missing authorization check".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
 
     assert_eq!(app.try_slash_command("/plan"), Some(Action::None));
@@ -4875,6 +4876,7 @@ fn slash_plan_is_a_complete_review_snapshot() {
         blocking: vec!["authorization is missing".into()],
         remediation: vec!["enforce the role check at the route boundary".into()],
         advisory: vec!["add an audit event for denied requests".into()],
+        unavailable: None,
     });
 
     assert_eq!(app.try_slash_command("/plan"), Some(Action::None));
@@ -5008,6 +5010,7 @@ fn roster_verdict_chip_reflects_critic_verdict_only_for_convened_seats() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     app.apply_engine(EngineEvent::CriticVerdict {
         seat: "qa".into(),
@@ -5015,6 +5018,7 @@ fn roster_verdict_chip_reflects_critic_verdict_only_for_convened_seats() {
         blocking: vec!["missing tests".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     let roster = app.convened_roster();
     // Anti-theater: QA reviewed but has no step → it never joins the roster.
@@ -5059,6 +5063,7 @@ fn critic_transcript_note_carries_per_blocker_resolution() {
             "generate a random per-session id server-side".into(),
         ],
         advisory: vec![],
+        unavailable: None,
     });
     let note = app
         .history
@@ -5645,6 +5650,7 @@ fn critic_verdict_records_and_replaces_per_seat() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec!["consider a cache".into()],
+        unavailable: None,
     });
     app.apply_engine(EngineEvent::CriticVerdict {
         seat: "qa".into(),
@@ -5652,6 +5658,7 @@ fn critic_verdict_records_and_replaces_per_seat() {
         blocking: vec!["no tests".into(), "no error handling".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert_eq!(app.critic_verdicts.len(), 2);
     // A re-review of the SAME seat replaces its row (does not stack).
@@ -5661,6 +5668,7 @@ fn critic_verdict_records_and_replaces_per_seat() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert_eq!(app.critic_verdicts.len(), 2, "seat replaced, not stacked");
     let qa = app.critic_verdicts.iter().find(|c| c.seat == "qa").unwrap();
@@ -5845,6 +5853,7 @@ fn new_run_clears_the_plan_and_review_panels() {
         blocking: vec!["x".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
     app.reset_for_new_run();
@@ -5867,6 +5876,7 @@ fn critic_verdict_is_mirrored_into_the_transcript_with_full_findings() {
         ],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
     assert!(joined.contains("[frontend-engineer]"), "seat in transcript");
@@ -5877,6 +5887,41 @@ fn critic_verdict_is_mirrored_into_the_transcript_with_full_findings() {
     assert!(
         joined.contains("no error states on the form"),
         "second must-fix (beyond the panel's first-line inline) in transcript"
+    );
+}
+
+#[test]
+fn unavailable_seat_event_is_not_a_must_fix() {
+    // S02-5: a seat that produced no verdict (timeout / fork / parse failure)
+    // is an operational fact. It must never read as a rejection with an
+    // invented "1 must-fix", nor count toward the blocking tally.
+    let mut app = fresh_app(Some("offline"));
+    let before = app.history.len();
+    app.apply_engine(umadev_agent::EngineEvent::critic_verdict(
+        &umadev_agent::critics::RoleVerdict::unavailable("qa-engineer", "review turn timed out"),
+    ));
+    let note: String = app
+        .history
+        .iter()
+        .skip(before)
+        .map(|m| m.body().clone())
+        .collect();
+    let must_fix = umadev_i18n::tf(app.lang, "plan.review.note.block", &["qa-engineer", "1"]);
+    assert!(!note.contains(&must_fix), "no invented must-fix: {note}");
+    assert!(
+        note.contains(&umadev_i18n::tf(
+            app.lang,
+            "plan.review.note.unavailable",
+            &["qa-engineer", "review turn timed out"],
+        )),
+        "the transcript names the outage and its reason: {note}"
+    );
+    assert_eq!(app.review_tally(), (0, 0), "neither an accept nor a blocker");
+    let row = &app.critic_verdicts[0];
+    assert!(row.is_unavailable() && !row.is_blocking());
+    assert_eq!(
+        row.verdict_label(app.lang),
+        umadev_i18n::t(app.lang, "plan.review.unavailable")
     );
 }
 
@@ -5893,6 +5938,7 @@ fn a_new_review_round_replaces_the_previous_rounds_seats() {
             blocking: vec!["fix it".into()],
             remediation: vec![],
             advisory: vec![],
+            unavailable: None,
         });
     }
     assert_eq!(app.critic_verdicts.len(), 3, "round 1 has three seats");
@@ -5909,6 +5955,7 @@ fn a_new_review_round_replaces_the_previous_rounds_seats() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert_eq!(
         app.critic_verdicts.len(),
@@ -5930,6 +5977,7 @@ fn contiguous_verdicts_in_one_round_do_not_clear_each_other() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     app.apply_engine(EngineEvent::CriticVerdict {
         seat: "qa".into(),
@@ -5937,6 +5985,7 @@ fn contiguous_verdicts_in_one_round_do_not_clear_each_other() {
         blocking: vec!["no tests".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert_eq!(app.critic_verdicts.len(), 2, "one round keeps both seats");
 }
@@ -5960,6 +6009,7 @@ fn delivery_finish_clears_the_live_plan_and_review_panels() {
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
     app.apply_engine(EngineEvent::BlockCompleted {
@@ -6001,6 +6051,7 @@ fn an_aborted_block_clears_the_live_plan_and_review_panels() {
         blocking: vec!["broken".into()],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
     app.apply_engine(EngineEvent::Note(format!(
@@ -6965,6 +7016,7 @@ fn resuming_a_blocked_run_keeps_earlier_transcript_and_marks_a_continued_divider
         blocking: vec![],
         remediation: vec![],
         advisory: vec![],
+        unavailable: None,
     });
     app.apply_engine(EngineEvent::CriticVerdict {
         seat: "security".into(),
@@ -6972,6 +7024,7 @@ fn resuming_a_blocked_run_keeps_earlier_transcript_and_marks_a_continued_divider
         blocking: vec!["step-2-auth-token-leak".into()],
         remediation: vec!["scope the token to the session".into()],
         advisory: vec![],
+        unavailable: None,
     });
     // The run hits a hard block and stops (clears the live panels, keeps the
     // transcript).

@@ -105,6 +105,18 @@ binary).
 | `UMADEV_LEGACY_PIPELINE` | Route `/run` through the legacy fixed 9-phase pipeline instead of the default director-driven agentic path. Enable with `1`/`true`/`on`. Also selects the `UMADEV_RUN_BUDGET_SECS` "whole-run soft budget" semantics above. | off (director path) |
 | `UMADEV_STRICT_COVERAGE` | Treat coverage as a strict gate. Enable with `1`. | off |
 
+### Project file `.umadevrc` — which run path reads each knob
+
+`.umadevrc` travels with the repository, so it may make a run stricter, never
+weaker.
+
+| Key | Applies to | Default |
+| --- | --- | --- |
+| `[pipeline] max_review_rounds` | Director build: caps the auto-QC fix rounds (a lower value only). Single-shot runner: the document review→fix budget. | `3` |
+| `[quality] threshold` | The scored quality gate of the legacy pipeline and the single-shot runner (a higher value only). The director build has no scored gate. | `90` |
+| `[quality] skip_checks` | The same scored gate; security checks always run. | none |
+| `[pipeline] skip_phases` | Single-shot runner only. | none |
+
 ---
 
 ## Paths

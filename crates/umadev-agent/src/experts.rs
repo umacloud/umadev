@@ -1378,9 +1378,25 @@ pub fn excerpt(text: &str, max_chars: usize) -> String {
 /// arbitrary prefix of the document.
 #[must_use]
 pub fn excerpt_sections(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
+    excerpt_sections_reporting(text, max_chars).0
+}
+
+/// [`excerpt_sections`] that also NAMES what it left out: the heading of every
+/// section it dropped or cut, in document order, or one entry for the tail of an
+/// unstructured document. Empty when the whole text fit. A reviewer whose payload
+/// is its entire review boundary needs this list, or it reports a section cut to
+/// fit the budget as a section the author never wrote.
+#[must_use]
+pub fn excerpt_sections_reporting(text: &str, max_chars: usize) -> (String, Vec<String>) {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return (text.to_string(), Vec::new());
     }
+    let unstructured_tail = || {
+        vec![format!(
+            "everything after the first {max_chars} of {total_chars} characters"
+        )]
+    };
     // Split at heading lines; the preamble before the first heading is its own
     // section so a doc that opens with prose keeps its intro.
     let mut sections: Vec<String> = Vec::new();
@@ -1405,10 +1421,12 @@ pub fn excerpt_sections(text: &str, max_chars: usize) -> String {
         sections.push(cur);
     }
     if sections.len() <= 1 {
-        return excerpt(text, max_chars); // no structure to preserve
+        // No structure to preserve.
+        return (excerpt(text, max_chars), unstructured_tail());
     }
     const KEYS: &[&str] = &[
         "api",
+        "auth",
         "endpoint",
         "route",
         "schema",
@@ -1423,6 +1441,8 @@ pub fn excerpt_sections(text: &str, max_chars: usize) -> String {
         "component",
         "acceptance",
         "criteria",
+        "requirement",
+        "scope",
         "stack",
         "data model",
         "interface",
@@ -1454,19 +1474,28 @@ pub fn excerpt_sections(text: &str, max_chars: usize) -> String {
         }
     }
     let mut kept = String::new();
+    let mut omitted = Vec::new();
     for (i, s) in sections.iter().enumerate() {
+        let heading = s.lines().next().unwrap_or("").trim();
+        let heading = if heading.starts_with('#') {
+            heading
+        } else {
+            "(text before the first heading)"
+        };
         if take[i] {
             kept.push_str(s);
-        } else if let Some((ti, t)) = &trunc {
-            if *ti == i {
-                kept.push_str(t);
-            }
+        } else if let Some((_, t)) = trunc.as_ref().filter(|(ti, _)| *ti == i) {
+            kept.push_str(t);
+            omitted.push(format!("{heading} (cut short)"));
+        } else {
+            omitted.push(heading.to_string());
         }
     }
     if kept.is_empty() {
-        return excerpt(text, max_chars); // even the smallest section overflowed
+        // Even the smallest section overflowed.
+        return (excerpt(text, max_chars), unstructured_tail());
     }
-    kept
+    (kept, omitted)
 }
 
 #[cfg(test)]
@@ -1699,6 +1728,24 @@ mod tests {
         let doc = "a".repeat(1000);
         let out = excerpt_sections(&doc, 100);
         assert!(out.chars().count() <= 100);
+    }
+
+    #[test]
+    fn excerpt_sections_reporting_names_every_section_it_left_out() {
+        // S04-13: whatever the excerpt drops or cuts is named, in document order,
+        // so a reviewer is never told it has a whole document when it does not.
+        let doc = format!(
+            "# Title\n\n## Overview\n{}\n\n## Authentication & authorization\nJWT\n\n## API\n{}\n",
+            "y".repeat(600),
+            "GET /a\n".repeat(20),
+        );
+        let (kept, omitted) = excerpt_sections_reporting(&doc, 190);
+        assert!(kept.contains("## API") && kept.contains("## Authentication"));
+        assert_eq!(omitted, vec!["# Title".to_string(), "## Overview".to_string()]);
+        let (_, nothing) = excerpt_sections_reporting("## API\nGET /a\n", 200);
+        assert!(nothing.is_empty(), "a document that fits omits nothing");
+        let (_, tail) = excerpt_sections_reporting(&"a".repeat(1000), 100);
+        assert_eq!(tail.len(), 1, "an unstructured cut is still declared");
     }
 
     #[test]

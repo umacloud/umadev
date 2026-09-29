@@ -1170,12 +1170,12 @@ pub fn run_quality_report_with_kind(
         &opts.project_root,
         output_dir.join(format!("{slug}-prd.md")),
     );
-    let prd_defects = review_document_structure(
+    let prd_defects = review_document_structure_any(
         &prd_text,
         &[
-            ("## goal", "Missing ## Goal section"),
-            ("## scope", "Missing ## Scope section"),
-            ("- [ ]", "Missing acceptance criteria checkboxes"),
+            (&["## goal", "## 目标", "## 目標"], "Missing ## Goal section"),
+            (&["## scope", "## 范围", "## 範圍"], "Missing ## Scope section"),
+            (&["- [ ]"], "Missing acceptance criteria checkboxes"),
         ],
     );
     checks.push(content_quality_check(
@@ -1218,12 +1218,15 @@ pub fn run_quality_report_with_kind(
         &opts.project_root,
         output_dir.join(format!("{slug}-architecture.md")),
     );
-    let arch_defects = review_document_structure(
+    let arch_defects = review_document_structure_any(
         &arch_text,
         &[
-            ("## api", "Missing ## API surface section"),
-            ("## data model", "Missing ## Data model section"),
-            ("| ", "Missing API route table (no markdown table rows)"),
+            (&["## api", "## 接口", "## 介面"], "Missing ## API surface section"),
+            (
+                &["## data model", "## 数据模型", "## 資料模型"],
+                "Missing ## Data model section",
+            ),
+            (&["| "], "Missing API route table (no markdown table rows)"),
         ],
     );
     checks.push(content_quality_check(
@@ -1239,13 +1242,16 @@ pub fn run_quality_report_with_kind(
         &opts.project_root,
         output_dir.join(format!("{slug}-uiux.md")),
     );
-    let uiux_defects = review_document_structure(
+    let uiux_defects = review_document_structure_any(
         &uiux_text,
         &[
-            ("--color", "Missing CSS color tokens"),
-            ("--font", "Missing typography tokens"),
-            ("icon", "Missing icon library declaration"),
-            ("hover", "Missing component states (hover/focus)"),
+            (&["--color"], "Missing CSS color tokens"),
+            (&["--font"], "Missing typography tokens"),
+            (&["icon", "图标", "圖示", "圖標"], "Missing icon library declaration"),
+            (
+                &["hover", "悬停", "懸停", "悬浮", "懸浮"],
+                "Missing component states (hover/focus)",
+            ),
         ],
     );
     checks.push(content_quality_check(
@@ -4049,6 +4055,17 @@ fn check_dark_mode_support(project_root: &Path, uiux_path: &Path) -> (String, i3
 /// fallback, a correctly-authored UIUX doc with a complete `:root` token block
 /// in a ```css fence would always fail the "Missing CSS color tokens" check.
 fn review_document_structure(text: &str, required: &[(&str, &str)]) -> Vec<String> {
+    let required = required
+        .iter()
+        .map(|(keyword, msg)| (std::slice::from_ref(keyword), *msg))
+        .collect::<Vec<_>>();
+    review_document_structure_any(text, &required)
+}
+
+/// [`review_document_structure`] where each requirement is met by ANY of its
+/// spellings — a PRD written in Chinese says `## 目标` / `## 范围`, not `## Goal` /
+/// `## Scope`, and is exactly as complete.
+fn review_document_structure_any(text: &str, required: &[(&[&str], &str)]) -> Vec<String> {
     let headings: Vec<String> = text
         .lines()
         .filter_map(|l| {
@@ -4067,13 +4084,16 @@ fn review_document_structure(text: &str, required: &[(&str, &str)]) -> Vec<Strin
         .collect();
     let full_lower = text.to_ascii_lowercase();
     let mut defects = Vec::new();
-    for (keyword, msg) in required {
-        let kw = keyword.trim_start_matches('#').trim().to_ascii_lowercase();
-        let in_heading = headings
-            .iter()
-            .any(|h| h.starts_with(&kw) || h.split_whitespace().any(|w| w == kw));
-        let in_text = !kw.is_empty() && full_lower.contains(&kw);
-        if !in_heading && !in_text {
+    for (spellings, msg) in required {
+        let present = spellings.iter().any(|keyword| {
+            let kw = keyword.trim_start_matches('#').trim().to_ascii_lowercase();
+            let in_heading = headings
+                .iter()
+                .any(|h| h.starts_with(&kw) || h.split_whitespace().any(|w| w == kw));
+            let in_text = !kw.is_empty() && full_lower.contains(&kw);
+            in_heading || in_text
+        });
+        if !present {
             defects.push((*msg).to_string());
         }
     }
@@ -6725,6 +6745,34 @@ mod tests {
             !report.checks.iter().any(|c| c.name == "Dark mode support"),
             "skipped check should not appear in report"
         );
+    }
+
+    #[test]
+    fn quality_accepts_a_chinese_prd() {
+        // S02-6: a PRD written with Chinese headings (目标 / 范围 / 验收标准) is a
+        // complete PRD. The UD-ART-002 content check must not fail it (and with it
+        // the whole legacy gate) only because the English words are absent.
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        run_research(&o, None).unwrap();
+        run_docs(&o, &DocsContent::default()).unwrap();
+        run_spec(&o).unwrap();
+        fs::write(
+            tmp.path().join("output/demo-prd.md"),
+            "# PRD — demo\n\n## 目标\n帮助小团队追踪任务进度。\n\n## 范围\n### 范围内\n- 任务看板\n\
+             ### 范围外\n- 计费\n\n## 验收标准\n- [ ] **FR-001** — 给定已登录用户,当创建任务时,则任务出现在看板上\n",
+        )
+        .unwrap();
+        let out = run_quality(&o).unwrap();
+        let json = fs::read_to_string(&out.artifacts[0]).unwrap();
+        let report: QualityReport = serde_json::from_str(&json).unwrap();
+        let prd = report
+            .checks
+            .iter()
+            .find(|c| c.name == "PRD content")
+            .expect("PRD content row");
+        assert_ne!(prd.status, "failed", "{}", prd.details);
+        assert_eq!(prd.status, "passed", "{}", prd.details);
     }
 
     #[test]

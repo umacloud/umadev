@@ -6067,13 +6067,12 @@ async fn drive_one_turn_with_backoff_and_memories(
                 // its OWN `AskUserQuestion` tool. Driven non-interactively, that call
                 // can't render its picker and auto-cancels — was a bare optionless
                 // stub read as cancelled. Surface the question + numbered options as a
-                // Note + give the tool row a real detail. A2#6: on THIS mid-run
-                // director path the honest hint is the MID-RUN variant — the build
-                // continues with the base's default; a typed answer folds in as
-                // follow-up steering at the next step boundary (never "the base is
-                // waiting on you", which is only true on the chat surface's relay).
+                // Note + give the tool row a real detail. The hint says who can
+                // answer: a live host-request surface pauses the request for the
+                // user; the headless CLI has none, so the host declined it with a
+                // safe default and no reply is promised (`surface_for_run`).
                 // Fail-open: a non-question call → None.
-                if let Some(surface) = crate::ask_question::surface_mid_run(&name, &input) {
+                if let Some(surface) = crate::ask_question::surface_for_run(&name, &input) {
                     detail = surface.detail;
                     events.emit(EngineEvent::Note(surface.note));
                 } else if let Some(surface) = crate::ask_question::exit_plan_surface(&name, &input)

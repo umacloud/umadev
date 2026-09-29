@@ -280,6 +280,10 @@ pub enum EngineEvent {
         remediation: Vec<String>,
         /// Nice-to-have notes (may be empty).
         advisory: Vec<String>,
+        /// `Some(reason)` when the seat produced NO verdict (a fork, transport,
+        /// parse or timeout failure): an operational fact to render neutrally,
+        /// never a must-fix finding. `None` for every real pass / fail verdict.
+        unavailable: Option<String>,
     },
 }
 
@@ -348,6 +352,7 @@ impl EngineEvent {
             blocking: verdict.blocking.clone(),
             remediation: verdict.remediation.clone(),
             advisory: verdict.advisory.clone(),
+            unavailable: verdict.unavailable_reason().map(str::to_string),
         }
     }
 }
@@ -1075,10 +1080,12 @@ mod tests {
             blocking,
             remediation,
             advisory,
+            unavailable,
         } = ev
         else {
             panic!("wrong variant");
         };
+        assert_eq!(unavailable, None, "a real verdict is never unavailable");
         assert_eq!(seat, "architect");
         assert!(!accepts);
         assert_eq!(blocking, vec!["missing API table".to_string()]);
@@ -1086,5 +1093,25 @@ mod tests {
         assert_eq!(remediation.len(), 1);
         assert!(remediation[0].contains("API table"));
         assert_eq!(advisory.len(), 1);
+    }
+
+    #[test]
+    fn unavailable_seat_event_is_not_a_must_fix() {
+        // S02-5: a seat that produced no verdict reaches the UI as unavailable
+        // with its operational reason — never as a rejection with no findings.
+        let ev = EngineEvent::critic_verdict(&crate::critics::RoleVerdict::unavailable(
+            "qa-engineer",
+            "review turn timed out",
+        ));
+        let EngineEvent::CriticVerdict {
+            blocking,
+            unavailable,
+            ..
+        } = ev
+        else {
+            panic!("wrong variant");
+        };
+        assert!(blocking.is_empty());
+        assert_eq!(unavailable.as_deref(), Some("review turn timed out"));
     }
 }

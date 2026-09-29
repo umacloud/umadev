@@ -52,7 +52,6 @@ const RUNTIME_LLM_SUBSTRINGS: &[&str] = &[
     "智能问答",
     "智能客服",
     "知识库问答",
-    "问答系统",
     "智能助手",
     "ai助手",
     "ai 助手",
@@ -100,6 +99,80 @@ const RUNTIME_LLM_WORDS: &[&str] = &["llm", "gpt", "chatgpt", "rag", "copilot"];
 /// "AI prompt" while dropping the non-AI false positives.
 const RUNTIME_LLM_WORDS_AI_QUALIFIED: &[&str] = &["agent", "prompt"];
 
+/// The canonical label of an Anthropic Claude runtime (see [`stated_runtime_model`]).
+const CLAUDE_RUNTIME_LABEL: &str = "Anthropic Claude";
+
+/// The coding bases / dev CLIs by product name. Naming one says which tool WRITES
+/// the app ("用 Claude Code 做一个记账本"), not a model the app calls at runtime.
+const DEV_BASE_NAMES: &[&str] = &[
+    "claude code",
+    "claude-code",
+    "claudecode",
+    "kimi code",
+    "kimi-code",
+    "kimi cli",
+    "gemini cli",
+    "gemini-cli",
+];
+
+/// Phrases that, right after "用 / 使用 / 让 <model>", make the model the DEV tool
+/// building the product ("用 kimi 帮我写个待办") rather than the app's runtime
+/// engine ("运行时用 kimi", "用 kimi 来回答用户问题" keep the model).
+const DEV_TOOL_VERBS: &[&str] = &[
+    "帮我",
+    "帮忙",
+    "做一个",
+    "做个",
+    "做一款",
+    "做一套",
+    "写一个",
+    "写个",
+    "写一款",
+    "来做",
+    "来写",
+    "来开发",
+    "开发",
+    "实现一个",
+    "搭一个",
+    "搭个",
+    "搭建",
+    "构建",
+    "编写",
+    "编程",
+    "to build",
+    "to make",
+    "to create",
+    "to develop",
+    "to code",
+    "to implement",
+];
+
+/// Lowercase `requirement` with every mention of the DEV tool blanked out — a
+/// base product name, or a model named as the one doing the work — so provider
+/// detection only sees what the BUILT APP calls at runtime.
+fn without_dev_tool_mentions(requirement: &str) -> String {
+    let mut lower = requirement.to_lowercase();
+    for name in DEV_BASE_NAMES {
+        lower = lower.replace(name, " ");
+    }
+    let leads = ["使用", "用", "让", "using", "use"];
+    for matcher in PROVIDER_PATTERNS.iter().flat_map(|(matchers, _)| matchers.iter()) {
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find(matcher) {
+            let start = from + offset;
+            let end = start + matcher.len();
+            let before = lower[..start].trim_end();
+            let after = lower[end..].trim_start();
+            let led = leads.iter().any(|lead| before.ends_with(lead));
+            if led && DEV_TOOL_VERBS.iter().any(|verb| after.starts_with(verb)) {
+                lower.replace_range(start..end, &" ".repeat(matcher.len()));
+            }
+            from = end;
+        }
+    }
+    lower
+}
+
 /// Provider / model recognisers, in priority order (more specific first). Each
 /// entry is `(matchers, canonical_label)`: if ANY matcher hits (CJK matchers by
 /// `contains`, ASCII matchers by [`has_word`]), the canonical label names the
@@ -133,7 +206,7 @@ const PROVIDER_PATTERNS: &[(&[&str], &str)] = &[
     (&["豆包", "doubao"], "Doubao / 豆包"),
     (&["混元", "hunyuan"], "Tencent Hunyuan / 混元"),
     (&["gemini"], "Google Gemini"),
-    (&["claude", "anthropic"], "Anthropic Claude"),
+    (&["claude", "anthropic"], CLAUDE_RUNTIME_LABEL),
     (
         &["ollama", "llama", "本地模型", "本地大模型", "私有化部署"],
         "a local / self-hosted model (Ollama / Llama, OpenAI-compatible API)",
@@ -150,7 +223,7 @@ const PROVIDER_PATTERNS: &[(&[&str], &str)] = &[
 /// unrecognised requirement returns `false` → no directive, no tokens spent).
 #[must_use]
 pub fn app_calls_llm_at_runtime(requirement: &str) -> bool {
-    let lower = requirement.to_lowercase();
+    let lower = without_dev_tool_mentions(requirement);
     if RUNTIME_LLM_SUBSTRINGS.iter().any(|s| lower.contains(s)) {
         return true;
     }
@@ -196,7 +269,7 @@ fn has_ai_app(lower: &str) -> bool {
 /// "glm" matches as a token but not inside an unrelated word.
 #[must_use]
 pub fn stated_runtime_model(requirement: &str) -> Option<&'static str> {
-    let lower = requirement.to_lowercase();
+    let lower = without_dev_tool_mentions(requirement);
     for (matchers, label) in PROVIDER_PATTERNS {
         let hit = matchers.iter().any(|m| {
             if m.is_ascii() {
@@ -210,6 +283,19 @@ pub fn stated_runtime_model(requirement: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The one-line guard the work firmware prefixes onto [`runtime_model_directive`]:
+/// keep the app's runtime model behind a provider layer and never silently
+/// hardcode the dev base's vendor. Empty when the user NAMED Anthropic Claude as
+/// the app's runtime model — then Claude is the requested default, not a leak.
+#[must_use]
+pub fn runtime_guard(requirement: &str) -> &'static str {
+    if stated_runtime_model(requirement) == Some(CLAUDE_RUNTIME_LABEL) {
+        return "";
+    }
+    "Runtime guard: use an OpenAI-compatible provider layer; NEVER silently hardcode \
+     Anthropic / Claude or `ANTHROPIC_API_KEY`.\n"
 }
 
 /// The firmware / generation guidance block for a build whose app calls an LLM at
@@ -226,7 +312,8 @@ pub fn runtime_model_directive(requirement: &str) -> String {
     if !app_calls_llm_at_runtime(requirement) {
         return String::new();
     }
-    let default_clause = match stated_runtime_model(requirement) {
+    let stated = stated_runtime_model(requirement);
+    let default_clause = match stated {
         Some(model) => format!(
             "The user NAMED a runtime model — **{model}**: default the app's config to \
              THAT provider (its model id + base URL + the matching API-key env var). \
@@ -240,13 +327,19 @@ pub fn runtime_model_directive(requirement: &str) -> String {
              model is configurable and how to switch it.",
         ),
     };
+    // A user who chose Claude for the app's runtime gets Claude as the default;
+    // everyone else gets the floor against silently inheriting the dev base's vendor.
+    let vendor_floor = if stated == Some(CLAUDE_RUNTIME_LABEL) {
+        ""
+    } else {
+        " NEVER silently hardcode Anthropic / Claude or `ANTHROPIC_API_KEY`."
+    };
     format!(
         "## App runtime model — USER-CONFIGURABLE, not the dev base\n\
          {default_clause}\n\
          Minimum implementation contract: keep model id, base URL, and API-key \
          env-var name configurable; prefer an OpenAI-compatible client so Qwen, \
-         DeepSeek, Zhipu, Moonshot, OpenAI, and local Ollama are config changes. \
-         NEVER silently hardcode Anthropic / Claude or `ANTHROPIC_API_KEY`.\n\
+         DeepSeek, Zhipu, Moonshot, OpenAI, and local Ollama are config changes.{vendor_floor}\n\
          This build's app calls an LLM at RUNTIME. That runtime model is the USER'S \
          choice and is a SEPARATE concern from the base CLI this dev tool itself runs \
          on. Never silently substitute the dev base's provider as the app's runtime \
@@ -399,5 +492,47 @@ mod tests {
         assert!(d.contains("Qwen"), "threads the Qwen/DashScope label: {d}");
         // Still carries the never-hardcode-Claude floor.
         assert!(d.contains("Anthropic / Claude"));
+    }
+
+    #[test]
+    fn naming_the_dev_base_is_not_a_runtime_llm_app() {
+        // S02-9: the dev base / the tool that WRITES the app is not a model the
+        // app calls at runtime, and a plain Q&A forum is an ordinary CRUD app.
+        for req in [
+            "用 Claude Code 做一个记账本",
+            "用 claude-code 帮我写一个博客",
+            "用 kimi 帮我写个待办",
+            "用 Kimi Code 做一个库存管理系统",
+            "use claude to build a todo app",
+            "做一个校园问答系统",
+        ] {
+            assert!(
+                !app_calls_llm_at_runtime(req),
+                "must not be flagged as a runtime-LLM app: {req}"
+            );
+            assert_eq!(stated_runtime_model(req), None, "{req}");
+        }
+        // A model the app really calls at runtime is still detected.
+        assert!(stated_runtime_model("做一个聊天机器人,运行时用 kimi")
+            .unwrap()
+            .contains("Moonshot"));
+        assert!(stated_runtime_model("做一个客服,用 kimi 来回答用户问题")
+            .unwrap()
+            .contains("Moonshot"));
+        assert!(app_calls_llm_at_runtime("做一个智能问答系统"));
+    }
+
+    #[test]
+    fn a_claude_backed_app_is_not_told_to_avoid_claude() {
+        // S02-9: when the user names Claude as the app's RUNTIME model, the
+        // directive must not also forbid hardcoding Anthropic / Claude.
+        let d = runtime_model_directive("做一个客服聊天机器人,运行时用 Claude");
+        assert!(d.contains("NAMED a runtime model") && d.contains("Anthropic Claude"));
+        assert!(
+            !d.contains("NEVER silently hardcode"),
+            "no contradictory anti-Anthropic guard for a Claude-backed app: {d}"
+        );
+        assert!(runtime_guard("做一个客服聊天机器人,运行时用 Claude").is_empty());
+        assert!(runtime_guard("做一个智能客服聊天机器人").contains("ANTHROPIC_API_KEY"));
     }
 }

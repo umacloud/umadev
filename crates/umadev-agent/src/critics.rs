@@ -1029,6 +1029,39 @@ pub(crate) fn cold_surface() -> Option<ColdJudgeFn> {
     COLD_SURFACE.try_with(std::clone::Clone::clone).ok()
 }
 
+/// Character budget for the document a doc-review seat is judging (the PRD for
+/// the PM seat, the architecture for the architect, the UI/UX spec for the
+/// designer). Sized like the code review bundle, so a document written to the
+/// mandated sections (typically 5-8k characters) is reviewed whole.
+const PRIMARY_DOC_REVIEW_CHARS: usize = 10_000;
+
+/// A section-aware document excerpt for a critic payload that TELLS the seat what
+/// it did not get. The payload is the reviewer's whole review boundary (see the
+/// independence firewall), so a section dropped or cut to fit the budget must be
+/// named there — otherwise the seat reports a budget cut as a missing section and
+/// sends a correct document into rework.
+pub(crate) fn review_doc_excerpt(text: &str, max_chars: usize) -> String {
+    const MAX_LISTED: usize = 24;
+    let (kept, omitted) = crate::experts::excerpt_sections_reporting(text, max_chars);
+    if omitted.is_empty() {
+        return kept;
+    }
+    let mut listed = omitted
+        .iter()
+        .take(MAX_LISTED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if omitted.len() > MAX_LISTED {
+        listed.push_str(&format!("; +{} more", omitted.len() - MAX_LISTED));
+    }
+    format!(
+        "{}\n[review excerpt: these sections were NOT supplied to you (cut to fit the review \
+         budget), so do not report them as missing: {listed}]",
+        kept.trim_end()
+    )
+}
+
 /// Product-manager critic — reviews the docs from the PM seat: does the plan
 /// actually serve the user + requirement, are scope / acceptance criteria
 /// coherent, what's MISSING a user would care about.
@@ -1063,8 +1096,8 @@ impl RoleCritic for PmCritic {
         let user = format!(
             "## Requirement\n{}\n\n## PRD\n{}\n\n## Architecture (context)\n{}",
             crate::experts::excerpt(artifacts.requirement, 1200),
-            crate::experts::excerpt_sections(artifacts.prd, 5000),
-            crate::experts::excerpt_sections(artifacts.architecture, 2000),
+            review_doc_excerpt(artifacts.prd, PRIMARY_DOC_REVIEW_CHARS),
+            review_doc_excerpt(artifacts.architecture, 2000),
         );
         consult.judge(self.role(), system, user).await
     }
@@ -1101,8 +1134,8 @@ impl RoleCritic for ArchitectureCritic {
         let user = format!(
             "## Requirement\n{}\n\n## Architecture\n{}\n\n## PRD (context)\n{}",
             crate::experts::excerpt(artifacts.requirement, 1200),
-            crate::experts::excerpt_sections(artifacts.architecture, 5000),
-            crate::experts::excerpt_sections(artifacts.prd, 2000),
+            review_doc_excerpt(artifacts.architecture, PRIMARY_DOC_REVIEW_CHARS),
+            review_doc_excerpt(artifacts.prd, 2000),
         );
         consult.judge(self.role(), system, user).await
     }
@@ -1304,8 +1337,8 @@ impl RoleCritic for UiuxCritic {
         let user = format!(
             "## Requirement\n{}\n\n## UI/UX spec\n{}\n\n## PRD (context)\n{}{code_block}",
             crate::experts::excerpt(artifacts.requirement, 1200),
-            crate::experts::excerpt_sections(artifacts.uiux, 5000),
-            crate::experts::excerpt_sections(artifacts.prd, 1500),
+            review_doc_excerpt(artifacts.uiux, PRIMARY_DOC_REVIEW_CHARS),
+            review_doc_excerpt(artifacts.prd, 1500),
         );
         consult.judge(self.role(), system, user).await
     }
@@ -1355,8 +1388,8 @@ impl RoleCritic for FrontendCritic {
         let user = format!(
             "## Requirement\n{}\n\n## UI/UX spec (intent)\n{}\n\n## Architecture API contract (context)\n{}\n\n## Delivered frontend code\n{}",
             crate::experts::excerpt(artifacts.requirement, 1000),
-            crate::experts::excerpt_sections(artifacts.uiux, 2000),
-            crate::experts::excerpt_sections(artifacts.architecture, 2000),
+            review_doc_excerpt(artifacts.uiux, 2000),
+            review_doc_excerpt(artifacts.architecture, 2000),
             crate::experts::excerpt(artifacts.code, 14_000),
         );
         consult.judge(self.role(), system, user).await
@@ -1417,7 +1450,7 @@ impl RoleCritic for BackendCritic {
         let user = format!(
             "## Requirement\n{}\n\n## {floor}\n\n## Architecture API contract (context)\n{}\n\n## Delivered backend code\n{}",
             crate::experts::excerpt(artifacts.requirement, 1000),
-            crate::experts::excerpt_sections(artifacts.architecture, 2500),
+            review_doc_excerpt(artifacts.architecture, 2500),
             crate::experts::excerpt(artifacts.code, 14_000),
         );
         consult.judge(self.role(), system, user).await
@@ -2136,6 +2169,85 @@ mod tests {
         assert!(
             !user.contains("DOER_CHAIN_OF_THOUGHT") && !system.contains("DOER_CHAIN_OF_THOUGHT"),
             "the critic never receives the maker's reasoning"
+        );
+    }
+
+    /// An architecture document written to the mandated sections, padded so the
+    /// API table and data model are realistic (`endpoints` rows, three entities).
+    fn architecture_doc(endpoints: usize) -> String {
+        let mut doc = String::from(
+            "# Architecture — demo\n\n## System overview\nA React SPA talks REST to an Axum API.\n\n\
+             ## API surface\n| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n",
+        );
+        for i in 0..endpoints {
+            doc.push_str(&format!(
+                "| GET | /api/items/{i} | - | `{{ id, title, done, owner }}` | bearer | read item {i} with its owner and audit fields |\n"
+            ));
+        }
+        doc.push_str(
+            "\n## API error convention\n`{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`\n\n## Data model\n",
+        );
+        for entity in ["User", "Item", "AuditLog"] {
+            doc.push_str(&format!(
+                "### {entity}\n| Field | Type | Required | Default | Description |\n|---|---|---|---|---|\n"
+            ));
+            for field in ["id", "created_at", "updated_at", "owner_id", "title", "status"] {
+                doc.push_str(&format!(
+                    "| {field} | text | yes | - | the {entity} {field}, indexed for lookups |\n"
+                ));
+            }
+        }
+        doc.push_str(
+            "\n## Authentication & authorization\nJWT bearer tokens (15 min) with refresh cookies; \
+             roles `admin` and `member`; members may only read their own items (AUTH_SECTION_MARKER).\n\n\
+             ## Project structure\n`web/` and `api/`, one module per resource.\n",
+        );
+        doc
+    }
+
+    #[tokio::test]
+    async fn architecture_critic_sees_or_is_told_about_the_auth_section() {
+        // S04-13: a typical 7k-character architecture keeps its auth section in
+        // the architect's review payload — the seat is told to judge auth
+        // conventions, so a silently dropped auth section invents a "missing" gap.
+        let doc = architecture_doc(45);
+        assert!((6_000..9_000).contains(&doc.chars().count()), "{}", doc.len());
+        let rec = RecordingConsult::default();
+        let arts = CriticArtifacts {
+            requirement: "build an item tracker",
+            architecture: &doc,
+            ..Default::default()
+        };
+        let _ = ArchitectureCritic.review(&rec, arts).await;
+        let (_, user) = rec.seen.lock().unwrap().clone();
+        assert!(
+            user.contains("AUTH_SECTION_MARKER"),
+            "the architect reviews the auth section of a typical document"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_document_names_every_section_the_critic_did_not_get() {
+        // S04-13: when a document still exceeds the review budget, the payload is
+        // the whole review boundary — so it must NAME what was left out instead of
+        // letting the seat report a budget cut as a missing section.
+        let doc = architecture_doc(160);
+        let rec = RecordingConsult::default();
+        let arts = CriticArtifacts {
+            requirement: "build an item tracker",
+            architecture: &doc,
+            ..Default::default()
+        };
+        let _ = ArchitectureCritic.review(&rec, arts).await;
+        let (_, user) = rec.seen.lock().unwrap().clone();
+        assert!(
+            user.contains("AUTH_SECTION_MARKER")
+                || (user.contains("NOT supplied") && user.contains("Authentication & authorization")),
+            "an omitted section is declared, never silently dropped: {user}"
+        );
+        assert!(
+            user.contains("Project structure"),
+            "every omitted heading is listed or kept"
         );
     }
 

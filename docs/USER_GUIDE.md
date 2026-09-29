@@ -270,16 +270,33 @@ UmaDev ships 5 design systems. Select one before running to get deterministic vi
 
 ```toml
 [quality]
-threshold = 85              # quality gate pass threshold (default: 90)
-skip_checks = ["dark_mode"] # skip specific checks
+threshold = 95              # raise the scored gate's pass threshold (default: 90)
+skip_checks = ["dark_mode"] # skip specific non-security checks of the scored gate
 
 [pipeline]
-skip_phases = ["research"]  # skip phases you don't need
+skip_phases = ["research"]  # single-shot runner only: skip phases you don't need
 max_review_rounds = 2       # limit auto-fix cycles (default: 3)
 
 [experts]
 custom_knowledge = "team-standards/"  # additional knowledge directory
 ```
+
+`.umadevrc` travels with the repository, so it can make a run stricter but
+never weaker: a lower `threshold` is ignored, and the security checks cannot be
+skipped.
+
+Which settings apply to which path:
+
+- **Default director build** (`/run`, free-text builds, `umadev run`):
+  `max_review_rounds` caps the auto-QC fix rounds (it can lower the default of
+  3, never raise it). The director holds every build to its own deterministic QC
+  floors, which have no score, so `threshold`, `skip_checks` and `skip_phases`
+  do not apply there.
+- **Legacy fixed pipeline** (`UMADEV_LEGACY_PIPELINE=1`) and the **single-shot
+  runner**: `threshold` and `skip_checks` configure the scored quality gate
+  (`output/<slug>-quality-gate.json`).
+- **Single-shot runner only**: `skip_phases`, and `max_review_rounds` as the
+  document review→fix budget.
 
 ### `~/.umadev/config.toml` (user-level)
 
@@ -333,7 +350,7 @@ No. UmaDev drives your already-logged-in AI coding CLI. It uses your existing su
 UmaDev retries once. If it still fails, it falls back to an offline template with TODO markers. You can `/redo` to try again.
 
 **Q: Can I customize the quality checks?**
-Yes, via `.umadevrc`. Set `skip_checks` to disable specific checks, or `threshold` to change the pass score.
+Partly, via `.umadevrc`. On the legacy pipeline and the single-shot runner, `skip_checks` disables specific non-security checks of the scored gate and `threshold` raises its pass score. The default director build has no scored gate; there, `max_review_rounds` limits the auto-QC fix rounds. See [Configuration](#configuration).
 
 **Q: Does it work offline?**
 Offline is a fallback, not the product. Without a base reachable, it generates structured templates with TODO markers — useful for planning, CI smoke tests, or demos, but not a substitute for real development. Real delivery always runs through one of the five bases.
