@@ -110,6 +110,10 @@ const MAX_GROK_NOTES_CHARS: usize = 16 * 1024;
 const MAX_GROK_PLAN_CHARS: usize = 256 * 1024;
 const MAX_KIMI_PLAN_REVIEW_CHARS: usize = 256 * 1024;
 const MAX_TOOL_CALL_ID_CHARS: usize = 512;
+// A permission request names its tool call by id. What each unsettled call does
+// is remembered until it settles; calls a cancelled turn never settles age out,
+// oldest first, beyond this many.
+const MAX_TOOL_CALL_SUBJECTS: usize = 64;
 // Kimi's official adapter carries the final tool output in the terminal
 // `tool_call_update` rather than streaming stdout progress. Keep enough of that
 // result for `/logs` and expanded tool cards; the TUI applies its own folding
@@ -4741,7 +4745,7 @@ async fn dispatch_server_message(
             handle_grok_queue_changed(params, context, replaying).await;
         }
         (method, true) => {
-            dispatch_host_request(frame, method, params, context, replaying).await;
+            dispatch_host_request(frame, method, params, context, tools, replaying).await;
         }
         _ => {}
     }
@@ -4752,6 +4756,7 @@ async fn dispatch_host_request(
     method: &str,
     params: &Value,
     context: &ReaderContext,
+    tools: &ToolState,
     replaying: bool,
 ) {
     match method {
@@ -4776,6 +4781,7 @@ async fn dispatch_host_request(
                 frame,
                 params,
                 context,
+                tools,
                 reader_grok_supports(context, GrokSourceCapability::PermissionRequests),
             )
             .await;
@@ -5553,6 +5559,7 @@ async fn handle_permission_request(
     frame: &Value,
     params: &Value,
     context: &ReaderContext,
+    tools: &ToolState,
     upstream_permission_boundary: bool,
 ) {
     let raw_id = frame.get("id").cloned().unwrap_or(Value::Null);
@@ -5614,16 +5621,15 @@ async fn handle_permission_request(
             drop(map);
             remember_interaction_owner(&context.interaction_sessions, &req_id, params).await;
             let tool = params.get("toolCall").unwrap_or(&Value::Null);
-            // The approval subject comes from the raw input: the trust policy
-            // must classify exactly what the agent will run.
-            let input = tool.get("rawInput").unwrap_or(tool);
+            // The trust policy must classify exactly what the agent will run.
+            let (action, target) = approval_subject(tool, tools);
             emit_event(
                 &context.event_tx,
                 SessionEvent::HostRequest {
                     req_id,
                     request: HostRequest::Approval {
-                        action: tool_name(tool),
-                        target: approval_target(tool, input),
+                        action,
+                        target,
                         message: tool
                             .get("title")
                             .and_then(Value::as_str)
@@ -6162,9 +6168,28 @@ struct ToolState {
     /// placeholder followed by arguments mislabelled as command output.
     provisional: HashSet<String>,
     settled: HashSet<String>,
+    /// What each unsettled call does, by call id, with the ids oldest first.
+    /// A permission request's `toolCall` names a call the agent announced
+    /// before, and Kimi's carries no `kind` and no arguments: what the call
+    /// will run exists only on the frames that announced it.
+    subjects: HashMap<String, ToolCallSubject>,
+    subject_order: VecDeque<String>,
     seen_grok_event_ids: HashSet<String>,
     grok_event_order: VecDeque<String>,
     bash_streams: HashMap<String, GrokBashStream>,
+}
+
+/// What one announced tool call will do.
+#[derive(Debug, Default)]
+struct ToolCallSubject {
+    /// The vendor's ACP `kind`.
+    kind: Option<String>,
+    /// The parsed arguments (`rawInput`).
+    raw_input: Option<Value>,
+    /// The argument JSON streamed into a provisional card so far. Kimi asks
+    /// for permission before the started upgrade that carries `rawInput`, so
+    /// this text is all it has sent about the call when it asks.
+    streamed_arguments: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -6201,6 +6226,49 @@ enum GrokBashUpdate {
 }
 
 impl ToolState {
+    /// Remember what an announced call does. A later frame replaces what it
+    /// carries and keeps what it omits; parsed arguments supersede the
+    /// streamed text. `streaming` says the frame's content is the argument
+    /// JSON streamed so far, not output.
+    fn remember_subject(&mut self, id: &str, update: &Value, streaming: bool) {
+        let kind = update.get("kind").and_then(Value::as_str);
+        let raw_input = update.get("rawInput").or_else(|| update.get("raw_input"));
+        let streamed_arguments = if streaming {
+            streamed_argument_text(update)
+        } else {
+            None
+        };
+        if id.is_empty() || (kind.is_none() && raw_input.is_none() && streamed_arguments.is_none())
+        {
+            return;
+        }
+        if !self.subjects.contains_key(id) {
+            while self.subject_order.len() >= MAX_TOOL_CALL_SUBJECTS {
+                let Some(oldest) = self.subject_order.pop_front() else {
+                    break;
+                };
+                self.subjects.remove(&oldest);
+            }
+            self.subject_order.push_back(id.to_string());
+        }
+        let subject = self.subjects.entry(id.to_string()).or_default();
+        if let Some(kind) = kind {
+            subject.kind = Some(kind.to_string());
+        }
+        if let Some(raw_input) = raw_input {
+            subject.raw_input = Some(raw_input.clone());
+            subject.streamed_arguments = None;
+        } else if let Some(streamed_arguments) = streamed_arguments {
+            subject.streamed_arguments = Some(streamed_arguments.to_string());
+        }
+    }
+
+    fn forget_subject(&mut self, id: &str) {
+        if self.subjects.remove(id).is_some() {
+            self.subject_order.retain(|remembered| remembered != id);
+        }
+    }
+
     fn remember_grok_event(&mut self, event_id: &str) -> bool {
         if event_id.is_empty() || self.seen_grok_event_ids.contains(event_id) {
             return false;
@@ -7079,6 +7147,7 @@ fn parse_tool_call(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent> {
             .get("rawInput")
             .or_else(|| update.get("raw_input"))
             .is_none();
+    tools.remember_subject(&id, update, provisional);
     if provisional {
         bounded_insert(&mut tools.provisional, id);
         return Vec::new();
@@ -7111,6 +7180,9 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
         .is_some();
     let was_provisional = !id.is_empty() && tools.provisional.contains(&id);
     let was_known = !id.is_empty() && tools.known.contains(&id);
+    if !matches!(status, "completed" | "failed") {
+        tools.remember_subject(&id, update, was_provisional && !has_raw_input);
+    }
     if was_provisional && !has_raw_input && !matches!(status, "completed" | "failed") {
         // Cumulative streamed arguments replace the provisional card's content.
         // They are neither process output nor an authoritative executable input.
@@ -7167,6 +7239,7 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
         "completed" | "failed" if id.is_empty() || !tools.settled.contains(&id) => {
             if !id.is_empty() {
                 bounded_insert(&mut tools.settled, id.clone());
+                tools.forget_subject(&id);
                 if let Some(mut stream) = tools.bash_streams.remove(&id) {
                     append_grok_bash_tail(
                         &mut bash_update,
@@ -7398,6 +7471,98 @@ fn approval_target(tool: &Value, input: &Value) -> String {
     first_target(input, preferred)
         .or_else(|| first_target(input, &TOOL_TARGET_KEYS))
         .unwrap_or_default()
+}
+
+/// The action and target of a permission request, judged by what the call it
+/// names will do.
+///
+/// ACP sends the request's `toolCall` as an update of a call the agent already
+/// announced, so a field it omits keeps its announced value. Kimi's carries
+/// only the call id, the tool name as `title` and a prose summary, and Kimi
+/// asks before the started upgrade that carries `rawInput`: the command or
+/// path exists only as the argument JSON it streamed into the call's card.
+/// The input is therefore the request's own `rawInput`, else the announced
+/// one, else the streamed arguments, else the path of a `diff` card. The bare
+/// title is never the target: `Bash` is no command and `Write` no path.
+/// Without any input the target is the request's summary, except for a shell
+/// command: the summary cuts a long command short, so the target stays empty
+/// and the trust floor escalates a command it cannot see.
+fn approval_subject(tool: &Value, tools: &ToolState) -> (String, String) {
+    let remembered = tools.subjects.get(&bounded_tool_call_id(tool));
+    let mut vendor = serde_json::Map::new();
+    for key in ["name", "toolName", "title"] {
+        if let Some(value) = tool.get(key) {
+            vendor.insert(key.to_string(), value.clone());
+        }
+    }
+    let kind = tool
+        .get("kind")
+        .and_then(Value::as_str)
+        .or_else(|| remembered.and_then(|subject| subject.kind.as_deref()));
+    if let Some(kind) = kind {
+        vendor.insert("kind".to_string(), Value::from(kind));
+    }
+    let vendor = Value::Object(vendor);
+    let streamed = remembered
+        .and_then(|subject| subject.streamed_arguments.as_deref())
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .filter(Value::is_object);
+    let diff = diff_path_input(tool);
+    let input = tool
+        .get("rawInput")
+        .or_else(|| tool.get("raw_input"))
+        .or_else(|| remembered.and_then(|subject| subject.raw_input.as_ref()))
+        .or(streamed.as_ref())
+        .or(diff.as_ref());
+    let action = tool_name(&vendor);
+    let target = input
+        .map(|input| approval_target(&vendor, input))
+        .filter(|target| !target.trim().is_empty())
+        .unwrap_or_else(|| {
+            if action.eq_ignore_ascii_case("bash") {
+                String::new()
+            } else {
+                tool_content_text(tool)
+            }
+        });
+    (action, target)
+}
+
+/// The argument JSON a provisional card shows: its first text entry.
+fn streamed_argument_text(update: &Value) -> Option<&str> {
+    update
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find_map(|item| item.pointer("/content/text").and_then(Value::as_str))
+}
+
+/// `{"file_path": …}` from the `content[type=diff]` card of a tool payload.
+fn diff_path_input(tool: &Value) -> Option<Value> {
+    tool.get("content")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("diff"))?
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| json!({"file_path": path}))
+}
+
+/// The text entries of a tool payload's `content`, one per line.
+fn tool_content_text(tool: &Value) -> String {
+    tool.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.pointer("/content/text")
+                .or_else(|| item.get("text"))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn grok_bash_raw_output(update: &Value) -> Option<&Value> {
@@ -9382,6 +9547,9 @@ mod folder_trust_tests;
 
 #[cfg(test)]
 mod background_control_tests;
+
+#[cfg(test)]
+mod kimi_wire_tests;
 
 #[cfg(test)]
 mod tests {
@@ -15255,7 +15423,7 @@ mod tests {
         })
     }
 
-    fn kimi_fixture_config_options(model: &str, mode: &str) -> Value {
+    pub(super) fn kimi_fixture_config_options(model: &str, mode: &str) -> Value {
         kimi_fixture_config_options_with_thinking(model, mode, "on")
     }
 
