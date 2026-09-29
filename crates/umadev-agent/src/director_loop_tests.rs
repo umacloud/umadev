@@ -9936,11 +9936,13 @@ async fn resolve_host_request_does_not_auto_allow_an_upstream_boundary() {
         (ApprovalDecision::Allow, Some("allow-once".to_string()))
     );
 
-    // A live user decides the boundary even though Auto would allow the action.
-    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // A live user decides the boundary even though Auto would allow the action,
+    // and the host learns that only the user's answer may settle it: the TUI
+    // must not release it when the user switches the tier to Auto.
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
     let probe = Arc::clone(&asked);
-    let approve: crate::interaction::ApprovalFn = Arc::new(move |_action, _target| {
-        probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let approve: crate::interaction::ApprovalFn = Arc::new(move |request| {
+        probe.lock().unwrap().push(request);
         Box::pin(async { true }) as crate::interaction::ApprovalFuture
     });
     let interaction = || RunInteraction {
@@ -9958,7 +9960,14 @@ async fn resolve_host_request_does_not_auto_allow_an_upstream_boundary() {
         decided(hosted),
         (ApprovalDecision::Allow, Some("allow-once".to_string()))
     );
-    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        *asked.lock().unwrap(),
+        [crate::interaction::ApprovalRequest {
+            action: "Bash".to_string(),
+            target: "npm test".to_string(),
+            requires_user_answer: true,
+        }]
+    );
 
     // That approval is not remembered: the next boundary request asks again.
     let again = crate::interaction::hosted(
@@ -9967,5 +9976,5 @@ async fn resolve_host_request_does_not_auto_allow_an_upstream_boundary() {
     )
     .await;
     assert_eq!(decided(again).0, ApprovalDecision::Allow);
-    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(asked.lock().unwrap().len(), 2);
 }

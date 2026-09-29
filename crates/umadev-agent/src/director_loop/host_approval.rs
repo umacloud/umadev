@@ -14,9 +14,10 @@ use crate::runner::RunOptions;
 /// though UmaDev asked it for Auto: the base's own policy (a user or managed
 /// ask rule) still demands a confirmation. Neither the project trust ledger nor
 /// the Auto release can answer that, so the live user decides, and without one
-/// the request is denied, as in the chat lane. Nothing is remembered either
-/// way, since the base asks again next time. Every other approval goes through
-/// the ordinary [`resolve_approval`].
+/// the request is denied, as in the chat lane. The host is told that only the
+/// user's answer settles it, so switching to Auto cannot release it either.
+/// Nothing is remembered either way, since the base asks again next time.
+/// Every other approval goes through the ordinary [`resolve_approval`].
 pub(super) async fn resolve(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
@@ -42,7 +43,7 @@ pub(super) async fn resolve(
         return resolve_approval(options, events, action, target).await;
     }
     let (decision, headless, note) =
-        match crate::interaction::request_approval(action, target).await {
+        match crate::interaction::request_user_answer(action, target).await {
             Some(true) => (ApprovalDecision::Allow, false, "trust.pause.allowed"),
             Some(false) => (ApprovalDecision::Deny, false, "trust.pause.denied"),
             None => (

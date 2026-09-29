@@ -1073,6 +1073,25 @@ pub(super) async fn await_user_approval(
     await_user_approval_with_auto_release(holder, sink, action, target, true, "").await
 }
 
+/// The approval pause behind the `/run` lane's approval callback. A request only
+/// the user's answer may settle (an upstream permission boundary) is never
+/// released by a switch to Auto, exactly like the chat lane's.
+pub(super) async fn await_run_approval(
+    holder: &ApprovalHolder,
+    sink: &Arc<ChannelSink>,
+    request: &umadev_agent::ApprovalRequest,
+) -> ApprovalReply {
+    await_user_approval_with_auto_release(
+        holder,
+        sink,
+        &request.action,
+        &request.target,
+        !request.requires_user_answer,
+        "",
+    )
+    .await
+}
+
 /// The `HostRequest::Approval` variant: carries the base `req_id` so a later
 /// `HostRequestSettled` can retract exactly this approval bar.
 pub(super) async fn await_user_approval_for_request(

@@ -43,10 +43,24 @@ pub type SteerIntake = Arc<Mutex<Vec<String>>>;
 /// APPROVED the action, `false` on deny / timeout / cancel (fail-open deny).
 pub type ApprovalFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 
-/// The interactive approval callback: `(action, target) -> approved?`. The TUI
+/// One approval a run asks its hosting UI to settle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    /// What the base wants to do (e.g. `Bash`).
+    pub action: String,
+    /// What it acts on (e.g. the command or the file path).
+    pub target: String,
+    /// Only the user's explicit answer may settle this approval: the host must
+    /// not resolve it on its own, for example by releasing it when the user
+    /// switches the trust tier to Auto. Set when the base's own permission
+    /// policy still asks although UmaDev requested Auto from it.
+    pub requires_user_answer: bool,
+}
+
+/// The interactive approval callback: `request -> approved?`. The TUI
 /// implements it over its existing `await_user_approval` pause (surface the item,
 /// block on y/n, bounded budget, fail-open deny).
-pub type ApprovalFn = Arc<dyn Fn(String, String) -> ApprovalFuture + Send + Sync>;
+pub type ApprovalFn = Arc<dyn Fn(ApprovalRequest) -> ApprovalFuture + Send + Sync>;
 
 /// Future returned by a hosting UI for a typed in-flight base request.
 pub type HostRequestFuture =
@@ -675,11 +689,28 @@ pub(crate) fn take_steer() -> Vec<String> {
 /// `None` when the run is headless (no scope / no callback) — the caller then
 /// applies today's deterministic floor decision. `Some(approved)` otherwise.
 pub(crate) async fn request_approval(action: &str, target: &str) -> Option<bool> {
+    ask_host_approval(action, target, false).await
+}
+
+/// Like [`request_approval`], for an approval only the user's explicit answer
+/// may settle ([`ApprovalRequest::requires_user_answer`]).
+pub(crate) async fn request_user_answer(action: &str, target: &str) -> Option<bool> {
+    ask_host_approval(action, target, true).await
+}
+
+async fn ask_host_approval(action: &str, target: &str, requires_user_answer: bool) -> Option<bool> {
     let cb = RUN_INTERACTION
         .try_with(|i| i.approval.clone())
         .ok()
         .flatten()?;
-    Some(cb(action.to_string(), target.to_string()).await)
+    Some(
+        cb(ApprovalRequest {
+            action: action.to_string(),
+            target: target.to_string(),
+            requires_user_answer,
+        })
+        .await,
+    )
 }
 
 /// Ask the hosting UI to answer a typed in-flight request. `None` means no
@@ -862,7 +893,12 @@ mod tests {
     #[tokio::test]
     async fn scoped_task_reads_the_hosted_hooks() {
         let steer: SteerIntake = Arc::new(Mutex::new(vec!["skip step 2".to_string()]));
-        let approval: ApprovalFn = Arc::new(|_a, _t| Box::pin(async { true }) as ApprovalFuture);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let probe = Arc::clone(&asked);
+        let approval: ApprovalFn = Arc::new(move |request| {
+            probe.lock().unwrap().push(request);
+            Box::pin(async { true }) as ApprovalFuture
+        });
         let interaction = RunInteraction {
             steer: Some(Arc::clone(&steer)),
             approval: Some(approval),
@@ -876,8 +912,19 @@ mod tests {
             assert!(take_steer().is_empty());
             // The approval callback is consulted and its verdict returned.
             assert_eq!(request_approval("write", "src/x.rs").await, Some(true));
+            assert_eq!(request_user_answer("bash", "npm test").await, Some(true));
         })
         .await;
+        // Only the second request tells the host that no tier change may
+        // settle it.
+        let asked = asked.lock().unwrap();
+        assert_eq!(
+            asked
+                .iter()
+                .map(|request| (request.action.as_str(), request.requires_user_answer))
+                .collect::<Vec<_>>(),
+            [("write", false), ("bash", true)]
+        );
         // Outside the scope the task-local is gone again (fail-open headless).
         assert!(!gates_hosted());
     }
@@ -886,7 +933,7 @@ mod tests {
     fn debug_impl_never_dumps_the_callback() {
         let i = RunInteraction {
             steer: Some(Arc::new(Mutex::new(Vec::new()))),
-            approval: Some(Arc::new(|_a, _t| {
+            approval: Some(Arc::new(|_request| {
                 Box::pin(async { false }) as ApprovalFuture
             })),
             host_request: None,

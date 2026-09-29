@@ -1026,7 +1026,7 @@ async fn resolve_approval_headless_keeps_the_floor_and_hosted_asks_the_user() {
 
     // Hosted + user APPROVES → Allow, interactive.
     let approve: crate::interaction::ApprovalFn =
-        Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
+        Arc::new(|_request| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
     let hosted_allow = crate::interaction::hosted(
         crate::interaction::RunInteraction {
             steer: None,
@@ -1049,7 +1049,7 @@ async fn resolve_approval_headless_keeps_the_floor_and_hosted_asks_the_user() {
 
     // Hosted + user DENIES an (unremembered) escalation → Deny, interactive.
     let deny: crate::interaction::ApprovalFn =
-        Arc::new(|_a, _t| Box::pin(async { false }) as crate::interaction::ApprovalFuture);
+        Arc::new(|_request| Box::pin(async { false }) as crate::interaction::ApprovalFuture);
     let hosted_deny = crate::interaction::hosted(
         crate::interaction::RunInteraction {
             steer: None,
@@ -1077,7 +1077,7 @@ async fn resolve_approval_auto_frees_installs_but_still_asks_on_disasters() {
 
     let consulted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let consulted_probe = Arc::clone(&consulted);
-    let never: crate::interaction::ApprovalFn = Arc::new(move |_a, _t| {
+    let never: crate::interaction::ApprovalFn = Arc::new(move |_request| {
         consulted_probe.store(true, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async { false }) as crate::interaction::ApprovalFuture
     });
@@ -1103,7 +1103,7 @@ async fn resolve_approval_auto_frees_installs_but_still_asks_on_disasters() {
     // A destructive disaster still surfaces the interactive prompt in Auto,
     // and the user's verdict decides.
     let approve: crate::interaction::ApprovalFn =
-        Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
+        Arc::new(|_request| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
     let asked = crate::interaction::hosted(
         crate::interaction::RunInteraction {
             steer: None,

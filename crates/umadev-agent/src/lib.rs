@@ -179,8 +179,8 @@ pub use init_assets::{scaffold_init_knowledge, KnowledgeScaffoldReport};
 pub use interaction::{
     classify_running_input, hosted as hosted_interaction, is_explicit_clarification_answer,
     is_explicit_later_work, is_run_resume_intent, is_running_cancel_intent, ApprovalFn,
-    ApprovalFuture, HostRequestFn, HostRequestFuture, RunInteraction, RunningInputDisposition,
-    SteerIntake,
+    ApprovalFuture, ApprovalRequest, HostRequestFn, HostRequestFuture, RunInteraction,
+    RunningInputDisposition, SteerIntake,
 };
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
