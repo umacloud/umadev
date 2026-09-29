@@ -323,7 +323,10 @@ impl ClaudeCodeDriver {
     ///   development posture. `--allowedTools` only pre-approves named tools
     ///   without a prompt; it is not a deny-list or a second sandbox.
     /// - `--dangerously-skip-permissions`: Auto only. It is never emitted by
-    ///   Plan/Guarded and is removed when `UMADEV_NO_SKIP_PERMS=1`.
+    ///   Plan/Guarded and is removed when `UMADEV_NO_SKIP_PERMS=1`. Claude
+    ///   refuses it as root outside a declared sandbox (`IS_SANDBOX=1` or
+    ///   `CLAUDE_CODE_BUBBLEWRAP=1`), so there Auto runs `acceptEdits` with the
+    ///   same tools instead of a flag that would end the call.
     /// - `--output-format text`: explicit text output — no JSON envelope
     ///   so the existing `clean_output` pipeline gets plain markdown.
     ///
@@ -350,16 +353,34 @@ impl ClaudeCodeDriver {
         self.base_args_with_format_for(
             output_format,
             std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1"),
+            claude_refuses_bypass(
+                running_as_root(),
+                std::env::var("IS_SANDBOX").ok().as_deref(),
+                std::env::var("CLAUDE_CODE_BUBBLEWRAP").ok().as_deref(),
+            ),
         )
     }
 
-    fn base_args_with_format_for(&self, output_format: &str, no_skip: bool) -> Vec<String> {
+    fn base_args_with_format_for(
+        &self,
+        output_format: &str,
+        no_skip: bool,
+        bypass_refused: bool,
+    ) -> Vec<String> {
         // The environment switch is a one-way safety latch. It never upgrades a
         // less-trusted profile and is sampled when the subprocess args are built.
         let permissions = if self.permissions.auto_approve() && no_skip {
             BasePermissionProfile::Guarded
         } else {
             self.permissions
+        };
+        // A one-shot call sends its prompt as plain text, so Claude has no
+        // channel to ask UmaDev and Auto keeps its full working set here. It
+        // runs `bypassPermissions` unless Claude would refuse that and exit.
+        let auto_mode = if bypass_refused {
+            "acceptEdits"
+        } else {
+            "bypassPermissions"
         };
         let (permission_mode, allowed_tools) = match permissions {
             // Plan and Guarded pre-approve no web tool: they confirm every network
@@ -371,7 +392,7 @@ impl ClaudeCodeDriver {
                 "Read,Grep,Glob,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
             ),
             BasePermissionProfile::Auto => (
-                "bypassPermissions",
+                auto_mode,
                 "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookEdit,Agent,Task,TaskOutput,BashOutput,AgentOutput",
             ),
         };
@@ -387,10 +408,35 @@ impl ClaudeCodeDriver {
             // exactly one value.
             format!("--allowedTools={allowed_tools}"),
         ];
-        if permissions.auto_approve() {
+        if permissions.auto_approve() && !bypass_refused {
             args.push("--dangerously-skip-permissions".to_string());
         }
         args
+    }
+}
+
+/// Claude refuses `bypassPermissions` and `--dangerously-skip-permissions` when
+/// it runs as root outside a declared sandbox (`IS_SANDBOX=1` or
+/// `CLAUDE_CODE_BUBBLEWRAP=1`): it prints the reason and exits before doing
+/// anything. Docker, dev containers and cloud VMs often run as root.
+fn claude_refuses_bypass(
+    is_root: bool,
+    is_sandbox: Option<&str>,
+    bubblewrap: Option<&str>,
+) -> bool {
+    is_root && is_sandbox != Some("1") && bubblewrap != Some("1")
+}
+
+/// Whether UmaDev (and so the `claude` it spawns) runs with user id 0.
+/// Claude applies its root check on every platform but Windows.
+fn running_as_root() -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::getuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -1519,7 +1565,7 @@ mod tests {
         for (profile, expected_mode, expected_bypass) in cases {
             let args = ClaudeCodeDriver::default()
                 .with_permissions(profile)
-                .base_args_with_format_for("text", false);
+                .base_args_with_format_for("text", false, false);
             let mode = args
                 .windows(2)
                 .find(|w| w[0] == "--permission-mode")
@@ -1534,7 +1580,7 @@ mod tests {
 
         let tightened = ClaudeCodeDriver::default()
             .with_permissions(BasePermissionProfile::Auto)
-            .base_args_with_format_for("text", true);
+            .base_args_with_format_for("text", true, false);
         assert!(tightened
             .windows(2)
             .any(|w| { w[0] == "--permission-mode" && w[1] == "default" }));
@@ -1544,13 +1590,57 @@ mod tests {
 
         let plan = ClaudeCodeDriver::default()
             .with_permissions(BasePermissionProfile::Plan)
-            .base_args_with_format_for("text", false);
+            .base_args_with_format_for("text", false, false);
         let allowed = plan
             .iter()
             .find_map(|a| a.strip_prefix("--allowedTools="))
             .unwrap_or_default();
         for mutating in ["Write", "Edit", "Bash", "NotebookEdit", "Agent", "Task"] {
             assert!(!allowed.split(',').any(|tool| tool == mutating));
+        }
+    }
+
+    #[test]
+    fn auto_profile_avoids_bypass_as_unsandboxed_root() {
+        // As root outside a declared sandbox, Claude exits at once when handed
+        // `bypassPermissions` or `--dangerously-skip-permissions`.
+        assert!(claude_refuses_bypass(true, None, None));
+        assert!(claude_refuses_bypass(true, Some("0"), Some("")));
+        assert!(!claude_refuses_bypass(true, Some("1"), None));
+        assert!(!claude_refuses_bypass(true, None, Some("1")));
+        assert!(!claude_refuses_bypass(false, None, None));
+
+        let args = ClaudeCodeDriver::default()
+            .with_permissions(BasePermissionProfile::Auto)
+            .base_args_with_format_for("text", false, true);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(!args.iter().any(|a| a == "bypassPermissions"));
+        let allowed = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--allowedTools="))
+            .unwrap_or_default();
+        for tool in ["Edit", "Write", "Bash"] {
+            assert!(
+                allowed.split(',').any(|t| t == tool),
+                "Auto keeps its working set: {tool}"
+            );
+        }
+        // Plan and Guarded never used the bypass and are unchanged.
+        for (profile, mode) in [
+            (BasePermissionProfile::Plan, "plan"),
+            (BasePermissionProfile::Guarded, "default"),
+        ] {
+            let args = ClaudeCodeDriver::default()
+                .with_permissions(profile)
+                .base_args_with_format_for("text", false, true);
+            assert!(args
+                .windows(2)
+                .any(|w| w[0] == "--permission-mode" && w[1] == mode));
         }
     }
 

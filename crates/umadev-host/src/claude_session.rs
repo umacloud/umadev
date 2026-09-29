@@ -658,8 +658,15 @@ impl ClaudeSession {
         // a fresh session (+ transcript replay) instead of surfacing the confusing pipe error
         // and re-resuming a corpse every subsequent turn.
         if let Some(status) = self.try_exit_status() {
+            // The base is gone, so its stderr is complete: finish reading it and
+            // name the reason it gave (a refused flag, a bad model, a lost login).
+            self.stderr_drain.shutdown().await;
+            let reason = self
+                .stderr
+                .snapshot()
+                .map_or_else(String::new, |tail| format!("; base stderr: {tail}"));
             return Err(SessionError::Send(format!(
-                "base session ended before send (base exited: {status})"
+                "base session ended before send (base exited: {status}){reason}"
             )));
         }
         self.stdin
@@ -6482,6 +6489,44 @@ cat >/dev/null
         assert!(
             tail.contains("gpt-bogus is not available"),
             "the captured tail must carry the base's idle reason: {tail}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_after_early_exit_reports_stderr_reason() {
+        // Claude refusing a flag at startup (e.g. the bypass flag as root) prints
+        // its reason on stderr and exits before the first turn is sent.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\necho 'fatal: X cannot be used here' 1>&2\nexit 1\n",
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-early-exit",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while session.try_exit_status().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let error = session
+            .send_turn("hello".to_string())
+            .await
+            .expect_err("the base already exited");
+        let SessionError::Send(message) = error else {
+            panic!("expected a send error, got {error:?}");
+        };
+        assert!(
+            message.contains("ended before send")
+                && message.contains("fatal: X cannot be used here"),
+            "the base's own reason must reach the user: {message}"
         );
     }
 
