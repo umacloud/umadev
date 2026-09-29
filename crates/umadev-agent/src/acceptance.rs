@@ -133,9 +133,34 @@ fn collect(
                     }
                 }
             }
-            EntryKind::Skip => scan.incomplete = true,
+            EntryKind::Skip => {
+                if skipped_entry_may_hide_source(&p) {
+                    scan.incomplete = true;
+                }
+            }
         }
     }
+}
+
+/// Whether an entry the no-follow walk had to skip (a symlink, a special file, an
+/// unreadable entry) could have held source the walk would otherwise collect: a
+/// source-named file, or a directory the walk would have descended into. A skipped
+/// dot-entry, or a link such as `CLAUDE.md -> AGENTS.md`, hides no source, so it must
+/// not make the scan incomplete. The target is only stat-ed (never read or entered).
+fn skipped_entry_may_hide_source(p: &Path) -> bool {
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.starts_with('.') {
+        return false;
+    }
+    if p.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| SRC_EXT.contains(&ext))
+    {
+        return true;
+    }
+    std::fs::metadata(p).is_ok_and(|m| m.is_dir())
+        && !SKIP_DIRS.contains(&name)
+        && !is_python_venv(p)
 }
 
 /// Whether a candidate source file carries REAL, substantive content — not an empty
@@ -355,9 +380,36 @@ fn static_prefix(path: &str) -> &str {
     &path[..cut]
 }
 
+/// The outcome of the planned-endpoint check ([`endpoint_acceptance`]). A check
+/// that could not run is its own outcome, never a missing endpoint: the base cannot
+/// repair it, so the director surfaces it as a note instead of a blocking gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointAcceptance {
+    /// The check ran: the planned endpoints with no implementation evidence (empty
+    /// when every one was found, or when nothing was planned).
+    Checked(Vec<String>),
+    /// The check could not run to completion; the reason, in the user's language.
+    Unavailable(String),
+}
+
+/// [`endpoint_acceptance`] as one list of lines, for callers that fold every
+/// finding together: an unavailable check reads as one `acceptance unavailable: …`
+/// line.
+#[must_use]
+pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
+    match endpoint_acceptance(project_root, slug) {
+        EndpointAcceptance::Checked(gaps) => gaps,
+        EndpointAcceptance::Unavailable(reason) => {
+            vec![format!("acceptance unavailable: {reason}")]
+        }
+    }
+}
+
 /// Planned endpoints (from the architecture API table) with no implementation
-/// evidence in the workspace. Empty when there's no architecture doc / no
-/// endpoints (fail-open — never a false alarm).
+/// evidence in the workspace. `Checked(empty)` when there's no architecture doc /
+/// no endpoints (fail-open — never a false alarm); `Unavailable` when the doc or
+/// the source tree could not be read completely (a file over the size cap, more
+/// source than the scan budget, an unreadable file, a symlinked source path).
 ///
 /// ## What counts as "implemented"
 /// The check matches each planned endpoint against the project's real **backend
@@ -380,24 +432,28 @@ fn static_prefix(path: &str) -> &str {
 /// mount/global/controller prefix the regex can't reconstruct is tolerated by a
 /// right-aligned tail match (see `umadev_contract::route_registered`).
 #[must_use]
-pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
+pub fn endpoint_acceptance(project_root: &Path, slug: &str) -> EndpointAcceptance {
     let arch_path = project_root.join(format!("output/{slug}-architecture.md"));
     let arch = match crate::bounded_fs::read_utf8_beneath(project_root, &arch_path, 4 * 1024 * 1024)
     {
         Ok(arch) => arch,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return EndpointAcceptance::Checked(Vec::new())
+        }
         Err(error) => {
-            return vec![format!(
-                "acceptance unavailable: output/{slug}-architecture.md could not be read completely ({error})"
-            )];
+            let doc = format!("output/{slug}-architecture.md");
+            return EndpointAcceptance::Unavailable(umadev_i18n::tlf(
+                "qc.floor_input_unreadable",
+                &[&doc, &error.to_string()],
+            ));
         }
     };
     if arch.trim().is_empty() {
-        return Vec::new();
+        return EndpointAcceptance::Checked(Vec::new());
     }
     let spec = umadev_contract::parse_architecture(&arch, slug);
     if spec.is_empty() {
-        return Vec::new();
+        return EndpointAcceptance::Checked(Vec::new());
     }
 
     let source_scan = source_scan(project_root);
@@ -420,16 +476,21 @@ pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
         ));
     }
     if source_unavailable {
-        return vec![
-            "acceptance unavailable: source route scan exceeded its no-follow file/aggregate/entry budget"
-                .to_string(),
-        ];
+        return EndpointAcceptance::Unavailable(umadev_i18n::tlf(
+            "qc.acceptance_scan_incomplete",
+            &[
+                &MAX_SOURCE_FILES.to_string(),
+                &(MAX_SOURCE_SCAN_BYTES / (1024 * 1024)).to_string(),
+                &(MAX_SOURCE_FILE_BYTES / (1024 * 1024)).to_string(),
+                &MAX_SOURCE_DEPTH.to_string(),
+            ],
+        ));
     }
     if backend_routes.is_empty() {
         // Fail-open: no recognised backend registration exists anywhere. Preserve
         // the legacy surface behavior so a pure-frontend project — or a backend
         // in a framework we cannot parse — is NOT falsely failed.
-        return legacy_surface_gaps(project_root, &spec);
+        return EndpointAcceptance::Checked(legacy_surface_gaps(project_root, &spec));
     }
 
     // The project HAS a backend we can read: every planned endpoint must have a
@@ -451,7 +512,7 @@ pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
             ));
         }
     }
-    gaps
+    EndpointAcceptance::Checked(gaps)
 }
 
 /// Legacy substring-over-source coverage check, retained as the fail-open
@@ -877,5 +938,104 @@ mod tests {
         let gaps = task_acceptance_gaps(tmp.path(), "demo");
         assert_eq!(gaps.len(), 1);
         assert!(gaps[0].contains("acceptance unavailable"));
+    }
+
+    /// Plans `GET /api/items` (implemented below) and `GET /api/orders` (never
+    /// implemented), with a real backend registering only the first.
+    fn items_backend(root: &Path) {
+        fs::create_dir_all(root.join("output")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("output/demo-architecture.md"),
+            "# API\n\n\
+             | Method | Path | Description | Auth |\n\
+             |---|---|---|---|\n\
+             | GET | /api/items | list items | none |\n\
+             | GET | /api/orders | list orders | none |\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/server.js"),
+            "app.get('/api/items', listItems);\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_agents_md_does_not_make_endpoint_acceptance_unavailable() {
+        use std::os::unix::fs::symlink;
+        // A root `CLAUDE.md -> AGENTS.md` link, or a dot-file link such as
+        // `.env -> .env.local`, hides no source. The scan stays complete, so the
+        // implemented endpoint passes and the genuinely missing one is still a gap
+        // (it used to read "acceptance unavailable", which blocked every run).
+        let tmp = TempDir::new().unwrap();
+        items_backend(tmp.path());
+        fs::write(tmp.path().join("AGENTS.md"), "# Agents\n").unwrap();
+        symlink("AGENTS.md", tmp.path().join("CLAUDE.md")).unwrap();
+        fs::write(tmp.path().join(".env.local"), "PORT=3000\n").unwrap();
+        symlink(".env.local", tmp.path().join(".env")).unwrap();
+
+        assert!(!source_scan(tmp.path()).incomplete);
+        let gaps = task_acceptance_gaps(tmp.path(), "demo");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert!(gaps[0].contains("/api/orders"), "{gaps:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_source_file_leaves_endpoint_acceptance_unavailable() {
+        use std::os::unix::fs::symlink;
+        // A link named like source may point at the very registration the check
+        // looks for, which the no-follow walk must not read: the check honestly
+        // reports itself unavailable instead of calling the endpoint missing.
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            outside.path().join("orders.js"),
+            "app.get('/api/orders', listOrders);\n",
+        )
+        .unwrap();
+        let tmp = TempDir::new().unwrap();
+        items_backend(tmp.path());
+        symlink(
+            outside.path().join("orders.js"),
+            tmp.path().join("src/orders.js"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            endpoint_acceptance(tmp.path(), "demo"),
+            EndpointAcceptance::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn more_source_than_the_scan_budget_leaves_endpoint_acceptance_unavailable() {
+        // Past the file cap the walk cannot see every registration, so "missing"
+        // cannot be concluded; the outcome is typed so the director can report it
+        // as a note rather than an endpoint the base is asked to implement.
+        let tmp = TempDir::new().unwrap();
+        items_backend(tmp.path());
+        for i in 0..MAX_SOURCE_FILES {
+            fs::write(
+                tmp.path().join(format!("src/m{i}.js")),
+                format!("export const v{i} = {i};\n"),
+            )
+            .unwrap();
+        }
+        // The reason names the limits, in the user's language (from the catalog).
+        let reason = umadev_i18n::tlf(
+            "qc.acceptance_scan_incomplete",
+            &["600", "16", "2", &MAX_SOURCE_DEPTH.to_string()],
+        );
+        assert_eq!(
+            endpoint_acceptance(tmp.path(), "demo"),
+            EndpointAcceptance::Unavailable(reason.clone())
+        );
+        assert_eq!(
+            task_acceptance_gaps(tmp.path(), "demo"),
+            vec![format!("acceptance unavailable: {reason}")],
+            "callers that fold findings together still see one explicit line"
+        );
     }
 }

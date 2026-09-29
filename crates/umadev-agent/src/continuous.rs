@@ -1796,7 +1796,7 @@ pub(crate) fn quality_floor(options: &RunOptions) -> (String, String) {
 /// the mismatch details (a fetch URL with no matching backend route). Reuses
 /// `umadev_contract` exactly like the single-shot quality gate. Fail-open: an
 /// unreadable architecture doc → empty contract → no drift.
-fn frontend_contract_drift(options: &RunOptions, slug: &str) -> Vec<String> {
+pub(crate) fn frontend_contract_drift(options: &RunOptions, slug: &str) -> Vec<String> {
     let arch_path = options
         .project_root
         .join("output")

@@ -739,26 +739,47 @@ pub(crate) fn bounded_log_tail(s: &str) -> String {
 
 /// Run the contract + coverage floor and report drift as factual evidence. An
 /// empty floor (no architecture doc / no gaps) → available + passed with no
-/// evidence; any drift → `passed = false` with each finding as evidence.
+/// evidence; any drift → `passed = false` with each finding as evidence. An
+/// endpoint check that could not read the whole source tree proves nothing either
+/// way: with no other finding it is a neutral skip (`available = false`), never a
+/// failure the step's doer is asked to repair.
 fn verify_contract(options: &RunOptions) -> VerifyResult {
-    let (qa_floor, _security_floor) = continuous::quality_floor(options);
-    let lines: Vec<String> = qa_floor
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(ToString::to_string)
+    let slug = options.effective_slug();
+    let root = &options.project_root;
+    let mut lines: Vec<String> = crate::coverage::uncovered_requirements(root, &slug)
+        .into_iter()
+        .map(|r| format!("coverage gap: {r}"))
         .collect();
-    if lines.is_empty() {
+    let acceptance_unavailable = match crate::acceptance::endpoint_acceptance(root, &slug) {
+        crate::acceptance::EndpointAcceptance::Checked(gaps) => {
+            lines.extend(gaps.into_iter().map(|g| format!("acceptance gap: {g}")));
+            None
+        }
+        crate::acceptance::EndpointAcceptance::Unavailable(reason) => Some(reason),
+    };
+    lines.extend(
+        continuous::frontend_contract_drift(options, &slug)
+            .into_iter()
+            .map(|v| format!("contract drift: {v}")),
+    );
+    if !lines.is_empty() {
         return VerifyResult {
+            available: true,
+            passed: false,
+            evidence: lines,
+        };
+    }
+    match acceptance_unavailable {
+        Some(reason) => VerifyResult {
+            available: false,
+            passed: true,
+            evidence: vec![format!("acceptance unavailable: {reason}")],
+        },
+        None => VerifyResult {
             available: true,
             passed: true,
             evidence: Vec::new(),
-        };
-    }
-    VerifyResult {
-        available: true,
-        passed: false,
-        evidence: lines,
+        },
     }
 }
 
@@ -1742,6 +1763,47 @@ mod tests {
         assert!(r.available);
         assert!(r.passed, "an empty contract floor passes");
         assert!(r.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verify_contract_is_neutral_when_the_endpoint_check_cannot_run() {
+        // A backend step judged by `contract` must not fail on a source scan that
+        // could not read the whole tree (the doer cannot fix that), while a planned
+        // endpoint that is genuinely missing from a readable tree still fails it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# API\n\n| Method | Path | Description | Auth |\n|---|---|---|---|\n\
+             | GET | /api/items | list items | none |\n\
+             | GET | /api/orders | list orders | none |\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("src/server.js"),
+            "app.get('/api/items', listItems);\n",
+        )
+        .unwrap();
+        let o = opts(tmp.path());
+        let ev = sink();
+        let r = verify(&o, &ev, VerifyKind::Contract).await;
+        assert!(r.available && !r.passed, "a real gap fails: {r:?}");
+        assert!(
+            r.evidence.iter().any(|e| e.contains("/api/orders")),
+            "{r:?}"
+        );
+
+        for i in 0..crate::acceptance::MAX_SOURCE_FILES {
+            std::fs::write(
+                tmp.path().join(format!("src/m{i}.js")),
+                format!("export const v{i} = {i};\n"),
+            )
+            .unwrap();
+        }
+        let r = verify(&o, &ev, VerifyKind::Contract).await;
+        assert!(!r.available, "an unreadable tree is a neutral skip: {r:?}");
+        assert!(r.passed, "{r:?}");
     }
 
     #[test]

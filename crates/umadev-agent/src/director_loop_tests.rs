@@ -3087,6 +3087,73 @@ fn acceptance_floor_is_fail_open_when_artifacts_are_missing() {
     );
 }
 
+/// An architecture doc planning `GET /api/items` (implemented by a real backend
+/// registration) and `GET /api/orders` (implemented nowhere).
+fn seed_items_backend(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("output")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("output/demo-architecture.md"),
+        "# API\n\n\
+         | Method | Path | Description | Auth |\n\
+         |---|---|---|---|\n\
+         | GET | /api/items | list items | none |\n\
+         | GET | /api/orders | list orders | none |\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/server.js"),
+        "app.get('/api/items', listItems);\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_genuinely_missing_endpoint_still_blocks_the_deliberate_floor() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_items_backend(tmp.path());
+    let o = opts(tmp.path());
+    let blocking = acceptance_floor_blocking(&o, Some(&build_route()));
+    assert!(
+        blocking
+            .iter()
+            .any(|b| b.contains("planned endpoint not implemented") && b.contains("/api/orders")),
+        "{blocking:?}"
+    );
+    assert!(
+        !blocking.iter().any(|b| b.contains("/api/items")),
+        "{blocking:?}"
+    );
+}
+
+#[test]
+fn an_endpoint_check_that_cannot_run_is_a_note_not_a_blocking_gap() {
+    // More source than the scan can read: whether `/api/orders` exists is unknown,
+    // and no edit can make the check run. The final gate must not tell the base to
+    // implement it (a finding it can never clear); the user sees a note instead.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_items_backend(tmp.path());
+    for i in 0..crate::acceptance::MAX_SOURCE_FILES {
+        std::fs::write(
+            tmp.path().join(format!("src/m{i}.js")),
+            format!("export const v{i} = {i};\n"),
+        )
+        .unwrap();
+    }
+    let o = opts(tmp.path());
+    let floor = acceptance_floor(&o, Some(&build_route()), None);
+    assert!(
+        !floor.blocking.iter().any(|b| b.contains("acceptance")),
+        "{:?}",
+        floor.blocking
+    );
+    assert!(
+        floor.notes.iter().any(|n| n.contains("600")),
+        "{:?}",
+        floor.notes
+    );
+}
+
 #[test]
 fn acceptance_floor_blocks_a_layer_violation_declared_in_the_architecture_doc() {
     // UD-CODE-006b (spec §3.6): the architecture doc declares a
