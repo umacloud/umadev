@@ -751,6 +751,11 @@
 "quick.busy" = "A pipeline is running — /cancel it before /quick, to avoid two pipelines writing the same workspace."
 "quick.usage" = "Usage: /quick <task>\n  Example: /quick tweak the header copy\n  Lightweight track: clarify-lite → implement → verify (skips research / 3 docs / both gates / delivery)."
 "quick.starting" = "[light] Lightweight track: \"{}\". Running spec → implement → quality (no gates)…"
+"quick.guarded_one_shot" = "[light] /quick drives the base through one-shot calls, which cannot ask you to approve an edit, so in Guarded mode it could not change any file. Type the change as a normal message instead (the resident session makes it and asks you before risky steps), or switch to /mode auto, where the fast track edits without asking."
+"quick.cli_guarded_one_shot" = "`umadev quick` drives the base through one-shot calls, which cannot ask you to approve an edit, so in Guarded mode the base could not change any file. Re-run with `--mode auto` to let it edit without asking, or type the change as a message in the UmaDev TUI, where the resident session edits and asks you before risky steps."
+"redo.cli_guarded_one_shot" = "`umadev redo {}` drives the base through one-shot calls, which cannot ask you to approve an edit, so in Guarded mode the base could not change any file. Re-run with `--mode auto` to let it edit without asking."
+"lean.incomplete" = "did not complete: the {} phase changed nothing or fell back to a placeholder (see the [WARN] notes above)"
+"lean.incomplete_exit" = "The run did not complete, so nothing was marked done."
 
 # /redo <phase> — re-run a single phase
 "redo.phase.usage" = "Usage: /redo [phase]\n  /redo            re-run the whole requirement from scratch\n  /redo <phase>    re-run ONE phase (e.g. /redo frontend) — handy for a base that went offline\n  Valid phases: {}"

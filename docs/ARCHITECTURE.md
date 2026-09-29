@@ -294,6 +294,9 @@ retrieve_with_vector(project_root, knowledge_dir, cfg, query, phase, qvec)
 Pre/PostToolUse hook；Kimi 的配置虽在用户目录，但 UmaDev 的每一条命令只对安装时的项目根
 生效，并保留用户其它 hook。其余底座能否在工具执行前在线裁决，取决于当前协议帧与握手能力；
 没有 pre-apply surface 时只报告事件审计与交付硬门，绝不把 post-hoc 观察写成实时拦截。
+Auto 下 Codex / OpenCode 同样保留协议内审批，不在底座内预先放行：UmaDev 自动放行普通动作，
+只在不可逆地板处询问（无人值守时拒绝）。一次性调用（`/quick`、`umadev quick` / `redo`）没有审批
+通道：Plan / Guarded 下底座只读，Auto 下预授权。
 
 ## verify 真测试序列
 

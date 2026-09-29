@@ -9846,6 +9846,76 @@ error TS2304: Cannot find name 'Foo'
         );
     }
 
+    /// A base that answers but writes the file it was asked to change only when
+    /// `writes` is set — a one-shot in Guarded runs read-only and can only talk.
+    struct LightImplementRuntime {
+        root: std::path::PathBuf,
+        writes: bool,
+    }
+
+    #[async_trait]
+    impl Runtime for LightImplementRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            let implementing = req
+                .system
+                .as_deref()
+                .is_some_and(|system| system.contains("Make ONLY the small change"));
+            if implementing && self.writes {
+                std::fs::create_dir_all(self.root.join("src")).unwrap();
+                std::fs::write(self.root.join("src/header.txt"), "新的页头文案\n").unwrap();
+            }
+            Ok(CompletionResponse {
+                text: "Updated the header copy in src/header.txt.".into(),
+                id: "light".into(),
+                model: "light".into(),
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn light_run_in_guarded_mode_uses_a_writable_brain_or_fails_loudly() {
+        // `/quick` in Guarded drove a read-only one-shot: the base replied
+        // "done", nothing changed on disk, and the run still reported success.
+        for writes in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            git_init_repo(tmp.path());
+            std::fs::write(tmp.path().join("README.md"), "demo\n").unwrap();
+            let mut o = opts(tmp.path());
+            o.requirement = "把页头文案改一下".into();
+            let runtime = LightImplementRuntime {
+                root: tmp.path().to_path_buf(),
+                writes,
+            };
+            let runner = AgentRunner::new(runtime, o);
+            runner.start().unwrap();
+            let report = runner.run_light(true).await.unwrap();
+            let implement = report
+                .completed
+                .iter()
+                .find(|phase| phase.phase == Phase::Frontend)
+                .expect("the implement phase ran");
+            assert_eq!(
+                implement.degraded, !writes,
+                "an implement step that changed no file must not count as done (writes={writes})"
+            );
+            let runs = crate::task_lifecycle::recent_agent_runs(tmp.path(), 1);
+            if !writes {
+                assert_eq!(
+                    runs[0].tasks[0].state,
+                    crate::task_lifecycle::AgentTaskState::Failed,
+                    "a Light run whose implement step changed nothing is not a success"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn run_light_emits_light_plan_note() {
         use crate::events::RecordingSink;

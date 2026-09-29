@@ -827,6 +827,172 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
     );
 }
 
+/// A base approval request shaped like the ones Codex (`Bash`/`Write` with
+/// `accept`/`decline`) and OpenCode (lowercase permission, `once`/`reject`)
+/// send once Auto keeps their own approvals on.
+fn auto_base_approval(action: &str, target: &str) -> umadev_runtime::HostRequest {
+    use umadev_runtime::{HostApprovalOption, HostApprovalOptionKind, HostRequest};
+    let (allow, reject) = if action.chars().next().is_some_and(char::is_uppercase) {
+        ("accept", "decline")
+    } else {
+        ("once", "reject")
+    };
+    HostRequest::Approval {
+        action: action.to_string(),
+        target: target.to_string(),
+        message: None,
+        options: vec![
+            HostApprovalOption {
+                id: allow.to_string(),
+                label: "Allow once".to_string(),
+                kind: HostApprovalOptionKind::AllowOnce,
+            },
+            HostApprovalOption {
+                id: reject.to_string(),
+                label: "Reject".to_string(),
+                kind: HostApprovalOptionKind::RejectOnce,
+            },
+        ],
+        metadata: serde_json::json!({}),
+    }
+}
+
+#[tokio::test]
+async fn auto_resolver_allows_ordinary_build_work_from_codex_and_opencode_without_asking() {
+    use umadev_runtime::{ApprovalDecision, HostResponse};
+
+    // Auto no longer pre-approves inside Codex/OpenCode, so every ordinary tool
+    // call arrives here. None of these may pause a live user: installs, tests,
+    // builds, everyday git and in-tree edits are reversible work.
+    let root = tempfile::tempdir().unwrap();
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let host_input_holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    for (action, target) in [
+        ("Bash", "npm install"),
+        ("Bash", "pnpm install"),
+        ("Bash", "npm test"),
+        ("Bash", "npm run build"),
+        ("Bash", "cargo build"),
+        ("Bash", "cargo test --workspace"),
+        ("Bash", "git status"),
+        ("Bash", "git diff"),
+        ("Bash", "git add -A"),
+        ("Bash", "git commit -m \"fix header copy\""),
+        ("Write", "src/app.tsx"),
+        ("Write", "src/a.ts, src/b.ts"),
+        ("bash", "npm test"),
+        ("bash", "pip install -r requirements.txt"),
+        ("edit", "src/components/Header.tsx"),
+        ("external_directory", "/home/u/.config/opencode/skills/review/*"),
+        ("task", "general"),
+        ("webfetch", "https://docs.rs/serde"),
+    ] {
+        for interactive in [true, false] {
+            let response = tokio::time::timeout(
+                Duration::from_millis(500),
+                resolve_resident_host_request(
+                    &auto_base_approval(action, target),
+                    "req-ordinary",
+                    root.path(),
+                    umadev_agent::TrustMode::Auto,
+                    interactive,
+                    &approval_holder,
+                    &host_input_holder,
+                    &sink,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Auto must not pause for {action} {target}"));
+            assert!(
+                matches!(
+                    response,
+                    HostResponse::Approval {
+                        decision: ApprovalDecision::Allow,
+                        selected_option_id: Some(ref id),
+                        ..
+                    } if id == "accept" || id == "once"
+                ),
+                "Auto must auto-allow {action} {target}: {response:?}"
+            );
+            assert!(approval_holder.lock().unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_resolver_still_stops_codex_and_opencode_at_the_irreversible_floor() {
+    use umadev_runtime::{ApprovalDecision, HostResponse};
+
+    let root = tempfile::tempdir().unwrap();
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let host_input_holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    for (action, target) in [
+        ("Bash", "git push --force origin main"),
+        ("Bash", "rm -rf build"),
+        ("Bash", "npm publish"),
+        ("bash", "echo key >> ~/.ssh/authorized_keys"),
+        ("edit", "../../etc/hosts"),
+        ("Write", "/etc/profile"),
+    ] {
+        // No live user: the floor denies instead of running it.
+        let headless = resolve_resident_host_request(
+            &auto_base_approval(action, target),
+            "req-floor",
+            root.path(),
+            umadev_agent::TrustMode::Auto,
+            false,
+            &approval_holder,
+            &host_input_holder,
+            &sink,
+        )
+        .await;
+        assert!(
+            matches!(
+                headless,
+                HostResponse::Approval {
+                    decision: ApprovalDecision::Deny,
+                    ..
+                }
+            ),
+            "headless Auto must deny {action} {target}: {headless:?}"
+        );
+
+        // A live user is asked, and the request waits for the answer.
+        let interactive = resolve_resident_host_request(
+            &auto_base_approval(action, target),
+            "req-floor",
+            root.path(),
+            umadev_agent::TrustMode::Auto,
+            true,
+            &approval_holder,
+            &host_input_holder,
+            &sink,
+        );
+        tokio::pin!(interactive);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut interactive)
+                .await
+                .is_err(),
+            "Auto must ask before {action} {target}"
+        );
+        deny_pending_approval(&approval_holder);
+        let answered = tokio::time::timeout(TURN_HANG_GUARD, interactive)
+            .await
+            .expect("the user's answer releases the request");
+        assert!(matches!(
+            answered,
+            HostResponse::Approval {
+                decision: ApprovalDecision::Deny,
+                ..
+            }
+        ));
+    }
+}
+
 #[test]
 fn should_pause_for_user_covers_guarded_review_and_auto_disasters() {
     use umadev_agent::{Capability, TrustMode};

@@ -6921,4 +6921,251 @@ done
             activity.observe(event);
         }
     }
+
+    #[test]
+    fn auto_profile_keeps_vendor_approvals_for_irreversible_floor() {
+        // `never` switched Codex's own approvals off in Auto, so `git push
+        // --force` or `rm -rf` ran unasked and UmaDev only saw it afterwards.
+        // Auto keeps the same approval channel as Guarded; UmaDev's resolver
+        // then auto-allows ordinary work and asks only at the irreversible floor.
+        let ws = Path::new("/tmp/p");
+        let full = thread_start_params_for(ws, "", BasePermissionProfile::Auto, "danger-full-access");
+        assert_ne!(full["approvalPolicy"], "never");
+        assert_eq!(full["approvalPolicy"], "untrusted");
+        let narrowed = thread_start_params_for(ws, "", BasePermissionProfile::Auto, "workspace-write");
+        assert_eq!(narrowed["approvalPolicy"], "on-request");
+        let resumed = thread_resume_params_writable_for(
+            "thr_main",
+            ws,
+            "",
+            BasePermissionProfile::Auto,
+            "danger-full-access",
+        );
+        assert_eq!(resumed["approvalPolicy"], "untrusted");
+    }
+
+    #[test]
+    fn readonly_fork_thread_is_ephemeral() {
+        // Every routed message opens a read-only fork; a durable thread would
+        // leave one rollout per message in `codex resume`.
+        let ws = Path::new("/tmp/p");
+        assert_eq!(thread_start_params_readonly(ws, "")["ephemeral"], true);
+        // The writer thread stays durable so `/continue` can resume it.
+        let writer = thread_start_params_for(ws, "", BasePermissionProfile::Guarded, "danger-full-access");
+        assert!(writer.get("ephemeral").is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_file_change_tagged_kind_add_markdown_and_delete() {
+        // app-server v2 tags the kind (`{"type":"add"}`) and, for add and delete,
+        // puts the raw file body in `diff`.
+        let (tx, mut rx) = chan();
+        emit_item(
+            &json!({
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [
+                    {"path": "a.md", "kind": {"type": "add"}, "diff": "---\ntitle: x\n---\n- 一\n- 二\n"},
+                    {"path": "old.env", "kind": {"type": "delete"}, "diff": "KEY=sk-live-123\n"},
+                    {"path": "src/lib.rs", "kind": {"type": "update", "move_path": null},
+                     "diff": "@@ -1 +1 @@\n-old\n+new\n"}
+                ]
+            }),
+            false,
+            &tx,
+        )
+        .await;
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected the new file's ToolCall");
+        };
+        assert_eq!(name, "Write", "a new file is a Write");
+        assert_eq!(input["file_path"], "a.md");
+        assert_eq!(input["content"], "---\ntitle: x\n---\n- 一\n- 二\n");
+        let _ = rx.recv().await;
+
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected the deletion's ToolCall");
+        };
+        assert_ne!(name, "Write", "a deletion is not a new file");
+        assert_eq!(input["file_path"], "old.env");
+        assert!(
+            input.get("content").is_none(),
+            "a deleted body is never scanned as written content: {input}"
+        );
+        let _ = rx.recv().await;
+
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected the update's ToolCall");
+        };
+        assert_eq!(name, "Edit");
+        assert_eq!(input["content"], "new");
+    }
+
+    fn v2_token_usage(turn: &str, last: (u64, u64), total: (u64, u64)) -> String {
+        let breakdown = |(input, output): (u64, u64)| {
+            json!({
+                "totalTokens": input + output,
+                "inputTokens": input,
+                "cachedInputTokens": 0,
+                "cacheWriteInputTokens": 0,
+                "outputTokens": output,
+                "reasoningOutputTokens": 0
+            })
+        };
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thr_main",
+                "turnId": turn,
+                "tokenUsage": {"total": breakdown(total), "last": breakdown(last), "modelContextWindow": null}
+            }
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn codex_turn_usage_sums_every_model_request_in_the_turn() {
+        // Codex sends `thread/tokenUsage/updated` after EVERY model request and
+        // `last` covers only that request. A tool-using turn makes several.
+        let pending = empty_pending();
+        let approvals = empty_approvals();
+        let turn_id: TurnId = Arc::new(Mutex::new(Some("t".to_string())));
+        let latest_usage = empty_usage();
+        let (tx, mut rx) = chan();
+        for line in [
+            v2_token_usage("t", (100, 10), (100, 10)),
+            v2_token_usage("t", (300, 20), (400, 30)),
+            // A rate-limit refresh repeats the same snapshot; it is not a request.
+            v2_token_usage("t", (300, 20), (400, 30)),
+        ] {
+            dispatch_line(&line, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        }
+        let done = r#"{"method":"turn/completed","params":{"threadId":"thr_main","turn":{"id":"t","status":"completed"}}}"#;
+        dispatch_line(done, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let SessionEvent::TurnDone { usage, .. } = rx.recv().await.unwrap() else {
+            panic!("expected TurnDone");
+        };
+        let usage = usage.expect("usage attached");
+        assert_eq!((usage.input_tokens, usage.output_tokens), (400, 30));
+        assert!(!usage.usage_incomplete);
+    }
+
+    #[cfg(unix)]
+    const FAKE_APP_SERVER_INTERRUPT_REUSE: &str = r#"#!/bin/sh
+extract_id() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+turns=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{}}\n' "$(extract_id "$line")" ;;
+    *'"method":"initialized"'*) : ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thr_reuse"}}}\n' "$(extract_id "$line")" ;;
+    *'"method":"turn/start"'*)
+      turns=$((turns + 1))
+      if [ "$turns" = 1 ]; then
+        printf '{"id":%s,"result":{"turn":{"id":"t1"}}}\n' "$(extract_id "$line")"
+        printf '{"method":"turn/started","params":{"threadId":"thr_reuse","turn":{"id":"t1","status":"running"}}}\n'
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_reuse","turnId":"t1","delta":"A"}}\n'
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_reuse","turnId":"t1","delta":"A2"}}\n'
+      else
+        printf '{"id":%s,"result":{"turn":{"id":"t2"}}}\n' "$(extract_id "$line")"
+        printf '{"method":"turn/started","params":{"threadId":"thr_reuse","turn":{"id":"t2","status":"running"}}}\n'
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_reuse","turnId":"t2","delta":"B"}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"thr_reuse","turn":{"id":"t2","status":"completed"}}}\n'
+      fi ;;
+    *'"method":"turn/interrupt"'*)
+      printf '{"id":%s,"result":{}}\n' "$(extract_id "$line")"
+      printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_reuse","turnId":"t1","delta":"late"}}\n'
+      printf '{"method":"turn/completed","params":{"threadId":"thr_reuse","turn":{"id":"t1","status":"interrupted"}}}\n' ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_turn_leftovers_never_reach_the_next_turn() {
+        // The TUI interrupts a turn at its tool ceiling and parks the session for
+        // the next message. Codex answers `turn/interrupt` first and only then
+        // sends the interrupted turn's `turn/completed`; neither that, nor what
+        // the old turn left queued, may be read as the next turn's events.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        write_fake_codex(&script, FAKE_APP_SERVER_INTERRUPT_REUSE);
+        let mut session = CodexSession::start_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            "gpt-5-codex",
+            BasePermissionProfile::Guarded,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("fake handshake");
+        session.send_turn("first".to_string()).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+            .await
+            .expect("first delta")
+            .expect("event");
+        assert!(matches!(first, SessionEvent::TextDelta(ref text) if text == "A"));
+        tokio::time::timeout(Duration::from_secs(5), session.interrupt())
+            .await
+            .expect("bounded interrupt")
+            .expect("interrupt acknowledged");
+        // Let the late frames land in the channel before the next turn starts.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        session.send_turn("second".to_string()).await.unwrap();
+        let mut seen = Vec::new();
+        let done = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = session.next_event().await.expect("event");
+                if let SessionEvent::TurnDone { status, .. } = event {
+                    break status;
+                }
+                seen.push(event);
+            }
+        })
+        .await
+        .expect("second turn completes");
+        assert_eq!(
+            done,
+            TurnStatus::Completed,
+            "the stale interrupted TurnDone leaked into the next turn: {seen:?}"
+        );
+        assert_eq!(
+            seen,
+            vec![SessionEvent::TextDelta("B".to_string())],
+            "only the second turn's own events"
+        );
+        session.end().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_error_includes_app_server_stderr() {
+        // A Codex too old for `app-server` exits 2 with clap's message; the user
+        // must see that reason, not only "codex app-server closed".
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        write_fake_codex(
+            &script,
+            "#!/bin/sh\necho \"error: unrecognized subcommand 'app-server'\" >&2\nexit 2\n",
+        );
+        let Err(error) = CodexSession::start_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            "gpt-5-codex",
+            BasePermissionProfile::Guarded,
+            Duration::from_secs(10),
+        )
+        .await
+        else {
+            panic!("a codex without app-server must fail to start");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("unrecognized subcommand"),
+            "the base's own reason must reach the user: {message}"
+        );
+    }
 }

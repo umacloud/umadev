@@ -278,6 +278,11 @@ enum Command {
         /// Workspace root; defaults to current directory.
         #[arg(long)]
         project_root: Option<PathBuf>,
+        /// Trust / autonomy tier for this re-run (`guarded` / `auto`); defaults to
+        /// the tier the original run used. Re-running a phase that edits code
+        /// through a base needs `auto`: its one-shot calls cannot ask first.
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// Approve the active gate and continue the pipeline.
     #[command(
@@ -1247,7 +1252,8 @@ async fn main() -> Result<()> {
             phase,
             backend,
             project_root,
-        } => cmd_redo(phase, backend, project_root).await,
+            mode,
+        } => cmd_redo(phase, backend, project_root, mode).await,
         Command::Continue {
             project_root,
             backend,
@@ -2896,12 +2902,16 @@ fn print_continuous_report(
     let report = continuous_report(outcome, requirement);
     match outcome {
         // Honest lean completion — no release/proof-pack claim.
-        RunOutcome::Completed if !plan_has_delivery(requirement) => print_lean_report(
-            project_root,
-            label,
-            umadev_i18n::tl("continuous.lean_complete"),
-            &report,
-        ),
+        // The continuous report lists no per-phase results, so nothing in it can
+        // be degraded; a failed phase reaches the hard-stop arm below instead.
+        RunOutcome::Completed if !plan_has_delivery(requirement) => {
+            let _ = print_lean_report(
+                project_root,
+                label,
+                umadev_i18n::tl("continuous.lean_complete"),
+                &report,
+            );
+        }
         // P2-J: a HARD STOP carries the REAL reason (zero source / a failed phase /
         // a dead base session / a failed quality gate). The generic `print_report`
         // unconditionally says "quality gate blocked", which is wrong for a
@@ -3853,8 +3863,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         &runtime_label,
         "lightweight task complete (spec -> implement -> quality, no gates)",
         &report,
-    );
-    Ok(())
+    )
 }
 
 /// Recover the run's requirement from persisted [`umadev_agent::WorkflowState`]
@@ -3911,6 +3920,7 @@ async fn cmd_redo(
     phase_name: String,
     backend_override: Option<BackendArg>,
     project_root: Option<PathBuf>,
+    mode_override: Option<String>,
 ) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     // Parse the phase name first so a typo fails fast with the valid set.
@@ -4053,16 +4063,37 @@ async fn cmd_redo(
         &runtime_label,
         &format!("re-ran the `{}` phase", phase.id()),
         &report,
-    );
-    Ok(())
+    )
 }
 
 /// Compact report for the lean entries (`quick` / `redo`). Unlike
 /// [`print_report`], these intentionally stop short of `delivery` (Light has no
 /// delivery phase; a single-phase redo runs exactly one phase), so the
 /// "stopped before delivery (quality gate blocked)" wording would be wrong here.
-fn print_lean_report(project_root: &Path, runtime_label: &str, headline: &str, report: &RunReport) {
-    println!("UmaDev — {headline}.");
+///
+/// A degraded phase (the base changed no file, or fell back to a placeholder)
+/// is not a finished run: the headline says so and the command fails, so a
+/// script never mistakes it for success.
+fn print_lean_report(
+    project_root: &Path,
+    runtime_label: &str,
+    headline: &str,
+    report: &RunReport,
+) -> Result<()> {
+    let degraded: Vec<&str> = report
+        .completed
+        .iter()
+        .filter(|phase_out| phase_out.degraded)
+        .map(|phase_out| phase_out.phase.id())
+        .collect();
+    if degraded.is_empty() {
+        println!("UmaDev — {headline}.");
+    } else {
+        println!(
+            "UmaDev — {}.",
+            umadev_i18n::tlf("lean.incomplete", &[&degraded.join(", ")])
+        );
+    }
     println!("  workspace: {}", project_root.display());
     println!("  runtime: {runtime_label}");
     println!("  final phase: {}", report.final_phase.id());
@@ -4076,6 +4107,28 @@ fn print_lean_report(project_root: &Path, runtime_label: &str, headline: &str, r
             }
         }
     }
+    if degraded.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", umadev_i18n::tl("lean.incomplete_exit"))
+    }
+}
+
+/// Whether a one-shot run (`quick`, `redo`) must stop before it starts. A
+/// one-shot base call cannot carry an approval, so in Guarded the base runs
+/// read-only: a step that has to edit the workspace would change nothing while
+/// the run reported success. Offline templates involve no base.
+fn one_shot_cannot_edit(backend: Option<BackendArg>, mode: umadev_agent::TrustMode) -> bool {
+    backend.is_some() && mode == umadev_agent::TrustMode::Guarded
+}
+
+/// The phases whose base worker edits the workspace itself (code and the
+/// delivery build), rather than returning text UmaDev writes as the artifact.
+fn redo_phase_edits_workspace(phase: umadev_spec::Phase) -> bool {
+    matches!(
+        phase,
+        umadev_spec::Phase::Frontend | umadev_spec::Phase::Backend | umadev_spec::Phase::Delivery
+    )
 }
 
 fn print_report(project_root: &Path, runtime_label: &str, report: &RunReport) {
@@ -8694,6 +8747,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_one_shot_quick_and_redo_stop_before_driving_a_read_only_base() {
+        // `quick` / `redo` drive one-shot base calls. They cannot carry an
+        // approval, so in Guarded the base runs read-only and the implement step
+        // changed nothing while the command still reported success.
+        isolate_state_directory();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let quick_error = cmd_quick(RunArgs {
+            requirement: "把页头文案改一下".to_string(),
+            backend: Some(BackendArg::Codex),
+            project_root: Some(tmp.path().to_path_buf()),
+            slug: String::new(),
+            mode: "guarded".to_string(),
+            continuous: false,
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(quick_error.contains("--mode auto"), "{quick_error}");
+        assert!(
+            !tmp.path().join(".umadev").exists(),
+            "the refusal comes before any run state"
+        );
+
+        let root = tmp.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.requirement = "把页头文案改一下".to_string();
+        state.slug = "demo".to_string();
+        state.backend = "opencode".to_string();
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Guarded);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+        let redo_error = Box::pin(cmd_redo(
+            "frontend".to_string(),
+            None,
+            Some(root.to_path_buf()),
+            None,
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            redo_error.contains("--mode auto") && redo_error.contains("frontend"),
+            "{redo_error}"
+        );
+
+        assert!(one_shot_cannot_edit(Some(BackendArg::ClaudeCode), umadev_agent::TrustMode::Guarded));
+        assert!(!one_shot_cannot_edit(Some(BackendArg::Codex), umadev_agent::TrustMode::Auto));
+        assert!(!one_shot_cannot_edit(None, umadev_agent::TrustMode::Guarded));
+        for phase in [
+            umadev_spec::Phase::Frontend,
+            umadev_spec::Phase::Backend,
+            umadev_spec::Phase::Delivery,
+        ] {
+            assert!(redo_phase_edits_workspace(phase), "{phase:?}");
+        }
+        // Text phases are written by UmaDev from the base's answer, so a
+        // read-only one-shot still does their job.
+        for phase in [
+            umadev_spec::Phase::Research,
+            umadev_spec::Phase::Docs,
+            umadev_spec::Phase::Spec,
+            umadev_spec::Phase::Quality,
+        ] {
+            assert!(!redo_phase_edits_workspace(phase), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn lean_report_with_a_degraded_phase_is_not_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let clean = RunReport {
+            final_phase: umadev_spec::Phase::Quality,
+            paused_at: None,
+            completed: Vec::new(),
+        };
+        assert!(print_lean_report(tmp.path(), "test", "done", &clean).is_ok());
+        let degraded = RunReport {
+            final_phase: umadev_spec::Phase::Quality,
+            paused_at: None,
+            completed: vec![umadev_agent::PhaseOutput {
+                phase: umadev_spec::Phase::Frontend,
+                artifacts: Vec::new(),
+                gate: None,
+                degraded: true,
+            }],
+        };
+        assert!(print_lean_report(tmp.path(), "test", "done", &degraded).is_err());
+    }
+
+    #[tokio::test]
     async fn persisted_git_commit_is_blocked_at_every_cli_replay_boundary() {
         isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8730,6 +8872,7 @@ mod tests {
                 "frontend".to_string(),
                 None,
                 Some(root.to_path_buf()),
+                None,
             ))
             .await,
         );

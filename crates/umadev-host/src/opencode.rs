@@ -1083,6 +1083,169 @@ mod tests {
     }
 
     #[test]
+    fn opencode_driver_never_resumes_a_foreign_session_id() {
+        // The CLI pins a UUID it generated itself. OpenCode mints every session
+        // id (`ses_…`) and exits "Session not found" for any other, so a foreign
+        // id must neither reach `--session` nor fall back to `--continue` (the
+        // user's most recent, unrelated conversation). The first run is fresh.
+        let uuid = "0b9f5c2e-3a41-4d7e-9c1a-5f2e8d7b6a10".to_string();
+        let mut via_setter = OpenCodeDriver::default();
+        via_setter.set_continue_session(true);
+        via_setter.set_session_id(Some(uuid.clone()));
+        let via_builder = OpenCodeDriver::default()
+            .with_continue_session(true)
+            .with_session_id(Some(uuid.clone()));
+        for driver in [&via_setter, &via_builder] {
+            let args = driver.call_args("");
+            assert!(
+                !args.iter().any(|a| a == "--session" || a == "--continue"),
+                "a foreign id must start a fresh session: {args:?}"
+            );
+            assert!(!args.contains(&uuid));
+        }
+
+        // The real id captured from that first run is then resumed exactly.
+        via_setter.remember_session_id("ses_01JB7Q9XK2M4N6P8R0T2V4X6Z8");
+        let args = via_setter.call_args("");
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--session", "ses_01JB7Q9XK2M4N6P8R0T2V4X6Z8"]));
+        assert!(!args.contains(&"--continue".to_string()));
+    }
+
+    /// The flat `OPENCODE_PERMISSION` object a one-shot passes, in key order.
+    /// OpenCode appends these rules after the agent's own and evaluates the
+    /// LAST rule whose permission pattern matches, so order is the semantics.
+    fn permission_override_rules(raw: &str) -> Vec<(String, String)> {
+        let body = raw
+            .trim()
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .expect("a flat JSON object");
+        body.split(',')
+            .map(|pair| {
+                let (key, value) = pair.split_once(':').expect("key:value");
+                (
+                    key.trim().trim_matches('"').to_string(),
+                    value.trim().trim_matches('"').to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// OpenCode's `Wildcard.match` for a permission name: `*` spans any run of
+    /// characters and `?` exactly one.
+    fn opencode_wildcard_match(value: &str, pattern: &str) -> bool {
+        fn matches(value: &[char], pattern: &[char]) -> bool {
+            match pattern.split_first() {
+                None => value.is_empty(),
+                Some(('*', rest)) => (0..=value.len()).any(|skip| matches(&value[skip..], rest)),
+                Some((&head, rest)) => value
+                    .split_first()
+                    .is_some_and(|(&c, tail)| (head == '?' || head == c) && matches(tail, rest)),
+            }
+        }
+        let value: Vec<char> = value.chars().collect();
+        let pattern: Vec<char> = pattern.chars().collect();
+        matches(&value, &pattern)
+    }
+
+    fn last_matching_action<'a>(rules: &'a [(String, String)], permission: &str) -> Option<&'a str> {
+        rules
+            .iter()
+            .rev()
+            .find(|(pattern, _)| opencode_wildcard_match(permission, pattern))
+            .map(|(_, action)| action.as_str())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_plan_one_shot_denies_shell_and_network() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `--agent plan` only denies edits; OpenCode's defaults allow `bash` and
+        // `webfetch`, and a non-interactive `run` executes allowed tools without
+        // asking. Every non-Auto one-shot must therefore carry a deny-by-default
+        // permission override that the base itself enforces.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-opencode");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'PERMISSION=%s\\n' \"$OPENCODE_PERMISSION\"\nprintf 'ARG=%s\\n' \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let reported = |text: &str, key: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|line| line.strip_prefix(key))
+                .map(str::to_string)
+                .collect()
+        };
+
+        for profile in [BasePermissionProfile::Plan, BasePermissionProfile::Guarded] {
+            let driver = OpenCodeDriver::with_program(script.to_str().unwrap())
+                .with_permissions(profile)
+                .with_version_output_for_test("1.4.0");
+            let text = driver
+                .complete(sample_completion_request())
+                .await
+                .unwrap()
+                .text;
+            let args = reported(&text, "ARG=");
+            assert!(
+                args.windows(2).any(|w| w == ["--agent", "plan"]),
+                "{profile:?}: {args:?}"
+            );
+            let raw = reported(&text, "PERMISSION=").concat();
+            assert!(
+                !raw.trim().is_empty(),
+                "{profile:?} one-shot must pass a permission override: {text}"
+            );
+            let rules = permission_override_rules(&raw);
+            for permission in [
+                "bash",
+                "webfetch",
+                "websearch",
+                "codesearch",
+                "edit",
+                "task",
+                "external_directory",
+                "skill",
+                "future_tool",
+                "github_create_issue",
+            ] {
+                assert_eq!(
+                    last_matching_action(&rules, permission),
+                    Some("deny"),
+                    "{profile:?} must deny {permission}: {raw}"
+                );
+            }
+            for permission in ["read", "grep", "glob", "list"] {
+                assert_eq!(
+                    last_matching_action(&rules, permission),
+                    Some("allow"),
+                    "{profile:?} keeps local inspection: {raw}"
+                );
+            }
+        }
+
+        // Explicit Auto is the one writable one-shot: the `build` agent with
+        // `--auto`, and no read-only override.
+        let auto = OpenCodeDriver::with_program(script.to_str().unwrap())
+            .with_permissions(BasePermissionProfile::Auto)
+            .with_version_output_for_test("1.4.0");
+        let text = auto
+            .complete(sample_completion_request())
+            .await
+            .unwrap()
+            .text;
+        assert!(reported(&text, "PERMISSION=").concat().trim().is_empty());
+        assert!(reported(&text, "ARG=")
+            .windows(2)
+            .any(|w| w == ["--agent", "build"]));
+    }
+
+    #[test]
     fn a_fork_reset_does_not_erase_the_parent_session() {
         let parent = OpenCodeDriver::default().with_session_id(Some("ses_parent".to_string()));
         let child = parent.clone().with_session_id(None);

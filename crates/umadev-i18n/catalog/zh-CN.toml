@@ -741,6 +741,11 @@
 "quick.busy" = "流水线正在跑 — 先 /cancel 停掉再 /quick,避免两个流水线同时写同一个工作区。"
 "quick.usage" = "用法:/quick <任务>\n  示例:/quick 把页头文案改一下\n  轻量档:澄清简版 → 实现 → 验证(跳过调研 / 三文档 / 两道确认门 / 交付)。"
 "quick.starting" = "[light] 轻量档:\"{}\"。按 spec → 实现 → quality 跑(无确认门)…"
+"quick.guarded_one_shot" = "[light] /quick 通过一次性调用驱动底座，无法在改动前请你批准，所以在守护模式下它改不了任何文件。请直接把这个改动当作普通消息发送(常驻会话会动手修改，并在有风险的步骤前征求你同意),或用 /mode auto 切到自主模式，快速通道会不经询问直接修改。"
+"quick.cli_guarded_one_shot" = "`umadev quick` 通过一次性调用驱动底座，无法在改动前请你批准，所以在守护模式下底座改不了任何文件。请加上 `--mode auto` 重新运行，让它不经询问直接修改；或在 UmaDev TUI 中把改动当作消息发送，由常驻会话动手修改，并在有风险的步骤前征求你同意。"
+"redo.cli_guarded_one_shot" = "`umadev redo {}` 通过一次性调用驱动底座，无法在改动前请你批准，所以在守护模式下底座改不了任何文件。请加上 `--mode auto` 重新运行，让它不经询问直接修改。"
+"lean.incomplete" = "未完成:{} 阶段没有产生任何实际改动，或只留下了占位产物(见上方 [WARN] 提示)"
+"lean.incomplete_exit" = "本次运行未完成，没有任何内容被标记为已完成。"
 
 # /redo <阶段> — 只重跑单个阶段
 "redo.phase.usage" = "用法:/redo [阶段]\n  /redo            从头重跑整个需求\n  /redo <阶段>     只重跑某一个阶段(如 /redo frontend)— 适合底座掉线后补跑\n  可选阶段:{}"

@@ -1347,6 +1347,55 @@ mod tests {
         assert_eq!(resp.model, "gpt-5-codex");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_one_shot_reports_only_this_calls_usage() {
+        use std::os::unix::fs::PermissionsExt;
+        // `codex exec` reports the thread's cumulative total on `turn.completed`,
+        // and `exec resume <id>` reloads the earlier calls' usage into it. Each
+        // continued one-shot (`umadev quick` phases) must count only itself.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-codex");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+cat >/dev/null
+case " $* " in
+  *" resume "*)
+    printf '{"type":"thread.started","thread_id":"thr_oneshot"}\n'
+    printf '{"type":"turn.completed","usage":{"input_tokens":400,"cached_input_tokens":0,"output_tokens":30,"reasoning_output_tokens":0}}\n' ;;
+  *)
+    printf '{"type":"thread.started","thread_id":"thr_oneshot"}\n'
+    printf '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}\n' ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let driver = CodexDriver::with_program(script.to_str().unwrap()).with_continue_session(true);
+        let request = || CompletionRequest {
+            model: String::new(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: "go".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+        let first = driver.complete(request()).await.unwrap().usage;
+        assert_eq!((first.input_tokens, first.output_tokens), (100, 10));
+        assert!(!first.usage_incomplete);
+
+        let second = driver.complete(request()).await.unwrap().usage;
+        assert_eq!(
+            (second.input_tokens, second.output_tokens),
+            (300, 20),
+            "the resumed call must not re-count the first call's tokens"
+        );
+        assert!(!second.usage_incomplete);
+    }
+
     #[test]
     fn stream_events_keep_model_text_and_tool_input_whole() {
         const SECRET: &str = "SYNTH_CODEX_SECRET_DO_NOT_LEAK_72";

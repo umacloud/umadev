@@ -10717,6 +10717,47 @@ fn slash_goal_and_quick_git_commit_route_only_to_the_host_transaction() {
     }
 }
 
+fn submit_line(app: &mut App, line: &str) -> Action {
+    for ch in line.chars() {
+        let _ = app.apply_key(KeyCode::Char(ch));
+    }
+    app.apply_key(KeyCode::Enter)
+}
+
+#[test]
+fn quick_in_guarded_on_a_base_refuses_instead_of_running_a_read_only_one_shot() {
+    // `/quick` drives one-shot base calls. They cannot carry an approval, so in
+    // Guarded the worker runs read-only: it could not edit anything, yet the
+    // lightweight run reported success.
+    let mut app = fresh_app(Some("codex"));
+    assert_eq!(app.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+    let action = submit_line(&mut app, "/quick 把页头文案改一下");
+    assert_eq!(action, Action::None);
+    assert!(!app.run_started && app.tasks.is_empty());
+    let guidance = umadev_i18n::t(app.lang, "quick.guarded_one_shot");
+    assert!(
+        app.history
+            .iter()
+            .any(|message| message.body().contains(guidance)),
+        "the refusal must say how to proceed"
+    );
+
+    // Auto: the one-shot may write, so the fast track runs.
+    let mut auto = fresh_app(Some("codex"));
+    auto.set_trust_mode(umadev_agent::TrustMode::Auto);
+    assert_eq!(
+        submit_line(&mut auto, "/quick 把页头文案改一下"),
+        Action::StartQuick("把页头文案改一下".to_string())
+    );
+
+    // Offline templates involve no base and no approval.
+    let mut offline = fresh_app(Some("offline"));
+    assert_eq!(
+        submit_line(&mut offline, "/quick 把页头文案改一下"),
+        Action::StartQuick("把页头文案改一下".to_string())
+    );
+}
+
 #[test]
 fn slash_goal_and_quick_compound_git_requests_fail_before_any_run_state() {
     for command in [

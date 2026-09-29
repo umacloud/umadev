@@ -6395,4 +6395,471 @@ mod tests {
             activity.observe(event);
         }
     }
+
+    /// OpenCode's `Permission.evaluate`: the LAST rule whose permission AND
+    /// pattern both match wins, and no match means `ask`. `*` spans any run of
+    /// characters and `?` exactly one (upstream `Wildcard.match`).
+    fn find_last_action(rules: &Value, permission: &str, pattern: &str) -> String {
+        fn wildcard(value: &[char], pattern: &[char]) -> bool {
+            match pattern.split_first() {
+                None => value.is_empty(),
+                Some(('*', rest)) => (0..=value.len()).any(|skip| wildcard(&value[skip..], rest)),
+                Some((&head, rest)) => value
+                    .split_first()
+                    .is_some_and(|(&c, tail)| (head == '?' || head == c) && wildcard(tail, rest)),
+            }
+        }
+        let matches = |value: &str, glob: &str| {
+            let value: Vec<char> = value.chars().collect();
+            let glob: Vec<char> = glob.chars().collect();
+            wildcard(&value, &glob)
+        };
+        rules
+            .as_array()
+            .expect("ruleset array")
+            .iter()
+            .rev()
+            .find(|rule| {
+                matches(permission, rule["permission"].as_str().unwrap_or(""))
+                    && matches(pattern, rule["pattern"].as_str().unwrap_or(""))
+            })
+            .and_then(|rule| rule["action"].as_str())
+            .unwrap_or("ask")
+            .to_string()
+    }
+
+    #[test]
+    fn auto_profile_keeps_vendor_approvals_for_irreversible_floor() {
+        // Auto must not pre-approve inside the base: OpenCode still raises
+        // `permission.asked` so UmaDev's resolver auto-allows ordinary work and
+        // asks only for what the irreversible floor names (force-push, writes
+        // outside the workspace, …). A wildcard `allow` ran them unasked.
+        let auto = session_ruleset_for_profile(BasePermissionProfile::Auto);
+        for (permission, pattern) in [
+            ("bash", "git push --force"),
+            ("bash", "npm test"),
+            ("edit", "../../etc/hosts"),
+            ("edit", "src/app.tsx"),
+            ("external_directory", "/etc/*"),
+            ("task", "general"),
+            ("webfetch", "https://example.com"),
+            ("mcp_github_create_issue", "*"),
+        ] {
+            assert_eq!(
+                find_last_action(&auto, permission, pattern),
+                "ask",
+                "Auto must route {permission} {pattern} to UmaDev's resolver"
+            );
+        }
+        for (permission, pattern) in [
+            ("read", "src/app.tsx"),
+            ("grep", "*"),
+            ("glob", "*"),
+            ("list", "*"),
+            ("question", "*"),
+        ] {
+            assert_eq!(find_last_action(&auto, permission, pattern), "allow");
+        }
+        for permission in ["plan_enter", "plan_exit"] {
+            assert_eq!(find_last_action(&auto, permission, "*"), "deny");
+        }
+    }
+
+    #[test]
+    fn pre_1_4_message_updated_without_top_level_session_id_still_attributes_assistant_text() {
+        // OpenCode 1.1–1.3 publish `message.updated` as `{info}` alone; 1.4 added
+        // the top-level `sessionID`. `info.sessionID` is the authority either way.
+        let mut tracker = PartTracker::default();
+        let message = json!({
+            "type": "message.updated",
+            "properties": {"info": {"id": "m1", "sessionID": "ses_a", "role": "assistant"}}
+        })
+        .to_string();
+        assert!(translate_frame_tracked(&message, "ses_a", &mut tracker).is_empty());
+        let part = json!({
+            "type": "message.part.updated",
+            "properties": {"part": {
+                "id": "p1", "sessionID": "ses_a", "messageID": "m1",
+                "type": "text", "text": "你好"
+            }}
+        })
+        .to_string();
+        assert_eq!(
+            translate_frame_tracked(&part, "ses_a", &mut tracker),
+            [SessionEvent::TextDelta("你好".to_string())]
+        );
+
+        // Another session's message never becomes ours, with or without the
+        // top-level field.
+        for frame in [
+            json!({
+                "type": "message.updated",
+                "properties": {"info": {"id": "m2", "sessionID": "ses_b", "role": "assistant"}}
+            }),
+            json!({
+                "type": "message.updated",
+                "properties": {
+                    "sessionID": "ses_b",
+                    "info": {"id": "m2", "sessionID": "ses_a", "role": "assistant"}
+                }
+            }),
+        ] {
+            assert!(translate_frame_tracked(&frame.to_string(), "ses_a", &mut tracker).is_empty());
+        }
+        let foreign_part = json!({
+            "type": "message.part.updated",
+            "properties": {"part": {
+                "id": "p2", "sessionID": "ses_a", "messageID": "m2",
+                "type": "text", "text": "not ours"
+            }}
+        })
+        .to_string();
+        assert!(translate_frame_tracked(&foreign_part, "ses_a", &mut tracker).is_empty());
+
+        // Exact usage from the same pre-1.4 shape is still counted.
+        tracker.begin_turn();
+        let usage = json!({
+            "type": "message.updated",
+            "properties": {"info": {
+                "id": "m1", "sessionID": "ses_a", "role": "assistant",
+                "tokens": {"input": 40, "output": 5, "reasoning": 0, "cache": {"read": 0, "write": 0}}
+            }}
+        })
+        .to_string();
+        assert!(translate_frame_tracked(&usage, "ses_a", &mut tracker).is_empty());
+        let done = translate_frame_tracked(&idle_frame("ses_a"), "ses_a", &mut tracker);
+        assert!(
+            matches!(
+                done.as_slice(),
+                [SessionEvent::TurnDone { usage: Some(u), .. }]
+                    if u.input_tokens == 40 && u.output_tokens == 5
+            ),
+            "{done:?}"
+        );
+    }
+
+    fn retry_status_frame(message: &str, next_in: Duration) -> String {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        json!({
+            "type": "session.status",
+            "properties": {"sessionID": "ses_a", "status": {
+                "type": "retry",
+                "attempt": 1,
+                "message": message,
+                "next": now_ms + next_in.as_millis()
+            }}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn retry_status_is_visible_and_a_usage_limit_ends_the_turn() {
+        // A short provider retry is surfaced but does not end the turn: OpenCode
+        // retries on its own.
+        let short = translate_frame(
+            &retry_status_frame("Rate limited (429)", Duration::from_secs(8)),
+            "ses_a",
+        );
+        assert!(
+            short.iter().any(|event| matches!(
+                event,
+                SessionEvent::ToolOutputDelta(text) if text.contains("Rate limited (429)")
+            )),
+            "{short:?}"
+        );
+        assert!(!short
+            .iter()
+            .any(|event| matches!(event, SessionEvent::TurnDone { .. })));
+
+        // A multi-hour usage-limit wait is not a hang to sit through: the
+        // message becomes the turn's failure, where quota classification and
+        // `/continue` apply.
+        let message = "Usage limit reached. It will reset in 3 hours";
+        let limit = translate_frame(
+            &retry_status_frame(message, Duration::from_secs(3 * 3600)),
+            "ses_a",
+        );
+        assert!(
+            limit.iter().any(|event| matches!(
+                event,
+                SessionEvent::ToolOutputDelta(text) if text.contains(message)
+            )),
+            "{limit:?}"
+        );
+        assert!(
+            limit.iter().any(|event| matches!(
+                event,
+                SessionEvent::TurnDone { status: TurnStatus::Failed(reason), .. }
+                    if reason.contains(message)
+            )),
+            "{limit:?}"
+        );
+    }
+
+    /// Drain `rx` to the next terminal status (`None` once the stream closes).
+    async fn next_turn_status(rx: &mut mpsc::Receiver<SessionEvent>) -> Option<TurnStatus> {
+        loop {
+            if let SessionEvent::TurnDone { status, .. } = rx.recv().await? {
+                return Some(status);
+            }
+        }
+    }
+
+    /// Accept one HTTP request on `listener` and report its request line.
+    async fn accept_request_line(listener: &tokio::net::TcpListener) -> String {
+        let (mut sock, _) = listener.accept().await.expect("request");
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+            .await
+            .unwrap_or(0);
+        let _ = tokio::io::AsyncWriteExt::write_all(
+            &mut sock,
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntrue",
+        )
+        .await;
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn ephemeral_fork_dropped_without_end_still_deletes_its_session() {
+        // A cancelled routing turn, or an `end()` cut off by the caller's short
+        // deadline, must not leave the temporary fork in the user's history.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let fork = OpenCodeForkSession {
+            http: HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap(),
+            session_id: "ses_dropped_fork".to_string(),
+            events: rx,
+            sse_task: Some(tokio::spawn(std::future::pending::<()>())),
+            lifecycle: SessionLifecycle::Ephemeral,
+            pending_interactions: HashMap::new(),
+            turn_sse_gate: TurnSse::unarmed(),
+            turn_active: false,
+        };
+        drop(fork);
+        let request = tokio::time::timeout(Duration::from_secs(3), accept_request_line(&listener))
+            .await
+            .expect("drop fires a DELETE");
+        assert!(
+            request.starts_with("DELETE /session/ses_dropped_fork "),
+            "{request}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_start_error_includes_the_bases_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("opencode");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.4.0; exit 0; fi\necho 'Error: Configuration is invalid at opencode.json: bad json' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Err(error) = OpenCodeSession::start_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            None,
+            None,
+            false,
+            Duration::from_secs(10),
+        )
+        .await
+        else {
+            panic!("a serve that exits must fail to start");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Configuration is invalid at opencode.json"),
+            "the base's own reason must reach the user: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retry_give_up_aborts_the_opencode_turn() {
+        use std::io::Write as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let aborted_seen = Arc::clone(&aborted);
+        let retry = retry_status_frame(
+            "Usage limit reached. It will reset in 3 hours",
+            Duration::from_secs(3 * 3600),
+        );
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let request_line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let mut s = sock.into_std().unwrap();
+                s.set_nonblocking(false).unwrap();
+                if request_line.starts_with("GET /event") {
+                    s.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                    let busy = r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#;
+                    for frame in [busy, retry.as_str()] {
+                        s.write_all(format!("data: {frame}\r\n\r\n").as_bytes())
+                            .unwrap();
+                        s.flush().unwrap();
+                    }
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        drop(s);
+                    });
+                } else {
+                    if request_line.starts_with("POST /session/ses_a/abort") {
+                        aborted_seen.store(true, Ordering::SeqCst);
+                    }
+                    write_json_response(&mut s, b"true");
+                }
+            }
+        });
+
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
+        let gate = TurnSse::unarmed();
+        gate.arm();
+        let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let pump = tokio::spawn(pump_sse_with_ready(
+            http,
+            "ses_a".to_string(),
+            tx,
+            None,
+            Arc::clone(&gate),
+        ));
+        let failed = tokio::time::timeout(Duration::from_secs(5), next_turn_status(&mut rx))
+            .await
+            .expect("the usage-limit retry ends the turn")
+            .expect("a terminal status before the stream closes");
+        assert!(
+            matches!(&failed, TurnStatus::Failed(reason) if reason.contains("Usage limit reached")),
+            "{failed:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !aborted.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("OpenCode's own retry sleep is aborted");
+        pump.abort();
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn second_turn_without_busy_edge_still_completes() {
+        use std::io::Write as _;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let go_rx = Arc::new(std::sync::Mutex::new(Some(go_rx)));
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let request_line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let mut s = sock.into_std().unwrap();
+                s.set_nonblocking(false).unwrap();
+                if request_line.starts_with("GET /event") {
+                    let go = go_rx.lock().unwrap().take();
+                    std::thread::spawn(move || {
+                        let send = |s: &mut std::net::TcpStream, frame: &str| {
+                            s.write_all(format!("data: {frame}\r\n\r\n").as_bytes())
+                                .unwrap();
+                            s.flush().unwrap();
+                        };
+                        s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                        let busy = r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"busy"}}}"#;
+                        let idle = r#"{"type":"session.status","properties":{"sessionID":"ses_a","status":{"type":"idle"}}}"#;
+                        let one = r#"{"type":"message.part.updated","properties":{"part":{"id":"p1","sessionID":"ses_a","type":"text","text":"first"}}}"#;
+                        let two = r#"{"type":"message.part.updated","properties":{"part":{"id":"p2","sessionID":"ses_a","type":"text","text":"second"}}}"#;
+                        // Turn 1: busy → text → idle.
+                        for frame in [busy, one, idle] {
+                            send(&mut s, frame);
+                        }
+                        // Turn 2 (after the client re-arms): text → idle, with
+                        // the busy edge coalesced away.
+                        if let Some(go) = go {
+                            let _ = go.recv_timeout(std::time::Duration::from_secs(5));
+                        }
+                        for frame in [two, idle] {
+                            send(&mut s, frame);
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                    });
+                } else if request_line.starts_with("GET /session/ses_a/children") {
+                    write_json_response(&mut s, b"[]");
+                } else if request_line.starts_with("GET /session/status") {
+                    write_json_response(&mut s, b"{}");
+                } else {
+                    write_json_response(&mut s, b"true");
+                }
+            }
+        });
+
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
+        let gate = TurnSse::unarmed();
+        let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        gate.arm();
+        let pump = tokio::spawn(pump_sse_with_ready(
+            http,
+            "ses_a".to_string(),
+            tx,
+            None,
+            Arc::clone(&gate),
+        ));
+        let first = tokio::time::timeout(Duration::from_secs(5), next_turn_status(&mut rx))
+            .await
+            .expect("turn 1 completes");
+        assert_eq!(first, Some(TurnStatus::Completed));
+
+        gate.arm();
+        go_tx.send(()).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), next_turn_status(&mut rx))
+            .await
+            .expect("turn 2 must complete on its idle, not hang to the watchdog");
+        assert_eq!(second, Some(TurnStatus::Completed));
+        pump.abort();
+        server.abort();
+    }
 }
