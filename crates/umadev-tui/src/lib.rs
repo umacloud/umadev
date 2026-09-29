@@ -10461,7 +10461,7 @@ async fn event_loop(
                     ));
                 }
                 Action::RunLocalShell(command) => {
-                    if run_task.is_some() || app.thinking || app.cancelling {
+                    if local_command::slot_busy(run_task.as_ref(), app) {
                         app.push_workspace_notice(umadev_i18n::t(
                             app.lang,
                             "chat.busy_cancel_first",
@@ -10478,7 +10478,7 @@ async fn event_loop(
                     }));
                 }
                 Action::RunUmaDevCommand { args, presentation } => {
-                    if run_task.is_some() || app.thinking || app.cancelling {
+                    if local_command::slot_busy(run_task.as_ref(), app) {
                         app.push_workspace_notice(umadev_i18n::t(
                             app.lang,
                             "chat.busy_cancel_first",

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use umadev_process::{BoundedCommandOptions, BoundedCommandOutput};
 
-use crate::app::LocalCommandPresentation;
+use crate::app::{App, LocalCommandPresentation};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -84,6 +84,13 @@ impl LocalCommandRequest {
             timeout: COMMAND_TIMEOUT,
         }
     }
+}
+
+/// Whether a local command must wait for the task that owns the event-loop
+/// slot. A finished handle does not count: a legacy engine block reports its
+/// end only through engine events, so nothing ever clears its handle.
+pub(crate) fn slot_busy(run_task: Option<&tokio::task::JoinHandle<()>>, app: &App) -> bool {
+    run_task.is_some_and(|task| !task.is_finished()) || app.thinking || app.cancelling
 }
 
 /// Terminal result sent back through the route-decision channel.
@@ -247,6 +254,27 @@ mod tests {
         assert!(rendered.chars().count() <= MAX_DISPLAY_CHARS);
         assert!(rendered.lines().count() <= MAX_DISPLAY_LINES);
         assert!(rendered.ends_with(umadev_i18n::t(umadev_i18n::Lang::En, "tui.bang.failed")));
+    }
+
+    #[tokio::test]
+    async fn a_finished_task_does_not_hold_the_local_command_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let app = App::new(
+            "slot",
+            crate::config::UserConfig::default(),
+            root.path().join("config.toml"),
+            root.path().to_path_buf(),
+        );
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(!slot_busy(Some(&finished), &app));
+        assert!(!slot_busy(None, &app));
+
+        let running = tokio::spawn(std::future::pending::<()>());
+        assert!(slot_busy(Some(&running), &app));
+        running.abort();
     }
 
     #[cfg(unix)]
