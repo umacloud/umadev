@@ -2111,9 +2111,15 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
     let ns: Vec<&VRow> = latest.iter().copied().filter(|r| !r.skipped).collect();
     let passed = ns.iter().filter(|r| r.passed).count();
     let total = ns.len();
-    let crit = latest
-        .iter()
-        .any(|r| !r.passed && !r.skipped && matches!(r.step.as_str(), "build" | "test" | "check"));
+    // A split layout names its steps after their directory (`frontend/build`).
+    let crit = latest.iter().any(|r| {
+        !r.passed
+            && !r.skipped
+            && matches!(
+                r.step.rsplit('/').next().unwrap_or_default(),
+                "build" | "test" | "check"
+            )
+    });
     let (status, score) = if total == 0 {
         ("warning", 70i32)
     } else if passed == total {
@@ -3370,6 +3376,9 @@ fn build_and_zip_proof_pack_with_limits(
     let mut expected_total = readme_bytes;
     let mut targets = Vec::new();
     let mut traversal = ProofTraversalBudget::default();
+    // A runtime proof taken before the last change to the code describes code that
+    // is not being delivered: it never goes into the pack as current evidence.
+    let stale_runtime_proof = crate::runtime_proof::persisted_proof_is_stale(&root);
 
     // Glob targets
     for name in [
@@ -3398,8 +3407,9 @@ fn build_and_zip_proof_pack_with_limits(
         // tree was clean / no scan ran; the pack simply omits it then.
         crate::security::sast_findings_rel_path().to_string(),
         // Runtime evidence — proof the app actually BOOTS + answers, not just
-        // that it compiles. Written by `verify --runtime`; absent (skipped)
-        // when no runtime check ran, in which case the pack simply omits it.
+        // that it compiles. Written by `verify --runtime` (and refreshed at
+        // delivery); absent (skipped) when no runtime check ran, in which case the
+        // pack simply omits it — as it does a STALE one (filtered below).
         crate::runtime_proof::runtime_proof_rel_path().to_string(),
         // Deploy evidence — proof the app was shipped to a live URL (platform /
         // command / preview URL / status / log tail). Written by `umadev deploy`
@@ -3408,6 +3418,9 @@ fn build_and_zip_proof_pack_with_limits(
         crate::deploy::deploy_proof_rel_path().to_string(),
         ".umadev/workflow-state.json".to_string(),
     ] {
+        if stale_runtime_proof && name == crate::runtime_proof::runtime_proof_rel_path() {
+            continue;
+        }
         add_proof_file(
             &root,
             PathBuf::from(name),

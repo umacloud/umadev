@@ -643,7 +643,7 @@ pub async fn verify(
         kind.as_str()
     )));
     match kind {
-        VerifyKind::BuildTest => verify_build_test(options).await,
+        VerifyKind::BuildTest => verify_build_test(options, events).await,
         VerifyKind::Contract => verify_contract(options),
         VerifyKind::SourcePresent => verify_source_present(options),
         VerifyKind::DesignTokensPresent => verify_design_tokens(options),
@@ -652,11 +652,12 @@ pub async fn verify(
 }
 
 /// Run the project's real build/test/lint and fold the per-step outcomes into a
-/// factual result. An empty step list (no project manifest) → unavailable /
-/// skipped (neutral). A failed, non-skipped step → `passed = false` with the
-/// step name as evidence.
-async fn verify_build_test(options: &RunOptions) -> VerifyResult {
-    verify_build_test_raw(options).await.0
+/// factual result. Nothing verifiable (no project manifest, or every step
+/// skipped) → unavailable (neutral), with a note saying build/test were not
+/// checked. A failed, non-skipped step → `passed = false` with the step name as
+/// evidence.
+async fn verify_build_test(options: &RunOptions, events: &Arc<dyn EventSink>) -> VerifyResult {
+    verify_build_test_raw(options, events).await.0
 }
 
 /// Cap on the RAW failing-log tail threaded into a rework directive: last lines…
@@ -674,18 +675,28 @@ const RAW_LOG_TAIL_CHARS: usize = 4096;
 /// [`RAW_LOG_TAIL_CHARS`] chars) through instead of dropping it. `None` when
 /// everything passed / was skipped / the failing step produced no output — the
 /// caller skips the excerpt cleanly then.
-pub(crate) async fn verify_build_test_raw(options: &RunOptions) -> (VerifyResult, Option<String>) {
+pub(crate) async fn verify_build_test_raw(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+) -> (VerifyResult, Option<String>) {
     let outcomes = crate::verify::run_verify(&options.project_root).await;
     if outcomes.is_empty() {
-        // No recognised project manifest → nothing to build. Neutral, not a fail.
-        return (
-            VerifyResult {
-                available: false,
-                passed: true,
-                evidence: vec!["no project manifest — build/test skipped".to_string()],
-            },
-            None,
-        );
+        // Nothing here verify can build. Neutral, not a fail — and not a pass either.
+        let why = crate::verify::verify_unavailable_note(&options.project_root);
+        return build_test_not_verified(events, &why);
+    }
+    if outcomes.iter().all(|o| o.skipped) {
+        let mut reasons: Vec<String> = Vec::new();
+        for o in &outcomes {
+            let reason = o.stderr.lines().next().unwrap_or_default().trim();
+            let reason = reason.strip_prefix("failed to spawn: ").unwrap_or(reason);
+            if !reason.is_empty() && !reasons.iter().any(|r| r == reason) {
+                reasons.push(reason.to_string());
+            }
+        }
+        reasons.truncate(3);
+        let why = format!("every step was skipped ({})", reasons.join("; "));
+        return build_test_not_verified(events, &why);
     }
     let mut evidence = Vec::new();
     let mut passed = true;
@@ -720,6 +731,25 @@ pub(crate) async fn verify_build_test_raw(options: &RunOptions) -> (VerifyResult
             evidence,
         },
         raw,
+    )
+}
+
+/// A build/test check that could not run: a neutral result, and a visible note —
+/// "nothing failed" must never read as "it was verified".
+fn build_test_not_verified(
+    events: &Arc<dyn EventSink>,
+    why: &str,
+) -> (VerifyResult, Option<String>) {
+    events.emit(EngineEvent::Note(format!(
+        "team · verify build-test — NOT verified: {why}; build and tests were not checked"
+    )));
+    (
+        VerifyResult {
+            available: false,
+            passed: true,
+            evidence: vec![format!("build/test not verified: {why}")],
+        },
+        None,
     )
 }
 
@@ -1009,8 +1039,9 @@ impl FinalizeResult {
 /// result, never an `Err`, never a panic — finalize must NEVER turn a build that
 /// already succeeded into a failure. It writes only UmaDev's own `output/` +
 /// `release/` artifacts (single-writer preserved: the main build is already done;
-/// this is post-build bookkeeping, not a base turn).
-pub fn finalize(
+/// this is post-build bookkeeping, not a base turn) — and, when a persisted runtime
+/// proof has gone stale, a fresh `.umadev/audit/runtime-proof.json`.
+pub async fn finalize(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: Option<&RoutePlan>,
@@ -1096,23 +1127,16 @@ pub fn finalize(
     // not say that — it says "some earlier code was verified", and stapling it to
     // today's delivery is how an unverified build ships behind a passing artifact.
     //
-    // So: if a persisted proof is STALE (its recorded source fingerprint no longer
-    // matches the tree), we do NOT assemble a pack around it. We say so, plainly, and
-    // withhold — the same honesty rule that withholds the pack for an unclean build.
-    // The remedy is not a disclaimer; it is to re-run the proof.
+    // So a STALE runtime proof (its recorded source fingerprint no longer matches the
+    // tree) is re-run against the code being delivered when that is possible; when it
+    // is not, it stays out of the pack (the pack never includes a stale proof) and
+    // the note says so. Either way the rest of the delivery — current evidence —
+    // still ships: every build changes the source, so withholding the delivery for
+    // a proof taken earlier would withhold it forever.
     //
     // Fail-open: an UNSTAMPED proof (an older artifact) has no fingerprint to
     // contradict and is never stale, so an existing workspace behaves exactly as before.
-    let stale = stale_proof_artifacts(&options.project_root);
-    if !stale.is_empty() {
-        events.emit(EngineEvent::Note(format!(
-            "team · delivery — withheld: {} is STALE (the source changed after it was taken, so \
-             it describes code we are not shipping). A completion claim is only as fresh as the \
-             evidence behind it — re-run the proof (`umadev verify --runtime`) and deliver again",
-            stale.join(", ")
-        )));
-        return result;
-    }
+    refresh_stale_runtime_proof(&options.project_root, events).await;
 
     // … plus the full, shareable proof-pack + scorecard.
     {
@@ -1151,31 +1175,46 @@ pub fn finalize(
     result
 }
 
-/// The persisted proof artifacts that are STALE — their recorded source fingerprint no
-/// longer matches the tree, so they describe code that has since changed. Named for the
-/// honest withhold note in [`finalize`].
-///
-/// Fail-open at every edge: an absent artifact, an unreadable/unparseable one, or one
-/// written before the freshness stamp existed contributes NOTHING (an unknown is not a
-/// finding). Only a proof that positively records a fingerprint that no longer matches
-/// is stale. See [`crate::freshness`].
-fn stale_proof_artifacts(root: &std::path::Path) -> Vec<String> {
-    const MAX_RUNTIME_PROOF_BYTES: usize = 4 * 1024 * 1024;
-    let mut stale = Vec::new();
-    let rel = crate::runtime_proof::runtime_proof_rel_path();
-    if let Some(proof) = crate::bounded_fs::read_utf8_beneath(
-        root,
-        std::path::Path::new(rel),
-        MAX_RUNTIME_PROOF_BYTES,
-    )
-    .ok()
-    .and_then(|b| serde_json::from_str::<crate::runtime_proof::RuntimeProof>(&b).ok())
-    {
-        if proof.is_stale(root) {
-            stale.push(format!("`{rel}`"));
-        }
+/// Re-run a STALE persisted runtime proof (see
+/// [`crate::runtime_proof::persisted_proof_is_stale`]) against the code being
+/// delivered, and persist the fresh result — whatever it says. When it cannot be
+/// re-run here (no dev server, no `curl`), or the tree moves again while it runs,
+/// the stale proof is left as it is and a note says it is stale and stays out of
+/// the proof-pack. Fail-open: nothing here can fail the delivery.
+async fn refresh_stale_runtime_proof(root: &std::path::Path, events: &Arc<dyn EventSink>) {
+    if !crate::runtime_proof::persisted_proof_is_stale(root) {
+        return;
     }
-    stale
+    let rel = crate::runtime_proof::runtime_proof_rel_path();
+    let why = match crate::runtime_proof::runtime_proof_unavailable(root) {
+        Some(why) => why.to_string(),
+        None => {
+            events.emit(EngineEvent::Note(format!(
+                "team · delivery — `{rel}` is STALE (the source changed after it was taken); \
+                 re-running the runtime proof against the code being delivered"
+            )));
+            let proof = crate::runtime_proof::run_runtime_proof(root).await;
+            if proof.is_stale(root) {
+                "the source changed again while it ran".to_string()
+            } else {
+                match crate::runtime_proof::write_runtime_proof(root, &proof) {
+                    Ok(_) => {
+                        events.emit(EngineEvent::Note(format!(
+                            "team · delivery — runtime proof refreshed: {}",
+                            proof.summary_line()
+                        )));
+                        return;
+                    }
+                    Err(error) => format!("it could not be saved ({error})"),
+                }
+            }
+        }
+    };
+    events.emit(EngineEvent::Note(format!(
+        "team · delivery — `{rel}` is STALE (the source changed after it was taken) and was not \
+         re-run: {why}. It is left out of the proof-pack; re-run `umadev verify --runtime` to \
+         include current runtime evidence"
+    )));
 }
 
 #[cfg(test)]
@@ -1728,6 +1767,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unverifiable_build_is_said_not_passed_silently() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("composer.json"), "{}").unwrap();
+        let o = opts(tmp.path());
+        let rec = Arc::new(RecordingSink::default());
+        let ev: Arc<dyn EventSink> = rec.clone();
+        let (r, _) = verify_build_test_raw(&o, &ev).await;
+        assert!(!r.available && r.passed, "neutral: {r:?}");
+        let notes: Vec<String> = rec
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("NOT verified") && n.contains("PHP")),
+            "{notes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn verify_contract_no_arch_doc_passes_clean() {
         // No architecture doc / no gaps → the contract floor is empty → passes.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1820,8 +1884,8 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn finalize_lean_build_ships_code_only_no_doc_ceremony() {
+    #[tokio::test]
+    async fn finalize_lean_build_ships_code_only_no_doc_ceremony() {
         // PROPORTIONALITY (audit #7): a LEAN/Fast Build's deliverable IS the code —
         // NO retrospective PRD/architecture/uiux/execution-plan set, NO proof-pack.
         // A counter / single page should not produce 4 enterprise docs.
@@ -1830,7 +1894,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Fast);
-        let r = finalize(&o, &ev, Some(&route), true);
+        let r = finalize(&o, &ev, Some(&route), true).await;
         assert!(!r.proof_pack, "a lean build earns no proof-pack");
         // NO scaffolded core docs — the code is the deliverable.
         for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
@@ -1850,8 +1914,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_deliberate_build_assembles_the_full_proof_pack() {
+    #[tokio::test]
+    async fn finalize_deliberate_build_assembles_the_full_proof_pack() {
         // A DELIBERATE (Standard/Deep) Build leaves the full shareable delivery —
         // core docs AND the zipped proof-pack + scorecard in release/.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1859,7 +1923,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Standard);
-        let r = finalize(&o, &ev, Some(&route), true);
+        let r = finalize(&o, &ev, Some(&route), true).await;
         assert!(r.proof_pack, "a deliberate build assembles the proof-pack");
         // A proof-pack zip landed in release/.
         let release = tmp.path().join("release");
@@ -1872,8 +1936,8 @@ mod tests {
         assert!(has_zip, "the proof-pack zip was assembled");
     }
 
-    #[test]
-    fn finalize_does_not_clobber_a_real_doc_the_base_wrote() {
+    #[tokio::test]
+    async fn finalize_does_not_clobber_a_real_doc_the_base_wrote() {
         // Idempotent: a doc the base already wrote (a real architecture table) is
         // left untouched — finalize only backfills the MISSING ones.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1884,7 +1948,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Fast);
-        finalize(&o, &ev, Some(&route), true);
+        finalize(&o, &ev, Some(&route), true).await;
         let after = std::fs::read_to_string(&arch).unwrap();
         assert!(
             after.contains("REAL architecture written by the base"),
@@ -1892,18 +1956,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_is_a_noop_with_no_source_or_no_route_or_a_chat_route() {
+    #[tokio::test]
+    async fn finalize_is_a_noop_with_no_source_or_no_route_or_a_chat_route() {
         let ev = sink();
         // No route (legacy entry) → no-op.
         let tmp = tempfile::TempDir::new().unwrap();
         let o = opts(tmp.path());
-        assert!(!finalize(&o, &ev, None, true).produced_anything());
+        assert!(!finalize(&o, &ev, None, true).await.produced_anything());
         // A Build route but an EMPTY tree (nothing built) → no-op (don't scaffold
         // docs around a build that produced nothing).
         let route = build_route(crate::router::Depth::Standard);
         assert!(
-            !finalize(&o, &ev, Some(&route), true).produced_anything(),
+            !finalize(&o, &ev, Some(&route), true)
+                .await
+                .produced_anything(),
             "no source → nothing to deliver"
         );
         // A non-Build (chat/explain) route with source → no-op (nothing to ship).
@@ -1911,13 +1977,15 @@ mod tests {
         let mut chat = build_route(crate::router::Depth::Fast);
         chat.class = RouteClass::Chat;
         assert!(
-            !finalize(&o, &ev, Some(&chat), true).produced_anything(),
+            !finalize(&o, &ev, Some(&chat), true)
+                .await
+                .produced_anything(),
             "a chat route delivers nothing"
         );
     }
 
-    #[test]
-    fn finalize_withholds_delivery_for_an_incomplete_build() {
+    #[tokio::test]
+    async fn finalize_withholds_delivery_for_an_incomplete_build() {
         // MEDIUM M2: a deliberate Build with real source on disk but NOT clean
         // (blocked / stranded steps → `clean == false`) must NOT emit a proof-pack or
         // a delivery scorecard — an incomplete build must never be disguised as
@@ -1927,7 +1995,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Standard);
-        let r = finalize(&o, &ev, Some(&route), false);
+        let r = finalize(&o, &ev, Some(&route), false).await;
         assert!(!r.proof_pack, "an incomplete build earns no proof-pack");
         assert!(
             !r.produced_anything(),
@@ -1950,17 +2018,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finalize_withholds_the_proof_pack_when_the_runtime_proof_is_stale() {
-        // EVIDENCE FRESHNESS. A proof-pack's whole value is that a reader can trust it
-        // without re-doing the work. A runtime proof captured BEFORE the last change to
-        // the code it describes does not say "this code was verified" — it says "some
-        // earlier code was verified", and stapling it to today's delivery is how an
-        // unverified build ships behind a passing artifact. So a stale proof withholds
-        // the pack and says so, exactly as an unclean build does.
+    /// The archive names in the newest proof-pack manifest under `release/`.
+    fn packed(root: &std::path::Path) -> Vec<String> {
+        let mut manifests: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("release"))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.to_string_lossy().ends_with(".manifest.txt"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        manifests.sort();
+        manifests
+            .last()
+            .map(|m| std::fs::read_to_string(m).unwrap_or_default())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_proof_is_refreshed_or_excluded_not_blocking() {
+        // EVIDENCE FRESHNESS. A runtime proof captured BEFORE the last change to the
+        // code describes code we are not shipping, so it is never packed as current
+        // evidence. But every build changes the source: withholding the whole delivery
+        // for it (the old behaviour) withheld every later delivery. A stale proof that
+        // cannot be re-run here (no dev server in this tree) is left out of the pack,
+        // with a note, and the delivery still ships.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
-        let ev = sink();
+        let rec = Arc::new(RecordingSink::default());
+        let ev: Arc<dyn EventSink> = rec.clone();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Standard);
 
@@ -1971,15 +2060,17 @@ mod tests {
             .expect("a test tree is fingerprintable");
         write_proof(&audit, Some(taken));
 
-        // A FRESH proof still delivers — the pack is assembled as before.
-        let fresh = finalize(&o, &ev, Some(&route), true);
+        // A FRESH proof is packed as evidence.
+        let fresh = finalize(&o, &ev, Some(&route), true).await;
+        assert!(fresh.proof_pack, "{fresh:?}");
+        let rel = crate::runtime_proof::runtime_proof_rel_path();
         assert!(
-            fresh.proof_pack,
-            "a proof that describes THIS tree still delivers: {fresh:?}"
+            packed(tmp.path()).iter().any(|f| f == rel),
+            "{:?}",
+            packed(tmp.path())
         );
 
-        // …now the SOURCE MOVES after the proof was taken. The proof describes code we
-        // are no longer shipping.
+        // …now the SOURCE MOVES after the proof was taken.
         std::fs::write(
             tmp.path().join("later.ts"),
             "export const changedAfterTheProof = true;\n",
@@ -1987,23 +2078,36 @@ mod tests {
         .unwrap();
         let _ = std::fs::remove_dir_all(tmp.path().join("release"));
 
-        let stale = finalize(&o, &ev, Some(&route), true);
+        let stale = finalize(&o, &ev, Some(&route), true).await;
         assert!(
-            !stale.proof_pack,
-            "a stale proof must not be assembled into a delivery pack: {stale:?}"
+            stale.proof_pack,
+            "a stale proof no longer withholds delivery: {stale:?}"
         );
-        let release = tmp.path().join("release");
         assert!(
-            !release.exists()
-                || std::fs::read_dir(&release)
-                    .map(|mut d| d.next().is_none())
-                    .unwrap_or(true),
-            "no proof-pack zip is written around stale evidence"
+            !packed(tmp.path()).iter().any(|f| f == rel),
+            "a stale proof is never packed as current evidence: {:?}",
+            packed(tmp.path())
         );
+        let notes: Vec<String> = rec
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("STALE") && n.contains("left out of the proof-pack")),
+            "{notes:?}"
+        );
+        // The stale file itself is left as it was (nothing re-ran it).
+        assert!(tmp.path().join(rel).is_file());
     }
 
-    #[test]
-    fn finalize_still_delivers_when_a_proof_carries_no_freshness_stamp() {
+    #[tokio::test]
+    async fn finalize_still_delivers_when_a_proof_carries_no_freshness_stamp() {
         // FAIL-OPEN. An artifact written before the stamp existed has no fingerprint to
         // contradict — an unknown, never a finding. Such a workspace behaves exactly as
         // it did before this check existed.
@@ -2015,15 +2119,15 @@ mod tests {
         let audit = tmp.path().join(".umadev").join("audit");
         std::fs::create_dir_all(&audit).unwrap();
         write_proof(&audit, None);
-        let r = finalize(&o, &ev, Some(&route), true);
+        let r = finalize(&o, &ev, Some(&route), true).await;
         assert!(
             r.proof_pack,
             "an unstamped proof is not stale — delivery is unchanged: {r:?}"
         );
     }
 
-    #[test]
-    fn finalize_deliberate_missing_docs_are_reported_missing_not_fabricated() {
+    #[tokio::test]
+    async fn finalize_deliberate_missing_docs_are_reported_missing_not_fabricated() {
         // HONESTY: a clean DELIBERATE build whose base did NOT produce the core docs must
         // NOT get a TODO-template stub backfilled (a fake deliverable that also fed the
         // FR-coverage check fabricated FR- ids). Finalize reports them MISSING truthfully,
@@ -2034,7 +2138,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Standard);
-        let r = finalize(&o, &ev, Some(&route), true);
+        let r = finalize(&o, &ev, Some(&route), true).await;
 
         // 1. No fabricated stub on disk: none of the core docs exist (nothing was written).
         for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
@@ -2088,8 +2192,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_reports_only_the_absent_docs_and_never_fabricates_a_real_one() {
+    #[tokio::test]
+    async fn finalize_reports_only_the_absent_docs_and_never_fabricates_a_real_one() {
         // A DELIBERATE build where the base produced a REAL PRD but not the architecture /
         // UI-UX docs: finalize leaves the real PRD untouched (no clobber), reports ONLY the
         // two absent docs as missing, and fabricates nothing. Fail-open: a partial doc set
@@ -2102,7 +2206,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Standard);
-        let r = finalize(&o, &ev, Some(&route), true);
+        let r = finalize(&o, &ev, Some(&route), true).await;
         // The base's real PRD is never clobbered.
         assert!(
             std::fs::read_to_string(&prd).unwrap().contains("REAL PRD"),

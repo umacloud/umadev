@@ -682,6 +682,33 @@ pub fn runtime_proof_rel_path() -> &'static str {
     ".umadev/audit/runtime-proof.json"
 }
 
+/// Whether the persisted `runtime-proof.json` is STALE: it records a source
+/// fingerprint that no longer matches the tree, so it describes code that has
+/// changed since. Fail-open: an absent, unreadable, unparseable or unstamped proof
+/// is not stale (see [`crate::freshness::is_stale`]).
+pub(crate) fn persisted_proof_is_stale(root: &Path) -> bool {
+    crate::bounded_fs::read_utf8_beneath(
+        root,
+        &root.join(runtime_proof_rel_path()),
+        MAX_RUNTIME_PROOF_BYTES,
+    )
+    .ok()
+    .and_then(|body| serde_json::from_str::<RuntimeProof>(&body).ok())
+    .is_some_and(|proof| proof.is_stale(root))
+}
+
+/// Why a runtime proof cannot be taken in `workspace` right now (no `curl`, no
+/// dev server to boot), or `None` when it can.
+pub(crate) fn runtime_proof_unavailable(workspace: &Path) -> Option<&'static str> {
+    if !has_curl() {
+        Some("curl is not installed")
+    } else if detect_dev_server(workspace).is_none() {
+        Some("no dev server was detected")
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // internals
 // ---------------------------------------------------------------------------
@@ -2470,6 +2497,25 @@ mod tests {
         // Round-trips back to the same struct.
         let parsed: RuntimeProof = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed, proof);
+    }
+
+    #[test]
+    fn a_proof_taken_before_the_code_changed_is_stale() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("app.ts"), "export const x = 1;\n").unwrap();
+        assert!(
+            !persisted_proof_is_stale(tmp.path()),
+            "no proof → not stale"
+        );
+        let mut proof = RuntimeProof::not_verified("x");
+        proof.status = RuntimeStatus::Verified;
+        proof.source_fingerprint = crate::freshness::workspace_fingerprint(tmp.path());
+        write_runtime_proof(tmp.path(), &proof).unwrap();
+        assert!(!persisted_proof_is_stale(tmp.path()));
+        fs::write(tmp.path().join("app.ts"), "export const changed = 2;\n").unwrap();
+        assert!(persisted_proof_is_stale(tmp.path()));
+        // Nothing to boot here: the proof cannot be re-run.
+        assert!(runtime_proof_unavailable(tmp.path()).is_some());
     }
 
     #[test]

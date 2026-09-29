@@ -413,6 +413,18 @@ fn runtime_claim(project_root: &Path) -> ReviewClaim {
             detail: "No runtime proof recorded (`umadev verify --runtime` not run).".to_string(),
         };
     };
+    if proof.is_stale(project_root) {
+        // It describes code that has changed since: not evidence about this code.
+        return ReviewClaim {
+            title: "Runtime evidence".to_string(),
+            verdict: Verdict::Warn,
+            detail: format!(
+                "The runtime proof is STALE — the source changed after it was taken ({}), so it \
+                 says nothing about this code. Re-run `umadev verify --runtime`.",
+                proof.summary_line()
+            ),
+        };
+    }
     if proof.status.is_verified() {
         let ok = proof.routes.iter().filter(|r| r.ok).count();
         ReviewClaim {
@@ -542,11 +554,17 @@ fn git_diff(project_root: &Path) -> Option<String> {
 
 /// `git diff --find-renames <against>` in `project_root`; `None` on spawn failure or a
 /// non-zero git exit.
+///
+/// Paths are printed unquoted (`core.quotePath=false`) so a test under
+/// `src/用户/` keeps its `a/… b/…` header, and the diff is decoded lossily so a
+/// GBK-encoded source in it does not turn the whole diff into "not a repo".
 fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
     let out = crate::external_command::bounded_git_output(
         project_root,
         GitAccess::ReadOnly,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--no-ext-diff",
             "--no-textconv",
@@ -560,7 +578,7 @@ fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8(out.stdout).ok()
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Resolve the merge-base of HEAD with the repo default branch (tries the common
@@ -636,11 +654,16 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
     let mut cur_file = String::new();
     let mut pending_delete = false;
 
-    // Markers that, when ADDED (a `+` line), disable a test.
+    // Markers that, when ADDED (a `+` line), disable a test — or focus one, which
+    // skips every other test in its file.
     const SKIP_MARKERS: &[&str] = &[
         "it.skip",
         "describe.skip",
         "test.skip",
+        "it.only",
+        "describe.only",
+        "test.only",
+        "context.only",
         "xit(",
         "xdescribe(",
         "#[ignore]",
@@ -664,6 +687,9 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
     // visible_if: false) - only flag these in a CI / workflow / shell / build file, else the
     // CI-integrity claim false-Fails a change that never touched CI (M2 regression).
     const CI_DISABLE_MARKERS_FILE_SCOPED: &[&str] = &["|| true", "|| exit 0", "if: false"];
+    // Jasmine / jest focus calls, only where they start a statement: `fit(` is also an
+    // estimator's `model.fit(X, y)`.
+    const FOCUS_CALLS: &[&str] = &["fit(", "fdescribe("];
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -684,21 +710,25 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
         // Added line introducing a skip marker (exclude the `+++` header).
         if line.starts_with('+') && !line.starts_with("+++") {
             let added = &line[1..];
-            for m in SKIP_MARKERS {
-                if contains_at_word_boundary(added, m) {
-                    signals.push(format!(
-                        "added skip/ignore (`{}`) in `{}`",
-                        m.trim_end_matches(['(', ' ']),
-                        if cur_file.is_empty() {
-                            "<file>"
-                        } else {
-                            &cur_file
-                        }
-                    ));
-                    break;
-                }
-            }
             let added_lc = added.to_ascii_lowercase();
+            let focus = FOCUS_CALLS
+                .iter()
+                .find(|call| crate::test_integrity::count_statement_call(&added_lc, call) > 0);
+            let marker = SKIP_MARKERS
+                .iter()
+                .find(|m| contains_at_word_boundary(added, m))
+                .or(focus);
+            if let Some(m) = marker {
+                signals.push(format!(
+                    "added skip/ignore (`{}`) in `{}`",
+                    m.trim_end_matches(['(', ' ']),
+                    if cur_file.is_empty() {
+                        "<file>"
+                    } else {
+                        &cur_file
+                    }
+                ));
+            }
             let scoped: &[&str] = if is_ci_or_build_file(&cur_file) {
                 CI_DISABLE_MARKERS_FILE_SCOPED
             } else {
@@ -826,6 +856,112 @@ mod tests {
         let link = tmp.path().join("artifact.json");
         symlink(outside.path(), &link).unwrap();
         assert!(read(tmp.path(), &link).is_empty());
+    }
+
+    #[test]
+    fn ci_weakening_flags_added_only_marker() {
+        // A focused test skips every other test in its file.
+        for added in [
+            "+  it.only('logs in', () => {});",
+            "+describe.only('auth', () => {",
+            "+  test.only('logs in', () => {});",
+            "+  fit('logs in', () => {});",
+            "+fdescribe('auth', () => {",
+        ] {
+            let diff = format!("diff --git a/src/auth.test.js b/src/auth.test.js\n{added}\n");
+            assert!(
+                scan_ci_weakening(&diff)
+                    .iter()
+                    .any(|s| s.contains("skip/ignore")),
+                "`{added}` focuses one test"
+            );
+        }
+        // An estimator's `fit(` is a method call, not jasmine's focused `fit(`.
+        let sklearn = "diff --git a/tests/test_model.py b/tests/test_model.py\n\
+                       +    model.fit(X, y)\n";
+        assert!(scan_ci_weakening(sklearn).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ci_weakening_flags_deleted_test_under_non_ascii_dir() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            crate::external_command::bounded_git_output(
+                &root,
+                GitAccess::Mutating,
+                args,
+                REVIEW_GIT_TIMEOUT,
+                64 * 1024,
+            )
+            .is_some_and(|output| output.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return; // no git on this machine
+        }
+        assert!(git(&["config", "user.email", "t@t"]));
+        assert!(git(&["config", "user.name", "t"]));
+        fs::create_dir_all(root.join("src/用户")).unwrap();
+        fs::write(
+            root.join("src/用户/login.test.js"),
+            "it('logs in', () => { expect(login()).toBe(true); });\n",
+        )
+        .unwrap();
+        // A GBK-encoded source (common in older Chinese Java projects) in the diff.
+        fs::write(
+            root.join("Legacy.java"),
+            b"// \xd3\xc3\xbb\xa7\nclass Legacy {}\n",
+        )
+        .unwrap();
+        assert!(git(&["add", "-A"]));
+        assert!(git(&["commit", "-q", "-m", "seed"]));
+        fs::remove_file(root.join("src/用户/login.test.js")).unwrap();
+        fs::write(
+            root.join("Legacy.java"),
+            b"// \xd3\xc3\xbb\xa7\nclass Legacy { int x; }\n",
+        )
+        .unwrap();
+
+        let claim = ci_integrity_claim(&root);
+        assert_eq!(claim.verdict, Verdict::Fail, "{}", claim.detail);
+        assert!(
+            claim.detail.contains("src/用户/login.test.js"),
+            "{}",
+            claim.detail
+        );
+    }
+
+    #[test]
+    fn runtime_claim_does_not_pass_a_stale_proof() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("app.ts"), "export const x = 1;\n").unwrap();
+        let proof = crate::runtime_proof::RuntimeProof {
+            timestamp: "2026-07-01T00:00:00Z".to_string(),
+            status: crate::runtime_proof::RuntimeStatus::Verified,
+            dev_server: Some("Vite dev server".to_string()),
+            command: Some("npm run dev".to_string()),
+            base_url: Some("http://localhost:5173".to_string()),
+            ready_ms: Some(900),
+            routes: Vec::new(),
+            e2e: None,
+            source_fingerprint: crate::freshness::workspace_fingerprint(root),
+        };
+        assert!(proof.source_fingerprint.is_some());
+        crate::runtime_proof::write_runtime_proof(root, &proof).unwrap();
+        assert_eq!(runtime_claim(root).verdict, Verdict::Pass, "fresh proof");
+
+        // The code moves after the proof was taken.
+        fs::write(root.join("app.ts"), "export const changed = 2;\n").unwrap();
+        let claim = runtime_claim(root);
+        assert_ne!(claim.verdict, Verdict::Pass, "{}", claim.detail);
+        assert!(
+            claim.detail.to_lowercase().contains("stale"),
+            "{}",
+            claim.detail
+        );
     }
 
     #[test]

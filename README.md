@@ -415,7 +415,7 @@ Small tasks have a lightweight path — the router classifies the request and ro
 | `frontend` | Source code + `output/<slug>-frontend-notes.md` |
 | `preview_confirm` | Gate — running app in the browser before backend work begins |
 | `backend` | Source code + `output/<slug>-backend-notes.md` |
-| `quality` | `output/<slug>-quality-gate.json`, `output/<slug>-quality-gate.md`, `runtime-proof.json` |
+| `quality` | `output/<slug>-quality-gate.json`, `output/<slug>-quality-gate.md` |
 | `delivery` | `output/<slug>-delivery-notes.md`, `release/proof-pack-*.zip`, `release/scorecard-*.html` |
 
 ---
@@ -436,7 +436,7 @@ It checks:
 - Leaked API keys, passwords, and connection strings.
 - Audit logs and compliance mapping.
 
-The runtime probe (`umadev verify --runtime`) boots the app and hits its routes, writing `runtime-proof.json` — evidence that the app actually starts and responds.
+The runtime probe (`umadev verify --runtime`) boots the app and hits its routes, writing `runtime-proof.json` — evidence that the app actually starts and responds. When the code has changed since the probe ran, delivery runs it again; if it cannot run here (no dev server or no `curl`), the stale proof is left out of the proof pack and reported as stale.
 
 Outputs:
 

@@ -303,8 +303,11 @@ Rust:  fmt --check → clippy → test → build --release
 Python: install → ruff → mypy → pytest
 Go:    vet → test → build
 Deno:  lint → test → check
+Maven / Gradle: test → build（优先用项目自带的 mvnw / gradlew）
 ```
-缺失 binary → skipped（非 fail），build/test 失败 → critical
+缺失 binary → skipped（非 fail），build/test 失败 → critical。根目录没有项目清单时，逐个校验
+`frontend/`、`backend/`、`server/`、`api/`、`web/`、`client/` 里的子项目（步骤名带目录前缀，如
+`frontend/build`）；一个都校验不了时，会明确提示"构建 / 测试未验证"，不会当作通过。
 
 ## 配置体系
 

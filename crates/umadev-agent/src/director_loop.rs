@@ -1337,7 +1337,7 @@ async fn drive_director_loop_with_idle(
             // path — depth-gated, fail-open. A clean Build leaves a PRD /
             // architecture / UI-UX doc (+ a proof-pack on the deliberate path). This
             // arm is reached only inside `qc.is_clean()`, so the build is clean.
-            director::finalize(options, events, route, true);
+            director::finalize(options, events, route, true).await;
             // SIZING calibration: a clean settle on round 0 (no rework) was a LIGHT
             // actual outcome; a clean settle only AFTER bounded QC fix rounds means the
             // cheap single turn under-sized the work → HEAVY. Advisory, fail-open.
@@ -2600,7 +2600,7 @@ async fn drive_plan_steps(
     // build settled clean (every step Done). MEDIUM M2: passing `clean` here stops
     // finalize from emitting a proof-pack + delivery scorecard for an INCOMPLETE build
     // (blocked / stranded steps), which would disguise it as success. Fail-open inside.
-    director::finalize(options, events, Some(route), clean);
+    director::finalize(options, events, Some(route), clean).await;
     // SELF-EVOLUTION at delivery (a SIDE EFFECT of a clean deliberate delivery, never
     // a driver): reconcile the lesson library — ask the brain (read-only fork,
     // fail-open) to judge each fresh lesson against its similar priors (ADD / UPDATE /
@@ -3870,7 +3870,7 @@ async fn verify_step_acceptance(
             // failing build/test output's bounded verbatim tail for the rework
             // directive. Same check, same events; a pass/skip yields no raw log.
             events.emit(EngineEvent::Note("team · verify build-test".to_string()));
-            let (bt, raw) = director::verify_build_test_raw(options).await;
+            let (bt, raw) = director::verify_build_test_raw(options, events).await;
             let mechanical_build_test_passed_steps = build_test_passed_steps(&bt);
             let mechanical_build_test_failed_steps = build_test_failed_steps(&bt);
             let mut v = with_source_evidence(acceptance_from_verify(bt), src_positive);
@@ -4059,7 +4059,7 @@ async fn verify_step_evidence(
     // tail of its raw output so the rework directive carries the raw evidence too.
     let (build, build_raw) = if needs_build {
         events.emit(EngineEvent::Note("team · verify build-test".to_string()));
-        let (r, raw) = director::verify_build_test_raw(options).await;
+        let (r, raw) = director::verify_build_test_raw(options, events).await;
         (Some(r), raw)
     } else {
         (None, None)
@@ -6820,7 +6820,7 @@ async fn run_auto_qc(
         // bounded tail alongside the one-line blocking distillation. Same check,
         // same note as `director::verify(BuildTest)` emitted before.
         events.emit(EngineEvent::Note("team · verify build-test".to_string()));
-        let (bt, raw) = director::verify_build_test_raw(options).await;
+        let (bt, raw) = director::verify_build_test_raw(options, events).await;
         if let Some(line) = build_test_blocking(&bt) {
             blocking.push(line);
             raw_failure_log = raw;

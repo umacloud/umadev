@@ -68,6 +68,11 @@ pub enum ProjectKind {
     Go,
     /// `deno.json` / `deno.jsonc` present — Deno.
     Deno,
+    /// `pom.xml` present — Java / Kotlin built with Maven.
+    Maven,
+    /// `build.gradle(.kts)` / `settings.gradle(.kts)` present — Java / Kotlin built
+    /// with Gradle.
+    Gradle,
     /// No recognised manifest. Verify is skipped.
     None,
 }
@@ -82,6 +87,8 @@ impl ProjectKind {
             Self::Python => "python",
             Self::Go => "go",
             Self::Deno => "deno",
+            Self::Maven => "maven",
+            Self::Gradle => "gradle",
             Self::None => "none",
         }
     }
@@ -126,13 +133,16 @@ pub struct VerifyStep {
 /// doesn't). Returns `None` when the project type is unrecognised.
 ///
 /// **Sequence per stack:**
-/// - Node → install → lint (if script exists) → typecheck (if tsc) →
-///   test (if script exists) → build (if script exists)
+/// - Node → install → lint (if script exists) → typecheck (the project's own
+///   tsc / vue-tsc, if declared) → test (if script exists) → build (if script
+///   exists)
 /// - Rust → fmt-check → clippy → test → build
 /// - Python → install (`poetry install` / `uv sync` / `pip install`, by how the
 ///   project is declared) → ruff check → mypy (if configured) → pytest
 /// - Go → vet → test → build
 /// - Deno → lint → test → check
+/// - Maven / Gradle → test → build (through the project's `mvnw` / `gradlew`
+///   wrapper when it has one)
 #[must_use]
 pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifyStep>> {
     // Helper: fast step (lint/fmt/vet) — default timeout.
@@ -164,18 +174,23 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
             if has_node_script(workspace, "lint") {
                 steps.push(s("lint", pm, &["run", "lint"], true));
             }
-            // Typecheck: tsc or vue-tsc. Decide by what package.json DECLARES
-            // (not by whether node_modules/.bin/<x> exists at step-build time),
-            // because install runs as the FIRST step at runtime — so the binary
-            // may not exist yet when we build this list, and we'd wrongly pick
-            // `tsc` for a Vue project whose install would have provided vue-tsc.
+            // Typecheck with the project's OWN compiler — vue-tsc or tsc — run through
+            // its package manager: a global `tsc` can be years older than the
+            // project's (TypeScript 4.x rejects a `"moduleResolution": "bundler"`
+            // tsconfig) and fail a healthy project. A project that declares neither
+            // has no compiler of its own to run. Decide by what package.json
+            // DECLARES (not by whether node_modules/.bin/<x> exists at step-build
+            // time), because install runs as the FIRST step at runtime.
             if workspace_file(workspace, "tsconfig.json") {
-                let tsc = if package_json_depends_on(workspace, "vue-tsc") {
-                    "vue-tsc"
-                } else {
-                    "tsc"
-                };
-                steps.push(s("typecheck", tsc, &["--noEmit"], true));
+                let compiler = ["vue-tsc", "typescript"]
+                    .into_iter()
+                    .find(|dep| package_json_depends_on(workspace, dep))
+                    .map(|dep| if dep == "typescript" { "tsc" } else { dep });
+                if let Some(compiler) = compiler {
+                    let mut args = node_bin_args(pm, compiler);
+                    args.push("--noEmit");
+                    steps.push(s("typecheck", pm, &args, true));
+                }
             }
             // Test: only if a test script exists. `npm init`'s placeholder is not a
             // test suite: it runs nothing and always exits 1 (a visible skip, see
@@ -211,7 +226,125 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
             s("test", "deno", &["test"], true),
             s("check", "deno", &["check", "."], false),
         ]),
+        ProjectKind::Maven => Some(java_steps(
+            workspace,
+            ("mvnw", "mvnw.cmd", "mvn"),
+            &["-B", "-q", "test"],
+            &["-B", "-q", "package", "-DskipTests"],
+        )),
+        ProjectKind::Gradle => Some(java_steps(
+            workspace,
+            ("gradlew", "gradlew.bat", "gradle"),
+            &["test", "--no-daemon", "-q", "--console=plain"],
+            &["assemble", "--no-daemon", "-q", "--console=plain"],
+        )),
         ProjectKind::None => None,
+    }
+}
+
+/// The `test` and `build` steps of a Maven or Gradle project, run through the
+/// project's own wrapper (`(unix, windows, installed)`: `mvnw` / `mvnw.cmd` /
+/// `mvn`) when it ships one — the wrapper pins the build tool version the project
+/// was written for — else the installed tool. Skippable: a machine without the
+/// build tool cannot verify the stack, which is reported as not verified rather
+/// than as a failure of the code.
+fn java_steps(
+    workspace: &Path,
+    (unix_wrapper, windows_wrapper, installed): (&str, &str, &str),
+    test: &[&str],
+    build: &[&str],
+) -> Vec<VerifyStep> {
+    let wrapper = if cfg!(windows) {
+        windows_wrapper
+    } else {
+        unix_wrapper
+    };
+    let step = |name: &'static str, args: &[&str]| {
+        let args = args.iter().map(|a| (*a).to_string());
+        let (program, args): (String, Vec<String>) = if !workspace_file(workspace, wrapper) {
+            (installed.to_string(), args.collect())
+        } else if cfg!(windows) {
+            let program = workspace.join(wrapper).to_string_lossy().into_owned();
+            (program, args.collect())
+        } else {
+            // Through `sh`: a wrapper checked out or unzipped without its execute
+            // bit still runs.
+            let script = workspace.join(wrapper).to_string_lossy().into_owned();
+            (
+                "sh".to_string(),
+                std::iter::once(script).chain(args).collect(),
+            )
+        };
+        VerifyStep {
+            name,
+            program,
+            args,
+            skippable: true,
+            timeout_secs: SLOW_STEP_TIMEOUT_SECS,
+        }
+    };
+    vec![step("test", test), step("build", build)]
+}
+
+/// Whether a JDK is reachable the way Maven and Gradle look for one: `JAVA_HOME`,
+/// else `java` on PATH.
+fn java_available() -> bool {
+    std::env::var_os("JAVA_HOME").is_some_and(|home| !home.is_empty()) || which("java")
+}
+
+/// Sub-directories a project commonly keeps its parts in when it has no manifest
+/// at its root (`frontend/` + `backend/`, `client/` + `server/`, `web/` + `api/`).
+const SPLIT_LAYOUT_DIRS: &[&str] = &["frontend", "backend", "server", "api", "web", "client"];
+
+/// The recognised projects in [`SPLIT_LAYOUT_DIRS`], as `(dir, path, kind)` —
+/// verified one by one when the root itself has no manifest.
+fn split_layout_projects(workspace: &Path) -> Vec<(&'static str, PathBuf, ProjectKind)> {
+    SPLIT_LAYOUT_DIRS
+        .iter()
+        .filter(|dir| workspace_directory(workspace, dir))
+        .filter_map(|dir| {
+            let path = workspace.join(dir);
+            let kind = detect_project(&path);
+            (kind != ProjectKind::None).then_some((*dir, path, kind))
+        })
+        .collect()
+}
+
+/// Why nothing could be build/test-verified in `workspace` (a verify that
+/// produced no outcome): the stack found at its root that verify does not
+/// build, or the absence of any project manifest.
+#[must_use]
+pub fn verify_unavailable_note(workspace: &Path) -> String {
+    const OTHER_STACKS: &[(&str, &str)] = &[
+        ("composer.json", "PHP"),
+        ("Gemfile", "Ruby"),
+        ("Package.swift", "Swift"),
+        ("pubspec.yaml", "Dart / Flutter"),
+        ("mix.exs", "Elixir"),
+        ("build.sbt", "Scala"),
+        ("CMakeLists.txt", "C / C++"),
+    ];
+    let dotnet = std::fs::read_dir(workspace).ok().is_some_and(|entries| {
+        entries.flatten().take(4096).any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            [".sln", ".csproj", ".fsproj"]
+                .iter()
+                .any(|ext| name.ends_with(ext))
+        })
+    });
+    let stack = OTHER_STACKS
+        .iter()
+        .find(|(manifest, _)| workspace_file(workspace, manifest))
+        .map(|(_, stack)| *stack)
+        .or(dotnet.then_some(".NET"));
+    match stack {
+        Some(stack) => format!("UmaDev cannot build or test a {stack} project"),
+        None => format!(
+            "no project manifest (package.json, Cargo.toml, go.mod, pyproject.toml / \
+             requirements.txt, pom.xml, build.gradle, deno.json) at the root or in {}/",
+            SPLIT_LAYOUT_DIRS.join("/, ")
+        ),
     }
 }
 
@@ -544,7 +677,8 @@ fn named_test_step(
         // `deno test --filter <name>` is a plain substring match unless it is written
         // as `/re/`; a literal name is safe.
         ProjectKind::Deno => Some(step("deno", vec!["test".into(), "--filter".into(), t])),
-        ProjectKind::None => None,
+        // No single-test filter is wired up for Maven / Gradle yet.
+        ProjectKind::Maven | ProjectKind::Gradle | ProjectKind::None => None,
     }
 }
 
@@ -818,8 +952,9 @@ pub struct DevServer {
 }
 
 /// Detect the best dev-server command for the workspace. Checks Node
-/// frameworks (Vite / Next / Astro / CRA) by dependencies + scripts, then
-/// static-serve for plain HTML, then returns None.
+/// frameworks (Vite / Next / Astro / CRA) by dependencies + scripts, then a
+/// `dev` script, then a page's own `serve` / `start` script, then static-serve
+/// for plain HTML, then returns None.
 ///
 /// When the root dev server looks like UmaDev's own acceptance harness, a real
 /// framework subproject (e.g. `jeecgboot-vue3/`) is preferred. A working root
@@ -899,7 +1034,27 @@ fn detect_dev_server_in_dir(workspace: &Path) -> Option<DevServer> {
             default_url: "http://localhost:3000",
         });
     }
-    // 3. Static HTML — Python's http.server as a zero-dependency fallback.
+    // 3. A page the project serves with its own `serve` / `start` script (a Vue CLI
+    //    app, an Express server that serves `public/`): run that, since serving the
+    //    HTML statically would "verify" the page without the app ever starting.
+    let has_page = ["index.html", "public/index.html"]
+        .iter()
+        .any(|p| workspace_file(workspace, p));
+    if has_page && has_node_script(workspace, "serve") {
+        return Some(DevServer {
+            label: "Node serve script",
+            command: "npm run serve".to_string(),
+            default_url: "http://localhost:8080",
+        });
+    }
+    if has_page && has_node_script(workspace, "start") {
+        return Some(DevServer {
+            label: "Node start script",
+            command: "npm start".to_string(),
+            default_url: "http://localhost:3000",
+        });
+    }
+    // 4. Static HTML — Python's http.server as a zero-dependency fallback.
     //    `http.server` listens on every interface by default, which would
     //    publish the whole directory (`.env`, `.git/`, `.umadev/` chat logs)
     //    to the LAN for the rest of the session: bind loopback only, and
@@ -1067,6 +1222,17 @@ fn skipped_checks(kind: ProjectKind, workspace: &Path) -> Vec<VerifyOutcome> {
     out
 }
 
+/// The `pm` arguments that run the project's own `bin` from its `node_modules`:
+/// `npm exec --no -- <bin>`, `pnpm exec <bin>`, `yarn <bin>`, `bun run <bin>`.
+fn node_bin_args<'a>(pm: &str, bin: &'a str) -> Vec<&'a str> {
+    match pm {
+        "pnpm" => vec!["exec", bin],
+        "yarn" => vec![bin],
+        "bun" => vec!["run", bin],
+        _ => vec!["exec", "--no", "--", bin],
+    }
+}
+
 /// Pick the Node package manager + install args from the workspace's
 /// lockfile. Falls back to `npm` when no lockfile is present.
 fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static str]) {
@@ -1123,10 +1289,12 @@ fn yarn_is_berry(workspace: &Path) -> bool {
 /// Detect the project kind from workspace files.
 ///
 /// Order matters: a workspace containing both `package.json` and
-/// `Cargo.toml` is reported as Rust. A root Cargo manifest is the stronger
-/// project signal, while Rust backend, Tauri, and wasm-bindgen repositories
-/// commonly also carry a root Node manifest. Deno is checked before both
-/// because a `deno.json` repository may carry either manifest for tooling.
+/// `Cargo.toml` (or `pom.xml` / `build.gradle`) is reported as Rust (or
+/// Maven / Gradle). A root Cargo or Java build manifest is the stronger
+/// project signal, while Rust backend, Tauri, wasm-bindgen and Java
+/// repositories commonly also carry a root Node manifest. Deno is checked
+/// before all of them because a `deno.json` repository may carry either
+/// manifest for tooling.
 #[must_use]
 pub fn detect_project(workspace: &Path) -> ProjectKind {
     if workspace_file(workspace, "deno.json") || workspace_file(workspace, "deno.jsonc") {
@@ -1138,6 +1306,20 @@ pub fn detect_project(workspace: &Path) -> ProjectKind {
         // those Node and ran npm while SKIPPING cargo build/cargo test - the compiled backend
         // went unverified.
         ProjectKind::Rust
+    } else if workspace_file(workspace, "pom.xml") {
+        // Maven / Gradle BEFORE Node, for the same reason: a Java backend commonly also
+        // carries a root package.json for commit tooling (husky, commitlint).
+        ProjectKind::Maven
+    } else if [
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+    ]
+    .iter()
+    .any(|manifest| workspace_file(workspace, manifest))
+    {
+        ProjectKind::Gradle
     } else if workspace_file(workspace, "package.json") {
         ProjectKind::Node
     } else if workspace_file(workspace, "go.mod") {
@@ -1337,8 +1519,11 @@ fn verify_timeout_override(raw: Option<&str>) -> Option<u64> {
 }
 
 /// Run the full verify step sequence for `workspace`. Returns one
-/// [`VerifyOutcome`] per step. Returns an empty vec when no project manifest
-/// is present (verify is genuinely meaningless).
+/// [`VerifyOutcome`] per step. With no manifest at the root, each project found
+/// in a split layout (`frontend/`, `backend/`, `server/`, `api/`, `web/`,
+/// `client/`) is verified in its own directory, its steps named after it
+/// (`frontend/build`). Returns an empty vec when no project manifest is present
+/// anywhere ([`verify_unavailable_note`] says why).
 ///
 /// Each step runs independently — a failing step does NOT abort the
 /// remaining steps, so the quality gate sees the complete picture (e.g.
@@ -1352,9 +1537,56 @@ fn verify_timeout_override(raw: Option<&str>) -> Option<u64> {
 /// before the kill, rather than an empty buffer.
 pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
     let kind = detect_project(workspace);
+    let mut outcomes = if kind == ProjectKind::None {
+        // No manifest at the root: verify each part of a split layout
+        // (`frontend/` + `backend/` …) in its own directory, naming its steps
+        // after it (`frontend/build`).
+        let mut outcomes = Vec::new();
+        for (dir, path, kind) in split_layout_projects(workspace) {
+            for mut outcome in run_project_steps(&path, kind).await {
+                outcome.step = format!("{dir}/{}", outcome.step);
+                outcome.command = format!("cd {dir} && {}", outcome.command);
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
+    } else {
+        run_project_steps(workspace, kind).await
+    };
+
+    // FRESHNESS STAMP: record WHICH source tree these outcomes describe, so a later
+    // reader can tell a green run of today's code from a green run of code that has
+    // since changed underneath it (see [`crate::freshness`]). Taken once, after the
+    // sequence settles — the tree as it stands at the moment the verdict is reached.
+    // Fail-open: an unwalkable tree stamps `None` (an unknown, never a mismatch).
+    let fingerprint = crate::freshness::workspace_fingerprint(workspace);
+    for o in &mut outcomes {
+        o.source_fingerprint.clone_from(&fingerprint);
+    }
+
+    outcomes
+}
+
+/// Run the verify step sequence of the `kind` project in `workspace`.
+async fn run_project_steps(workspace: &Path, kind: ProjectKind) -> Vec<VerifyOutcome> {
     let Some(steps) = verify_steps(kind, workspace) else {
         return Vec::new();
     };
+    // Maven and Gradle (and their wrappers) need a JDK; without one they fail for a
+    // reason that is not the project's code, so the steps are recorded as skipped.
+    if matches!(kind, ProjectKind::Maven | ProjectKind::Gradle) && !java_available() {
+        return steps
+            .iter()
+            .map(|step| {
+                VerifyOutcome::skipped_due_to(
+                    kind,
+                    step.name,
+                    format!("{} {}", step.program, step.args.join(" ")),
+                    "no Java runtime: JAVA_HOME is not set and `java` is not on PATH",
+                )
+            })
+            .collect();
+    }
 
     // A global env override, when set, overrides EVERY step's budget.
     let global_override =
@@ -1416,17 +1648,6 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         });
     }
     outcomes.extend(skipped_checks(kind, workspace));
-
-    // FRESHNESS STAMP: record WHICH source tree these outcomes describe, so a later
-    // reader can tell a green run of today's code from a green run of code that has
-    // since changed underneath it (see [`crate::freshness`]). Taken once, after the
-    // sequence settles — the tree as it stands at the moment the verdict is reached.
-    // Fail-open: an unwalkable tree stamps `None` (an unknown, never a mismatch).
-    let fingerprint = crate::freshness::workspace_fingerprint(workspace);
-    for o in &mut outcomes {
-        o.source_fingerprint.clone_from(&fingerprint);
-    }
-
     outcomes
 }
 
@@ -2554,6 +2775,224 @@ mod tests {
         .unwrap();
         let outcome = run_named_test(root, "test_login").await;
         assert_ne!(outcome, NamedTestOutcome::Passed, "test_login never ran");
+    }
+
+    // ── Java and split layouts are verified, not silently skipped ────────────
+
+    #[test]
+    fn maven_and_gradle_projects_are_recognised() {
+        for manifest in ["pom.xml", "build.gradle", "build.gradle.kts"] {
+            let tmp = TempDir::new().unwrap();
+            fs::write(tmp.path().join(manifest), "").unwrap();
+            let kind = detect_project(tmp.path());
+            assert_ne!(kind, ProjectKind::None, "{manifest}");
+            let steps = verify_steps(kind, tmp.path()).expect(manifest);
+            assert!(!steps.is_empty(), "{manifest}");
+        }
+    }
+
+    #[test]
+    fn java_builds_prefer_the_project_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("pom.xml"), "<project/>").unwrap();
+        let names = |steps: &[VerifyStep]| steps.iter().map(|s| s.name).collect::<Vec<_>>();
+        let steps = verify_steps(ProjectKind::Maven, tmp.path()).unwrap();
+        assert_eq!(names(&steps), ["test", "build"]);
+        assert_eq!(steps[0].program, "mvn");
+        assert!(steps
+            .iter()
+            .all(|s| s.skippable && s.args.contains(&"-B".to_string())));
+
+        fs::write(tmp.path().join("mvnw"), "#!/bin/sh\n").unwrap();
+        fs::write(tmp.path().join("mvnw.cmd"), "@echo off\n").unwrap();
+        let steps = verify_steps(ProjectKind::Maven, tmp.path()).unwrap();
+        let wrapper = steps[0].program.clone() + " " + &steps[0].args.join(" ");
+        assert!(wrapper.contains("mvnw"), "{wrapper}");
+
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("build.gradle.kts"), "").unwrap();
+        let steps = verify_steps(ProjectKind::Gradle, tmp.path()).unwrap();
+        assert_eq!(names(&steps), ["test", "build"]);
+        assert_eq!(steps[0].program, "gradle");
+        fs::write(tmp.path().join("gradlew"), "#!/bin/sh\n").unwrap();
+        fs::write(tmp.path().join("gradlew.bat"), "@echo off\n").unwrap();
+        let steps = verify_steps(ProjectKind::Gradle, tmp.path()).unwrap();
+        let wrapper = steps[0].program.clone() + " " + &steps[0].args.join(" ");
+        assert!(wrapper.contains("gradlew"), "{wrapper}");
+        assert!(steps[0].args.contains(&"--no-daemon".to_string()));
+    }
+
+    #[tokio::test]
+    async fn split_frontend_backend_layout_is_verified() {
+        // `frontend/package.json` + `backend/…` and no root manifest: the frontend
+        // build must still run, and its failure must be visible.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("frontend")).unwrap();
+        fs::create_dir_all(root.join("backend")).unwrap();
+        fs::write(
+            root.join("frontend/package.json"),
+            r#"{"name":"web","private":true,"scripts":{"build":"exit 3"}}"#,
+        )
+        .unwrap();
+        let outcomes = run_verify(root).await;
+        assert!(!outcomes.is_empty(), "a split layout is verified");
+        assert!(
+            outcomes.iter().all(|o| o.step.starts_with("frontend/")),
+            "{outcomes:?}"
+        );
+        if which("npm") {
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|o| o.step.ends_with("build") && !o.passed && !o.skipped),
+                "{outcomes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_layout_projects_are_found_only_without_a_root_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for dir in ["frontend", "server", "docs"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("frontend/package.json"), "{}").unwrap();
+        fs::write(root.join("server/go.mod"), "module x\n").unwrap();
+        fs::write(root.join("docs/package.json"), "{}").unwrap();
+        let found: Vec<(&str, ProjectKind)> = split_layout_projects(root)
+            .into_iter()
+            .map(|(dir, _, kind)| (dir, kind))
+            .collect();
+        assert_eq!(
+            found,
+            [("frontend", ProjectKind::Node), ("server", ProjectKind::Go)]
+        );
+    }
+
+    #[test]
+    fn unverifiable_stack_is_named() {
+        let tmp = TempDir::new().unwrap();
+        assert!(verify_unavailable_note(tmp.path()).contains("no project manifest"));
+        fs::write(tmp.path().join("composer.json"), "{}").unwrap();
+        assert!(verify_unavailable_note(tmp.path()).contains("PHP"));
+    }
+
+    // ── the project's own TypeScript, not whatever `tsc` is on PATH ──────────
+
+    #[test]
+    fn typecheck_uses_the_project_local_compiler() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("tsconfig.json"), "{}").unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","devDependencies":{"typescript":"^5.4.0"}}"#,
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        let typecheck = steps
+            .iter()
+            .find(|s| s.name == "typecheck")
+            .expect("a declared TypeScript is type-checked");
+        assert!(
+            typecheck.program != "tsc" && typecheck.program != "vue-tsc",
+            "a bare global compiler: {} {:?}",
+            typecheck.program,
+            typecheck.args
+        );
+        assert!(typecheck.args.iter().any(|a| a == "tsc"), "{typecheck:?}");
+
+        // No TypeScript declared: there is no project compiler to run.
+        fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        assert!(steps.iter().all(|s| s.name != "typecheck"), "{steps:?}");
+    }
+
+    #[test]
+    fn typecheck_runs_through_the_projects_package_manager() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("tsconfig.json"), "{}").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"x","devDependencies":{"vue-tsc":"^2.0.0","typescript":"^5.4.0"}}"#,
+        )
+        .unwrap();
+        let typecheck = |root: &Path| {
+            let step = verify_steps(ProjectKind::Node, root)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == "typecheck")
+                .expect("typecheck");
+            (step.program, step.args)
+        };
+        assert_eq!(
+            typecheck(root),
+            (
+                "npm".to_string(),
+                vec![
+                    "exec".into(),
+                    "--no".into(),
+                    "--".into(),
+                    "vue-tsc".into(),
+                    "--noEmit".into()
+                ]
+            )
+        );
+        fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        assert_eq!(
+            typecheck(root),
+            (
+                "pnpm".to_string(),
+                vec!["exec".into(), "vue-tsc".into(), "--noEmit".into()]
+            )
+        );
+        fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+        fs::write(root.join("yarn.lock"), "").unwrap();
+        assert_eq!(
+            typecheck(root),
+            (
+                "yarn".to_string(),
+                vec!["vue-tsc".into(), "--noEmit".into()]
+            )
+        );
+        fs::remove_file(root.join("yarn.lock")).unwrap();
+        fs::write(root.join("bun.lock"), "{}").unwrap();
+        assert_eq!(
+            typecheck(root),
+            (
+                "bun".to_string(),
+                vec!["run".into(), "vue-tsc".into(), "--noEmit".into()]
+            )
+        );
+    }
+
+    // ── the real server wins over a static page server ───────────────────────
+
+    #[test]
+    fn a_start_script_is_preferred_over_the_static_page_server() {
+        // An Express app serving `public/index.html` from `node server.js`: serving
+        // the page statically "verified" the app without its server ever running.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("public")).unwrap();
+        fs::write(tmp.path().join("public/index.html"), "<h1>hi</h1>").unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"app","scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
+        let ds = detect_dev_server(tmp.path()).expect("a start script");
+        assert_eq!(ds.command, "npm start");
+
+        // A Vue CLI app's `serve` script is its dev server.
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"app","scripts":{"serve":"vue-cli-service serve"}}"#,
+        )
+        .unwrap();
+        let ds = detect_dev_server(tmp.path()).expect("a serve script");
+        assert_eq!(ds.command, "npm run serve");
     }
 
     #[test]

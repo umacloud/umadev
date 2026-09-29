@@ -892,7 +892,7 @@ const JASMINE_DECLARATIONS: &[&str] = &["xit(", "xdescribe(", "xtest(", "fit(", 
 /// its line by nothing but whitespace or a `{`, `(`, `;`, `,`, `}` or an arrow's
 /// `>`. So jasmine's `fit('focuses', …)` counts, while `model.fit(X, y)`,
 /// `def fit(self, X)` and `refit(` do not. `haystack` / `token` are lowercased.
-fn count_statement_call(haystack: &str, token: &str) -> usize {
+pub(crate) fn count_statement_call(haystack: &str, token: &str) -> usize {
     let mut count = 0;
     let mut from = 0;
     while let Some(idx) = haystack[from..].find(token) {
