@@ -152,6 +152,29 @@ impl ScriptedKimi {
                     &permission_request("perm-write", "1:c2", "Write", "Writing /home/dev/.zshrc"),
                 );
             }
+            "surrogate" => {
+                // Kimi's Bash summary is `Running: ` + the command's first 50
+                // UTF-16 units. Here that cut splits the emoji, and Node writes
+                // its first half as a lone `\ud83d` escape.
+                let command = "git commit -m \"修复登录页面在移动端的布局错位问题并优化了加载速度与交互体验 🎉\"";
+                for frame in streamed_call("1:s1", "Bash", "execute", &json!({"command":command})) {
+                    emit(stdout, &frame);
+                }
+                let cut = "Running: git commit -m \"修复登录页面在移动端的布局错位问题并优化了加载速度与交互体 LONE…";
+                let request = permission_request("perm-surrogate", "1:s1", "Bash", cut).to_string();
+                assert!(request.contains("LONE"));
+                writeln!(stdout, "{}", request.replace("LONE", "\\ud83d")).unwrap();
+                stdout.flush().unwrap();
+            }
+            "unparseable" => {
+                // Intact JSON-RPC framing around a value no JSON number can hold.
+                let request = permission_request("perm-unparseable", "1:u1", "Bash", "Running: ls")
+                    .to_string()
+                    .replacen("\"params\":{", "\"params\":{\"n\":1e999999,", 1);
+                assert!(request.contains("1e999999"));
+                writeln!(stdout, "{request}").unwrap();
+                stdout.flush().unwrap();
+            }
             other => panic!("scripted Kimi received an unexpected prompt {other:?}"),
         }
     }
@@ -250,6 +273,12 @@ async fn deny(session: &mut AcpSession, req_id: &str) {
         )
         .await
         .unwrap();
+}
+
+/// What UmaDev answered to the fixture's request `id`.
+fn reply(workspace: &Path, id: &str) -> Value {
+    let reply = std::fs::read_to_string(workspace.join(format!("reply-{id}.json"))).unwrap();
+    serde_json::from_str(&reply).unwrap()
 }
 
 #[tokio::test]
@@ -404,4 +433,69 @@ fn approval_subject_never_judges_a_command_by_its_summary() {
         .1,
         "step 63"
     );
+}
+
+#[tokio::test]
+async fn unpaired_surrogate_permission_request_is_still_answered() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut session = start_scripted_kimi(workspace.path()).await;
+    session.send_turn("surrogate".to_string()).await.unwrap();
+    // The request carries a lone `\ud83d`. Dropping it would leave Kimi's
+    // permission RPC, which has no timeout, waiting for good.
+    let (req_id, action, target) = next_approval(&mut session).await;
+    assert_eq!(action, "Bash");
+    assert_eq!(
+        target,
+        "git commit -m \"修复登录页面在移动端的布局错位问题并优化了加载速度与交互体验 🎉\""
+    );
+    deny(&mut session, &req_id).await;
+    assert_eq!(next_turn_status(&mut session).await, TurnStatus::Completed);
+    assert_eq!(
+        reply(workspace.path(), "perm-surrogate"),
+        json!({"outcome":{"outcome":"selected","optionId":"reject"}})
+    );
+    session.end().await.unwrap();
+}
+
+#[test]
+fn only_unpaired_surrogate_escapes_are_repaired() {
+    // A lone half of either kind becomes U+FFFD; the rest is kept exactly.
+    assert_eq!(
+        parse_peer_frame(r#"{"a":"x\ud83d…","b":"\ude00y"}"#).unwrap(),
+        json!({"a":"x\u{fffd}…","b":"\u{fffd}y"})
+    );
+    // A pair, an escaped backslash before `u` and other escapes are untouched.
+    for intact in [
+        r#"{"a":"\ud83d\ude00"}"#,
+        r#"{"a":"\\ud83d"}"#,
+        r#"{"a":"\"\n\u0041"}"#,
+    ] {
+        assert_eq!(replace_unpaired_surrogate_escapes(intact), None, "{intact}");
+    }
+    assert_eq!(
+        parse_peer_frame(r#"{"a":"\\ud83d"}"#).unwrap(),
+        json!({"a":"\\ud83d"})
+    );
+    // A high half followed by another escape is still unpaired.
+    assert_eq!(
+        replace_unpaired_surrogate_escapes(r#""\uD83D\u0041""#).as_deref(),
+        Some(r#""\ufffd\u0041""#)
+    );
+    // A line broken in any other way still fails.
+    assert!(parse_peer_frame(r#"{"a":"\ud83d"#).is_err());
+}
+
+#[tokio::test]
+async fn unparseable_permission_request_is_answered_not_dropped() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut session = start_scripted_kimi(workspace.path()).await;
+    session.send_turn("unparseable".to_string()).await.unwrap();
+    // The request cannot be shown faithfully, so it is declined as cancelled
+    // instead of left waiting; the turn then ends normally.
+    assert_eq!(next_turn_status(&mut session).await, TurnStatus::Completed);
+    assert_eq!(
+        reply(workspace.path(), "perm-unparseable"),
+        json!({"outcome":{"outcome":"cancelled"}})
+    );
+    session.end().await.unwrap();
 }

@@ -4459,12 +4459,10 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
     let mut terminal_error = "ACP process closed".to_string();
     loop {
         match read_bounded_frame(&mut reader).await {
-            Ok(Some(FrameRead::Line(line))) => {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                dispatch_frame(frame, &context, &mut tools).await;
-            }
+            Ok(Some(FrameRead::Line(line))) => match parse_peer_frame(&line) {
+                Ok(frame) => dispatch_frame(frame, &context, &mut tools).await,
+                Err(error) => settle_unreadable_frame(&line, &error.to_string(), &context).await,
+            },
             Ok(Some(FrameRead::Oversized)) => {
                 terminal_error = "ACP frame exceeded the 64 MiB safety limit".to_string();
                 if context.turn_active.swap(false, Ordering::AcqRel) {
@@ -4509,6 +4507,141 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
                 usage: None,
             })
             .await;
+    }
+}
+
+/// Parse one peer line. A line strict JSON rejects is retried once with every
+/// unpaired UTF-16 surrogate escape replaced by U+FFFD.
+fn parse_peer_frame(line: &str) -> Result<Value, serde_json::Error> {
+    let error = match serde_json::from_str::<Value>(line) {
+        Ok(frame) => return Ok(frame),
+        Err(error) => error,
+    };
+    let Some(repaired) = replace_unpaired_surrogate_escapes(line) else {
+        return Err(error);
+    };
+    let frame = serde_json::from_str::<Value>(&repaired)?;
+    tracing::warn!(
+        bytes = line.len(),
+        "ACP frame carried an unpaired UTF-16 surrogate escape; read it as U+FFFD"
+    );
+    Ok(frame)
+}
+
+/// `line` with every unpaired UTF-16 surrogate escape (`\uD800`-`\uDFFF`
+/// without its partner) replaced by `\uFFFD`, or `None` when it has none.
+///
+/// Node's `JSON.stringify` writes half of an astral character as a lone escape
+/// when a string was cut between its two UTF-16 units, and Kimi cuts command
+/// summaries and long file lines by code unit. serde_json rejects such an
+/// escape, which lost the whole frame. Only these escapes are rewritten, so a
+/// line that is malformed in any other way still fails to parse.
+fn replace_unpaired_surrogate_escapes(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut repaired: Option<String> = None;
+    let mut copied = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            index += 1;
+            continue;
+        }
+        let paired = match utf16_escape_at(bytes, index) {
+            Some(0xD800..=0xDBFF) => utf16_escape_at(bytes, index + 6)
+                .is_some_and(|next| (0xDC00..=0xDFFF).contains(&next)),
+            Some(0xDC00..=0xDFFF) => false,
+            Some(_) => {
+                index += 6;
+                continue;
+            }
+            None => {
+                // Any other escape: step over the backslash and what it escapes.
+                index += 2;
+                continue;
+            }
+        };
+        if paired {
+            index += 12;
+            continue;
+        }
+        let out = repaired.get_or_insert_with(|| String::with_capacity(line.len()));
+        out.push_str(&line[copied..index]);
+        out.push_str("\\ufffd");
+        index += 6;
+        copied = index;
+    }
+    let mut out = repaired?;
+    out.push_str(&line[copied..]);
+    Some(out)
+}
+
+/// The UTF-16 code unit of the `\uXXXX` escape starting at byte `at`.
+fn utf16_escape_at(bytes: &[u8], at: usize) -> Option<u16> {
+    let [b'\\', b'u', digits @ ..] = bytes.get(at..at + 6)? else {
+        return None;
+    };
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u16::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+}
+
+/// The JSON-RPC envelope of a line that is not a valid frame as a whole. Its
+/// other fields are skipped without being decoded.
+#[derive(serde::Deserialize)]
+struct UnreadableEnvelope {
+    id: Option<Value>,
+    method: Option<String>,
+}
+
+/// Settle a peer line that cannot be read as a frame, after logging why.
+///
+/// Dropping it would leave a request unanswered for good: Kimi's permission
+/// RPC has no timeout, so its turn would stall until the idle watchdog. A
+/// permission request is declined as cancelled, any other request gets a
+/// JSON-RPC error, and a response fails the request it answers.
+async fn settle_unreadable_frame(line: &str, reason: &str, context: &ReaderContext) {
+    let envelope = serde_json::from_str::<UnreadableEnvelope>(line).ok();
+    tracing::warn!(
+        bytes = line.len(),
+        method = ?envelope
+            .as_ref()
+            .and_then(|envelope| envelope.method.as_deref())
+            .map(|method| clip_text(method, 80)),
+        reason,
+        "ACP peer line is not a valid frame"
+    );
+    let Some(UnreadableEnvelope {
+        id: Some(id),
+        method,
+    }) = envelope
+    else {
+        return;
+    };
+    match method.as_deref() {
+        Some("session/request_permission") => {
+            let _ = write_permission_response(&context.writer, &id, None, None).await;
+        }
+        Some(_) => {
+            reply_rpc_error(
+                &context.writer,
+                id,
+                -32_700,
+                "ACP request could not be parsed",
+            )
+            .await;
+        }
+        None => {
+            let Some(id) = id.as_u64() else {
+                return;
+            };
+            let sender = context.pending.lock().await.remove(&id);
+            if let Some(sender) = sender {
+                let _ = sender.send(Err(AcpResponseError::message(
+                    "ACP response could not be parsed",
+                )));
+            }
+        }
     }
 }
 

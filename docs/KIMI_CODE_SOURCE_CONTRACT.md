@@ -164,6 +164,12 @@ with other tools.
   real path, including one outside the workspace. A shell command it cannot see
   is never judged by the summary, which Kimi cuts after 50 characters; the
   trust floor asks for it instead.
+- Kimi cuts command summaries and long file lines by UTF-16 code unit, so a
+  frame can carry half of an emoji as a lone `\ud83d` escape, which strict
+  JSON rejects. UmaDev reads such an escape as U+FFFD instead of dropping the
+  frame. A line that still cannot be read is logged, and a request it carries is
+  answered with a cancelled outcome, so Kimi's permission request, which has no
+  timeout, never waits for an answer that will not come.
 - Negotiated ACP image and embedded-resource capabilities drive native image and
   file delivery. Kimi's official adapter accepts UTF-8 text embedded resources
   but explicitly drops blob resources, so UmaDev sends text files natively and
