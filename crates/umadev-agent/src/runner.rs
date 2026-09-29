@@ -6710,7 +6710,11 @@ fn diagnose_failure(err: &str) -> &'static str {
     match crate::base_error::classify(None, None, Some(err)) {
         BaseFailure::RateLimit | BaseFailure::Quota | BaseFailure::Overloaded => "diag.rate_limit",
         BaseFailure::Auth => "diag.not_logged_in",
-        BaseFailure::Network { .. } if timed_out => "diag.timeout",
+        BaseFailure::Network { .. }
+            if timed_out && !crate::base_error::is_gateway_failure(&lower) =>
+        {
+            "diag.timeout"
+        }
         BaseFailure::Network { .. } => "diag.network",
         BaseFailure::Context | BaseFailure::CapabilityUnsupported => "diag.generic",
         BaseFailure::Exited(_) | BaseFailure::Unknown => {
@@ -6726,10 +6730,9 @@ fn diagnose_failure(err: &str) -> &'static str {
             .any(|marker| lower.contains(marker))
             {
                 "diag.not_logged_in"
-            } else if names_gateway_failure(&lower)
-                || ["dns", "network", "unreachable"]
-                    .iter()
-                    .any(|marker| lower.contains(marker))
+            } else if ["dns", "network", "unreachable"]
+                .iter()
+                .any(|marker| lower.contains(marker))
             {
                 "diag.network"
             } else if timed_out {
@@ -6747,24 +6750,10 @@ fn diagnose_failure(err: &str) -> &'static str {
 }
 
 /// Whether a failed worker call is worth an automatic retry: what the shared
-/// classifier calls transient (a rate limit, an overloaded base, a network
-/// blip), plus a gateway 502/503/504, which this one-shot call has always
-/// retried as a provider blip. An exhausted quota or a login failure is final.
+/// classifier calls transient (a rate limit, an overloaded base, a network blip
+/// or a gateway 502/503/504). An exhausted quota or a login failure is final.
 fn worker_failure_is_transient(err: &str) -> bool {
-    let failure = crate::base_error::classify(None, None, Some(err));
-    crate::base_error::is_transient(&failure)
-        || (failure == crate::base_error::BaseFailure::Unknown
-            && names_gateway_failure(&err.to_ascii_lowercase()))
-}
-
-/// An HTTP gateway failure: 502, 503 or 504 as a whole token, or its wording.
-fn names_gateway_failure(lower: &str) -> bool {
-    ["502", "503", "504"]
-        .iter()
-        .any(|code| crate::base_error::contains_token(lower, code))
-        || ["bad gateway", "service unavailable", "gateway timeout"]
-            .iter()
-            .any(|marker| lower.contains(marker))
+    crate::base_error::is_transient(&crate::base_error::classify(None, None, Some(err)))
 }
 
 /// Read the exponential-retry base delay (ms) from

@@ -699,10 +699,33 @@ fn is_network(hay: &str) -> Option<bool> {
     if SSL_MARKERS.iter().any(|m| hay.contains(m)) {
         return Some(true);
     }
-    if NET_MARKERS.iter().any(|m| hay.contains(m)) {
+    if NET_MARKERS.iter().any(|m| hay.contains(m)) || is_gateway_failure(hay) {
         return Some(false);
     }
     None
+}
+
+/// An HTTP gateway failure between the base and its model endpoint: 502, 503 or
+/// 504 as a whole token, or its wording. Relays and proxies answer these for an
+/// upstream that is briefly unreachable, so like any network blip they are worth
+/// a bounded backoff-and-retry.
+pub(crate) fn is_gateway_failure(hay: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "gateway time-out",
+        "网关错误",
+        "网关超时",
+        "服务不可用",
+        "閘道錯誤",
+        "閘道逾時",
+        "服務無法使用",
+    ];
+    ["502", "503", "504"]
+        .iter()
+        .any(|code| contains_token(hay, code))
+        || MARKERS.iter().any(|m| hay.contains(m))
 }
 
 /// Parse the first (optionally signed) integer out of a formatted
@@ -1081,6 +1104,40 @@ mod tests {
         );
         assert_eq!(
             classify(None, Some("the server is at capacity, try again"), None),
+            BaseFailure::Overloaded
+        );
+    }
+
+    #[test]
+    fn gateway_failures_are_transient_network_blips() {
+        for text in [
+            "API Error: 502 Bad Gateway",
+            "upstream returned HTTP 503",
+            "504 Gateway Time-out",
+            "status 503 service unavailable",
+            "网关超时，请稍后重试",
+            "服務無法使用",
+        ] {
+            let failure = classify(None, Some(text), None);
+            assert_eq!(failure, BaseFailure::Network { ssl: false }, "{text}");
+            assert!(is_transient(&failure), "{text}");
+        }
+        // A code inside an id or a byte count is not a gateway failure.
+        assert_eq!(
+            classify(
+                Some("exit status: 1"),
+                Some("request req_5031a7 failed"),
+                None
+            ),
+            BaseFailure::Exited(1)
+        );
+        assert_eq!(
+            classify(None, Some("wrote 5025 bytes"), None),
+            BaseFailure::Unknown
+        );
+        // An overloaded 503 keeps its more specific family.
+        assert_eq!(
+            classify(None, Some("503: the engine is currently overloaded"), None),
             BaseFailure::Overloaded
         );
     }
