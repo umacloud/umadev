@@ -327,8 +327,10 @@ fn python_tool(
         PythonEnv::Pip => &[],
     };
     match runner.split_first() {
-        Some((program, args)) if available(tool) || python_project_declares(workspace, tool) => {
-            let mut argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        Some((program, runner_args))
+            if available(tool) || python_project_declares(workspace, tool) =>
+        {
+            let mut argv: Vec<String> = runner_args.iter().map(|a| (*a).to_string()).collect();
             argv.push(tool.to_string());
             ((*program).to_string(), argv)
         }
@@ -639,14 +641,14 @@ fn named_test_verdict(
     out: &VerifyOutcome,
     truncated: bool,
 ) -> NamedTestOutcome {
-    let text = format!("{}\n{}", out.stdout, out.stderr);
+    let log = format!("{}\n{}", out.stdout, out.stderr);
     let sighting = match kind {
-        ProjectKind::Rust => cargo_test_sighting(&text, test),
-        ProjectKind::Python => pytest_sighting(&text, test, out.exit_code),
-        ProjectKind::Go => go_test_sighting(&text),
-        ProjectKind::Node => node_test_sighting(&text),
-        ProjectKind::Deno => deno_test_sighting(&text),
-        _ => TestSighting::Unknown,
+        ProjectKind::Rust => cargo_test_sighting(&log, test),
+        ProjectKind::Python => pytest_sighting(&log, test, out.exit_code),
+        ProjectKind::Go => go_test_sighting(&log),
+        ProjectKind::Node => node_test_sighting(&log),
+        ProjectKind::Deno => deno_test_sighting(&log),
+        ProjectKind::None => TestSighting::Unknown,
     };
     match sighting {
         TestSighting::Passed => NamedTestOutcome::Passed,
@@ -661,11 +663,11 @@ fn named_test_verdict(
 
 /// cargo / libtest: `test tests::adds_numbers ... ok` lines, matched on the exact
 /// name or the last path segments (`adds_numbers`, `tests::adds_numbers`).
-fn cargo_test_sighting(text: &str, test: &str) -> TestSighting {
+fn cargo_test_sighting(log: &str, test: &str) -> TestSighting {
     let suffix = format!("::{test}");
     let mut harness_ran = false;
     let mut passed = false;
-    for line in text.lines().map(str::trim) {
+    for line in log.lines().map(str::trim) {
         harness_ran |= line.starts_with("running ") || line.starts_with("test result:");
         let Some((name, result)) = line
             .strip_prefix("test ")
@@ -694,9 +696,9 @@ fn cargo_test_sighting(text: &str, test: &str) -> TestSighting {
 /// pytest `-v`: `tests/test_a.py::test_login PASSED` lines and the summary's
 /// `FAILED tests/test_a.py::test_login - …`, matched on the node id's last part
 /// (a parametrized `test_login[1-2]` included). Exit 5 means nothing was collected.
-fn pytest_sighting(text: &str, test: &str, exit_code: i32) -> TestSighting {
+fn pytest_sighting(log: &str, test: &str, exit_code: i32) -> TestSighting {
     let mut passed = false;
-    for line in text.lines() {
+    for line in log.lines() {
         let is_ours = line.split_whitespace().any(|token| {
             token.rsplit_once("::").is_some_and(|(_, last)| {
                 last.split_once('[').map_or(last, |(name, _)| name) == test
