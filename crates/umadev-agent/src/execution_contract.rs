@@ -332,7 +332,9 @@ fn normalized_unique<'a>(items: impl IntoIterator<Item = &'a str>) -> Vec<String
         .collect()
 }
 
-fn normalize_claim(raw: &str) -> Option<String> {
+/// A workspace-relative path claim, or `None` for an absolute, parent-escaping
+/// or malformed one.
+pub(crate) fn normalize_claim(raw: &str) -> Option<String> {
     let path = raw.trim().trim_matches(['`', '"', '\'']).replace('\\', "/");
     if path.starts_with('/') || path.as_bytes().get(1) == Some(&b':') {
         return None;

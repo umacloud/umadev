@@ -98,6 +98,34 @@ fn out_of_scope_final_write_is_blocking_not_success() {
     assert!(!blocked.contains("[ok]"));
 }
 
+#[tokio::test]
+async fn fallback_edit_of_a_path_glued_to_chinese_words_passes_the_contract() {
+    // Chinese users often write a path with no space around it. When routing
+    // falls back, the scope must claim that file rather than the whole run of
+    // glued words, so the requested edit settles instead of failing the
+    // execution contract.
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src/pages")).unwrap();
+    std::fs::write(root.path().join("src/pages/index.tsx"), "<h1>Home</h1>\n").unwrap();
+    let text = "把src/pages/index.tsx的标题改成欢迎";
+    let routed = umadev_agent::route_with_context_and_source(
+        None,
+        &crate::route_floor_options(root.path(), text, umadev_agent::TrustMode::Guarded),
+        text,
+        "",
+    )
+    .await;
+    assert!(routed.plan.class.mutates_workspace(), "{:?}", routed.plan);
+    let postcondition =
+        ResidentExecutionPostcondition::capture(root.path(), &routed.plan, text).unwrap();
+
+    std::fs::write(root.path().join("src/pages/index.tsx"), "<h1>欢迎</h1>\n").unwrap();
+    assert_eq!(
+        postcondition.validate_final(root.path()).unwrap(),
+        ["src/pages/index.tsx"]
+    );
+}
+
 #[test]
 fn quick_edit_change_budget_is_enforced_over_actual_content_diff() {
     let root = tempfile::tempdir().unwrap();

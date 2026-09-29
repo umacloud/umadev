@@ -483,6 +483,8 @@ pub async fn route_with_context_and_readonly_session(
         );
     }
 
+    let mut brain = brain;
+    brain.scope = workspace_scope_claims(&brain.scope, requirement, &options.project_root);
     let plan = apply_route_ceilings(
         brain_to_route_in_mode(&brain, requirement, options.mode),
         requirement,
@@ -978,14 +980,35 @@ pub fn looks_like_work_request(text: &str) -> bool {
 /// are candidate `scope` claims for retrieval and execution validation; an empty
 /// result is fine because a lightweight turn may discover a bounded source surface.
 fn path_hints_from_text(text: &str) -> Vec<String> {
-    const EXTS: &[&str] = &[
-        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".css", ".html", ".json",
-        ".toml", ".yaml", ".yml", ".md", ".vue", ".svelte", ".sql",
-    ];
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for raw in text.split(|c: char| {
-        c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；' | '(' | ')' | '`')
+        c.is_whitespace()
+            || matches!(
+                c,
+                ',' | '，'
+                    | '、'
+                    | ';'
+                    | '；'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '`'
+                    | '：'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '「'
+                    | '」'
+                    | '『'
+                    | '』'
+                    | '《'
+                    | '》'
+                    | '【'
+                    | '】'
+            )
     }) {
         let tok = raw
             .trim_matches(|c: char| {
@@ -995,18 +1018,65 @@ fn path_hints_from_text(text: &str) -> Vec<String> {
         if tok.is_empty() {
             continue;
         }
-        let lower = tok.to_lowercase();
-        let looks_pathy = tok.contains('/')
-            || EXTS.iter().any(|e| lower.ends_with(e))
-            || matches!(lower.as_str(), ".gitignore" | ".umadevrc");
-        if looks_pathy && seen.insert(tok.to_string()) {
-            out.push(tok.to_string());
-            if out.len() >= 8 {
-                break;
+        for hint in path_hints_in_token(tok) {
+            if seen.insert(hint.to_string()) {
+                out.push(hint.to_string());
+                if out.len() >= 8 {
+                    return out;
+                }
             }
         }
     }
     out
+}
+
+/// The path claims in one token. Chinese users often glue a path to the words
+/// around it (`把src/pages/index.tsx的标题改成欢迎`); the claim is the ASCII path
+/// run, not the whole token, which would reject the edit to the real file. A
+/// token whose ASCII runs are only fragments (`配置/发布.toml`) is itself a
+/// non-ASCII path and stays whole.
+fn path_hints_in_token(tok: &str) -> Vec<&str> {
+    if tok.is_ascii() {
+        return if looks_like_path(tok) {
+            vec![tok]
+        } else {
+            Vec::new()
+        };
+    }
+    let runs: Vec<&str> = tok
+        .split(|c: char| {
+            !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '\\' | '@' | '+'))
+        })
+        .map(|run| run.trim_end_matches('.'))
+        .filter(|run| {
+            // A run that starts at a separator, or is only an extension, is the
+            // tail of a longer non-ASCII path.
+            !run.starts_with(['/', '\\'])
+                && looks_like_path(run)
+                && run
+                    .rsplit_once('.')
+                    .map_or(*run, |(stem, _)| stem)
+                    .chars()
+                    .any(|c| c.is_ascii_alphanumeric())
+        })
+        .collect();
+    if runs.is_empty() && looks_like_path(tok) {
+        vec![tok]
+    } else {
+        runs
+    }
+}
+
+/// A path separator, a known source extension, or a known dotfile.
+fn looks_like_path(tok: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".css", ".html", ".json",
+        ".toml", ".yaml", ".yml", ".md", ".vue", ".svelte", ".sql",
+    ];
+    let lower = tok.to_lowercase();
+    tok.contains('/')
+        || EXTS.iter().any(|e| lower.ends_with(e))
+        || matches!(lower.as_str(), ".gitignore" | ".umadevrc")
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -2641,6 +2711,31 @@ fn brain_unavailable_chat_route() -> RoutePlan {
         est_budget: Budget::for_route(RouteClass::Chat, Depth::Fast),
         confidence: 0.3,
     }
+}
+
+/// The model's scope entries that name something real: a path that exists under
+/// the workspace, or one the user wrote in the request (a file the turn may
+/// create). The scope becomes the resident turn's write allow-list, so a label
+/// (`登录模块`), a guessed path that does not exist, or a path outside the
+/// workspace would otherwise reject the correct edit as out of scope.
+fn workspace_scope_claims(
+    scope: &[String],
+    requirement: &str,
+    root: &std::path::Path,
+) -> Vec<String> {
+    let named: HashSet<String> = path_hints_from_text(requirement)
+        .iter()
+        .filter_map(|hint| crate::execution_contract::normalize_claim(hint))
+        .collect();
+    scope
+        .iter()
+        .filter(|entry| {
+            crate::execution_contract::normalize_claim(entry).is_some_and(|claim| {
+                named.contains(&claim) || std::fs::symlink_metadata(root.join(&claim)).is_ok()
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Union two scope lists (floor first), deduped, bounded to 12 entries.

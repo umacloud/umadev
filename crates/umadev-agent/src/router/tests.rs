@@ -856,6 +856,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn path_hints_split_cjk_glued_paths() {
+        // Chinese users often write a path with no space around it; the claim
+        // is the path, not the whole run of glued words.
+        for text in [
+            "把src/pages/index.tsx的标题改成欢迎",
+            "修复src/pages/index.tsx里的空指针",
+            "文件：src/pages/index.tsx，把标题改成欢迎",
+            "把“src/pages/index.tsx”里的标题改成欢迎",
+            "把「src/pages/index.tsx」里的标题改成欢迎",
+        ] {
+            assert_eq!(
+                path_hints_from_text(text),
+                vec!["src/pages/index.tsx".to_string()],
+                "{text}"
+            );
+        }
+        assert_eq!(
+            path_hints_from_text("把.github/workflows/ci.yml里的缓存关掉"),
+            vec![".github/workflows/ci.yml".to_string()]
+        );
+        // A name that is not ASCII stays whole instead of splitting into
+        // fragments such as `/` or `.toml`.
+        assert_eq!(
+            path_hints_from_text("修改 配置/发布.toml 的版本号"),
+            vec!["配置/发布.toml".to_string()]
+        );
+
+        // The fallback edit of that exact file passes its execution contract.
+        let text = "把src/pages/index.tsx的标题改成欢迎";
+        let route = safe_fallback_route(text);
+        assert!(route.class.mutates_workspace());
+        let contract = crate::execution_contract::ExecutionContract::from_route(&route, text);
+        assert!(
+            contract
+                .validate_changed_paths(["src/pages/index.tsx"])
+                .is_empty(),
+            "{:?}",
+            contract.allowed_paths
+        );
+    }
+
+    #[tokio::test]
+    async fn model_scope_keeps_only_paths_in_the_workspace() {
+        // The model's scope becomes the resident turn's write allow-list. A
+        // label or a guessed path must not become a claim that rejects the
+        // correct edit; paths that exist in the workspace stay.
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src/pages")).unwrap();
+        std::fs::write(workspace.path().join("src/pages/index.tsx"), "").unwrap();
+        let mut options = opts();
+        options.project_root = workspace.path().to_path_buf();
+        let mut session = ForkReplies(
+            r#"{"class":"quick_edit","authorization":"mutating","kind":"light","complexity":"simple","scope":["登录模块","src/login.rs","../outside.rs","/etc/passwd","src/pages/index.tsx","./src/pages"],"confidence":0.9}"#,
+        );
+        let (routed, readonly) = route_with_context_and_readonly_session(
+            Some(&mut session),
+            &options,
+            "把首页标题改成欢迎",
+            "",
+        )
+        .await;
+        close_readonly_session(readonly).await;
+        assert_eq!(routed.source, RouteSource::Brain);
+        assert_eq!(
+            routed.plan.scope,
+            vec!["src/pages/index.tsx".to_string(), "./src/pages".to_string()]
+        );
+
+        // A file the user names in the request may not exist yet: the turn is
+        // asked to create it, so it stays claimed.
+        let mut session = ForkReplies(
+            r#"{"class":"quick_edit","authorization":"mutating","kind":"light","complexity":"simple","scope":["src/pages/about.tsx","src/pages/index.tsx","src/router.tsx"],"confidence":0.9}"#,
+        );
+        let (routed, readonly) = route_with_context_and_readonly_session(
+            Some(&mut session),
+            &options,
+            "新建 src/pages/about.tsx，并在首页加一个链接",
+            "",
+        )
+        .await;
+        close_readonly_session(readonly).await;
+        assert_eq!(
+            routed.plan.scope,
+            vec![
+                "src/pages/about.tsx".to_string(),
+                "src/pages/index.tsx".to_string()
+            ]
+        );
+    }
+
     // ── Model-first routing + deterministic authorization ceiling ──
 
     #[test]
