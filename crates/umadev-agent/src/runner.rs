@@ -7615,6 +7615,58 @@ error TS2304: Cannot find name 'Foo'
         assert!(out.is_none(), "should give up after max_retries");
     }
 
+    /// Always fails with a fixed error and counts how often it was called.
+    struct CountingFailRuntime {
+        msg: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Runtime for CountingFailRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(RuntimeError::HostProcess(self.msg.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn try_generate_does_not_retry_exhausted_quota() {
+        // An exhausted plan does not clear in seconds, and a status code inside
+        // a request id is not a gateway error: neither is worth a retry that
+        // re-spawns the base CLI.
+        set_retry_base_ms_for_tests(1);
+        for msg in [
+            "You exceeded your current quota, please check your plan and billing details.",
+            "usage limit reached for this account",
+            "unexpected response for request req_5031a7 from claude-3-haiku-20240307",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let runner = AgentRunner::new(
+                CountingFailRuntime {
+                    msg,
+                    calls: Arc::clone(&calls),
+                },
+                opts(tmp.path()),
+            );
+            runner.start().unwrap();
+            let p = crate::experts::research_prompt("demo", "req", "");
+            assert!(runner.try_generate(Phase::Research, p).await.is_none());
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "{msg}"
+            );
+        }
+    }
+
     #[test]
     fn start_writes_initial_state() {
         let tmp = TempDir::new().unwrap();
@@ -8143,6 +8195,33 @@ error TS2304: Cannot find name 'Foo'
         ] {
             assert!(!umadev_i18n::tl(key).is_empty(), "{key} must be localized");
         }
+    }
+
+    #[test]
+    fn diagnose_ignores_status_digits_inside_ids() {
+        // A model name or request id that happens to contain 403 or 503 is not
+        // an auth failure or a gateway outage.
+        assert_ne!(
+            diagnose_failure("unexpected response from claude-3-haiku-20240307"),
+            "diag.not_logged_in"
+        );
+        assert_ne!(
+            diagnose_failure("request req_5031a7 returned an unexpected payload"),
+            "diag.network"
+        );
+        // The same codes as whole tokens still classify.
+        assert_eq!(
+            diagnose_failure("http 403 forbidden"),
+            "diag.not_logged_in"
+        );
+        assert_eq!(
+            diagnose_failure("503 service unavailable"),
+            "diag.network"
+        );
+        assert_eq!(
+            diagnose_failure("you exceeded your current quota"),
+            "diag.rate_limit"
+        );
     }
 
     #[tokio::test]

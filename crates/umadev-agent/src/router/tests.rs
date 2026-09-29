@@ -27,6 +27,112 @@ mod tests {
         }
     }
 
+    /// A resident session whose read-only fork answers the routing consult with
+    /// a fixed reply, so a test drives the live `consult_route` path.
+    struct ForkReplies(&'static str);
+    /// The fork itself: it streams the reply and finishes the turn.
+    struct ScriptedFork(std::collections::VecDeque<umadev_runtime::SessionEvent>);
+    #[async_trait]
+    impl BaseSession for ScriptedFork {
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            self.0.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _request: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl BaseSession for ForkReplies {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Ok(Box::new(ScriptedFork(std::collections::VecDeque::from([
+                umadev_runtime::SessionEvent::TextDelta(self.0.to_string()),
+                umadev_runtime::SessionEvent::TurnDone {
+                    status: umadev_runtime::TurnStatus::Completed,
+                    usage: None,
+                },
+            ]))))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            None
+        }
+        async fn respond(
+            &mut self,
+            _request: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn brain_route_parse_tolerates_null_strings() {
+        // Models write `null` for "no question" or "no kind". That is an empty
+        // value, not a broken reply that throws the whole verdict away.
+        let brain: BrainRoute = serde_json::from_str(
+            r#"{"class":"build","authorization":"mutating","kind":null,"complexity":"complex","clarify_question":null}"#,
+        )
+        .expect("a null string field is an empty value");
+        assert_eq!(brain.class, "build");
+        assert_eq!(brain.authorization, "mutating");
+        assert!(brain.kind.is_empty());
+        assert!(brain.clarify_question.is_empty());
+
+        let odd: BrainRoute = serde_json::from_str(
+            r#"{"class":null,"kind":7,"complexity":true,"authorization":null,"clarify_question":{}}"#,
+        )
+        .expect("a non-string scalar is an empty value too");
+        for field in [
+            &odd.class,
+            &odd.kind,
+            &odd.complexity,
+            &odd.authorization,
+            &odd.clarify_question,
+        ] {
+            assert!(field.is_empty(), "{field:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn consult_route_keeps_a_model_verdict_that_has_null_fields() {
+        let mut session = ForkReplies(
+            r#"{"class":"build","authorization":"mutating","kind":"greenfield","complexity":"complex","clarify_question":null,"clarify_options":null,"confidence":0.9}"#,
+        );
+        let (routed, readonly) = route_with_context_and_readonly_session(
+            Some(&mut session),
+            &opts(),
+            "做一个带登录的 SaaS 仪表盘",
+            "",
+        )
+        .await;
+        close_readonly_session(readonly).await;
+        assert_eq!(routed.source, RouteSource::Brain);
+        assert_eq!(routed.fallback_reason, None);
+        assert_eq!(routed.plan.class, RouteClass::Build);
+        assert!(routed.plan.needs_clarify.is_none());
+    }
+
     #[test]
     fn triage_prompt_sizes_a_document_as_docs_only_simple() {
         // The PRIMARY brain-first fix: the triage prompt must instruct the borrowed
@@ -445,6 +551,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn route_rationale_follows_ui_language() {
+        // The intent card shows the rationale under a localized headline, so it
+        // must come from the catalog of the current UI language.
+        for (class, depth, key) in [
+            (RouteClass::Chat, Depth::Fast, "intent.rationale.chat"),
+            (RouteClass::Explain, Depth::Fast, "intent.rationale.explain"),
+            (RouteClass::QuickEdit, Depth::Fast, "intent.rationale.quick_edit"),
+            (RouteClass::Debug, Depth::Fast, "intent.rationale.debug_fast"),
+            (RouteClass::Debug, Depth::Standard, "intent.rationale.debug_deep"),
+            (RouteClass::Build, Depth::Standard, "intent.rationale.build"),
+        ] {
+            let route = RoutePlan {
+                class,
+                kind: TaskKind::Light,
+                depth,
+                team: Vec::new(),
+                scope: Vec::new(),
+                needs_clarify: None,
+                est_budget: Budget::for_route(class, depth),
+                confidence: 0.5,
+            };
+            assert_eq!(route.rationale(), umadev_i18n::tl(key), "{key}");
+            let english = umadev_i18n::t(umadev_i18n::Lang::En, key);
+            assert!(!english.is_empty() && english != key, "{key}");
+            assert!(
+                !english
+                    .chars()
+                    .any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)),
+                "{key}: {english}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_deliberate_build_gets_a_higher_turn_cap_than_a_chat() {
         // The route's turn cap is derived from its depth: a real build (Standard/Deep)
@@ -714,6 +854,76 @@ mod tests {
         ] {
             assert!(hints.iter().any(|hint| hint == expected), "{expected}");
         }
+    }
+
+    #[test]
+    fn path_hints_split_cjk_glued_paths() {
+        // Chinese users often write a path with no space around it; the claim
+        // is the path, not the whole run of glued words.
+        for text in [
+            "把src/pages/index.tsx的标题改成欢迎",
+            "修复src/pages/index.tsx里的空指针",
+            "文件：src/pages/index.tsx，把标题改成欢迎",
+            "把“src/pages/index.tsx”里的标题改成欢迎",
+            "把「src/pages/index.tsx」里的标题改成欢迎",
+        ] {
+            assert_eq!(
+                path_hints_from_text(text),
+                vec!["src/pages/index.tsx".to_string()],
+                "{text}"
+            );
+        }
+        assert_eq!(
+            path_hints_from_text("把.github/workflows/ci.yml里的缓存关掉"),
+            vec![".github/workflows/ci.yml".to_string()]
+        );
+        // A name that is not ASCII stays whole instead of splitting into
+        // fragments such as `/` or `.toml`.
+        assert_eq!(
+            path_hints_from_text("修改 配置/发布.toml 的版本号"),
+            vec!["配置/发布.toml".to_string()]
+        );
+
+        // The fallback edit of that exact file passes its execution contract.
+        let text = "把src/pages/index.tsx的标题改成欢迎";
+        let route = safe_fallback_route(text);
+        assert!(route.class.mutates_workspace());
+        let contract = crate::execution_contract::ExecutionContract::from_route(&route, text);
+        assert!(
+            contract
+                .validate_changed_paths(["src/pages/index.tsx"])
+                .is_empty(),
+            "{:?}",
+            contract.allowed_paths
+        );
+    }
+
+    #[tokio::test]
+    async fn model_scope_keeps_only_paths_in_the_workspace() {
+        // The model's scope becomes the resident turn's write allow-list. A
+        // label or a guessed path must not become a claim that rejects the
+        // correct edit; paths that exist in the workspace stay.
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src/pages")).unwrap();
+        std::fs::write(workspace.path().join("src/pages/index.tsx"), "").unwrap();
+        let mut options = opts();
+        options.project_root = workspace.path().to_path_buf();
+        let mut session = ForkReplies(
+            r#"{"class":"quick_edit","authorization":"mutating","kind":"light","complexity":"simple","scope":["登录模块","src/login.rs","../outside.rs","/etc/passwd","src/pages/index.tsx","./src/pages"],"confidence":0.9}"#,
+        );
+        let (routed, readonly) = route_with_context_and_readonly_session(
+            Some(&mut session),
+            &options,
+            "把首页标题改成欢迎",
+            "",
+        )
+        .await;
+        close_readonly_session(readonly).await;
+        assert_eq!(routed.source, RouteSource::Brain);
+        assert_eq!(
+            routed.plan.scope,
+            vec!["src/pages/index.tsx".to_string(), "./src/pages".to_string()]
+        );
     }
 
     // ── Model-first routing + deterministic authorization ceiling ──
@@ -1355,6 +1565,15 @@ mod tests {
             "提交当前改动功能有 bug",
         ] {
             assert!(!request_is_git_commit(request), "{request}");
+            // The UI checks the wider host firewall before any routing. Only a
+            // commit whose scope is missing is held back for a clearer request;
+            // everything else here must stay ordinary conversation or work.
+            let ambiguous_commit = matches!(request, "执行提交" | "提交这些文件");
+            assert_eq!(
+                request_has_git_commit_operation(request),
+                ambiguous_commit,
+                "{request}"
+            );
         }
     }
 
@@ -1962,6 +2181,150 @@ mod tests {
     }
 
     #[test]
+    fn firewall_passes_submit_feature_requests_to_routing() {
+        // 提交 is also the everyday word for "submit". A button label, a form
+        // flow, a notification, or a hook that mentions Git is product work for
+        // the base, so the host firewall must let it reach normal routing.
+        for request in [
+            "加一个确认提交按钮",
+            "把按钮文字改成确认提交",
+            "用户提交后推送通知给管理员",
+            "创建一个提交反馈的页面",
+            "创建一个提交按钮",
+            "创建一个提交模板",
+            "create a commit hook",
+            "提交文件时显示上传进度",
+            "写一个统计 git 提交次数的脚本",
+            "给项目加一个 git commit 前自动跑 eslint 的钩子",
+            "make a commitment to ship the beta this week",
+            "确认提交后跳转到首页",
+            "提交修改后的表单",
+            "提交代码时自动格式化",
+            "写一个脚本，提交代码前自动运行 lint",
+            "用户填写完表单后提交",
+            "add a hook that runs eslint before git commit",
+            "写一个 git commit 消息生成器",
+            "给仓库加一个 commit-msg 钩子",
+            "git commit 前自动运行测试",
+        ] {
+            assert!(!request_has_git_commit_operation(request), "{request}");
+            assert!(!request_is_git_commit(request), "{request}");
+        }
+    }
+
+    #[test]
+    fn submit_wording_does_not_force_read_only() {
+        let writable = BrainRoute {
+            class: "quick_edit".to_string(),
+            authorization: "mutating".to_string(),
+            kind: "light".to_string(),
+            complexity: "simple".to_string(),
+            ..Default::default()
+        };
+        let route = |request: &str| {
+            apply_route_ceilings(
+                brain_to_route_in_mode(&writable, request, crate::trust::TrustMode::Guarded),
+                request,
+                crate::trust::TrustMode::Guarded,
+            )
+        };
+        // A status/error word or a question word next to an everyday 提交 is
+        // not a Git diagnostic or a commit question: the edit stays writable.
+        for request in [
+            "给提交按钮加上 loading 状态",
+            "提交按钮在加载时显示 loading 状态",
+            "把提交接口的错误提示改成中文",
+            "提交按钮样式有问题，改成蓝色",
+            "修改提交记录页面的状态显示",
+            "提交订单接口报错 500，修一下",
+            "提交修改后的表单报错了，帮我修一下",
+            "做一个用户注册页面，提交时校验邮箱格式是否正确",
+            "表单提交前检查是否登录",
+            "校验失败时不要提交表单",
+            "build a committee voting page where members can vote",
+        ] {
+            assert!(!request_has_git_commit_operation(request), "{request}");
+            assert!(route(request).class.mutates_workspace(), "{request}");
+        }
+        // Questions and failure reports about a real Git commit stay read-only.
+        for request in [
+            "提交这些文件吗？",
+            "可以提交 README.md 吗？",
+            "不要提交当前改动",
+            "git commit 失败了，帮我排查",
+            "代码提交失败了，帮我看看",
+            "提交代码报错了",
+        ] {
+            assert!(!route(request).class.mutates_workspace(), "{request}");
+        }
+    }
+
+    #[test]
+    fn common_commit_phrasings_use_host_transaction() {
+        for request in [
+            "提交代码",
+            "帮我提交一下代码",
+            "把代码提交了",
+            "提交改动",
+            "提交所有修改",
+            "提交当前代码",
+            "把修改提交到本地仓库",
+            "commit",
+            "commit it",
+            "commit the code",
+            "提交代码吧",
+            "把刚才的修改提交一下",
+            "將代碼提交",
+            "提交當前代碼",
+            "please commit",
+            "commit the current changes",
+        ] {
+            assert_eq!(
+                parse_git_commit_intent(request),
+                GitCommitIntent::NaturalAllDirty,
+                "{request}"
+            );
+            assert!(request_is_git_commit(request), "{request}");
+            assert!(request_has_git_commit_operation(request), "{request}");
+            let host = parse_host_git_commit_request(request)
+                .unwrap_or_else(|| panic!("host-owned commit: {request}"));
+            assert_eq!(host.verifier, None, "{request}");
+            let route = deterministic_route(request);
+            assert_eq!(route.class, RouteClass::QuickEdit, "{request}");
+            assert!(route.team.is_empty(), "{request}");
+        }
+        assert_eq!(
+            parse_git_commit_intent("提交申请表单"),
+            GitCommitIntent::NotCommit
+        );
+
+        // A commit named together with another action, or in the middle of a
+        // sentence, stays behind the host boundary: refused, never delegated.
+        for request in [
+            "提交代码，然后推送",
+            "提交代码并推送",
+            "提交代码到远程仓库",
+            "把代码提交到远程",
+            "commit it and push",
+            "commit and push",
+            "确认提交，然后推送",
+            "修复bug然后提交代码",
+            "fix the bug and commit",
+            "提交后推送",
+            "提交完推送",
+            "帮我做一次 git commit",
+            "i want you to commit these changes",
+            "我想提交git记录",
+        ] {
+            assert!(request_has_git_commit_operation(request), "{request}");
+            assert!(
+                parse_host_git_commit_request(request).is_none_or(|parsed| parsed.verifier.is_some()),
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_git_commits_are_a_strong_read_only_route_ceiling() {
         let mutating = BrainRoute {
             class: "build".to_string(),
@@ -2150,6 +2513,71 @@ mod tests {
             crate::trust::TrustMode::Plan,
         );
         assert!(!planned.class.mutates_workspace());
+    }
+
+    #[test]
+    fn mutation_floor_never_promotes_plain_questions() {
+        // Each question opens with a noun built from a write verb (开发环境,
+        // 实现原理, 更新日志…). A correct read-only verdict must stand; the floor
+        // must not turn the question into a writable turn on a new branch.
+        let read_only = BrainRoute {
+            class: "explain".to_string(),
+            authorization: "read_only".to_string(),
+            kind: "light".to_string(),
+            complexity: "simple".to_string(),
+            confidence: 0.99,
+            ..Default::default()
+        };
+        let modes = [
+            crate::trust::TrustMode::Guarded,
+            crate::trust::TrustMode::Auto,
+        ];
+        for request in [
+            "开发环境怎么启动？",
+            "请问，实现原理是什么？",
+            "更新日志在哪里看？",
+            "修改记录在哪看？",
+            "保存按钮在哪个组件里？",
+            "创建时间是怎么算的？",
+            "完成度怎么样？",
+            "重构的话风险大吗？",
+            "优化空间还有多大？",
+            "删除按钮是做什么用的？",
+            "开发环境怎么启动",
+            "实现原理是什么",
+            "重构的话风险大吗",
+        ] {
+            for mode in modes {
+                let route = apply_route_ceilings(
+                    brain_to_route_in_mode(&read_only, request, mode),
+                    request,
+                    mode,
+                );
+                assert!(!route.class.mutates_workspace(), "{mode:?}: {request}");
+            }
+            assert!(
+                !safe_fallback_route(request).class.mutates_workspace(),
+                "fallback: {request}"
+            );
+        }
+        for request in [
+            "完成这个功能",
+            "修复登录页的空指针",
+            "开发环境怎么启动？顺便修复登录页的空指针",
+        ] {
+            for mode in modes {
+                let route = apply_route_ceilings(
+                    brain_to_route_in_mode(&read_only, request, mode),
+                    request,
+                    mode,
+                );
+                assert!(route.class.mutates_workspace(), "{mode:?}: {request}");
+            }
+            assert!(
+                safe_fallback_route(request).class.mutates_workspace(),
+                "fallback: {request}"
+            );
+        }
     }
 
     #[test]

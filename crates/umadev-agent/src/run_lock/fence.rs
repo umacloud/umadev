@@ -306,6 +306,15 @@ fn unsafe_legacy_migration_error(path: &Path) -> io::Error {
 }
 
 pub(super) fn ensure_v2_fence(path: &Path) -> io::Result<()> {
+    ensure_v2_fence_with(path, write_new_fence)
+}
+
+/// [`ensure_v2_fence`] with the first write of a new fence supplied by the
+/// caller, so a failed write can be exercised.
+pub(super) fn ensure_v2_fence_with(
+    path: &Path,
+    write_new: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     match umadev_state::fs::read_bounded(path, 4 * 1024) {
         Ok(bytes) if bytes == V2_FENCE => return Ok(()),
         Ok(_) => return Err(legacy_fence_error(path)),
@@ -330,12 +339,9 @@ pub(super) fn ensure_v2_fence(path: &Path) -> io::Result<()> {
     }
     match umadev_state::fs::retry_transient(|| options.open(path)) {
         Ok(mut file) => {
-            use std::io::Write;
             // A partial fence is intentionally left fail-closed after a crash;
             // doctor/manual migration may repair it, but no later run guesses.
-            file.write_all(V2_FENCE)?;
-            file.flush()?;
-            file.sync_all()?;
+            write_new(&mut file)?;
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let bytes = umadev_state::fs::read_bounded(path, 4 * 1024)
@@ -347,6 +353,13 @@ pub(super) fn ensure_v2_fence(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     Ok(())
+}
+
+fn write_new_fence(file: &mut std::fs::File) -> io::Result<()> {
+    use std::io::Write;
+    file.write_all(V2_FENCE)?;
+    file.flush()?;
+    file.sync_all()
 }
 
 fn legacy_fence_error(path: &Path) -> io::Error {
