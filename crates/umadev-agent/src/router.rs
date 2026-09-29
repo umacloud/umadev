@@ -1063,22 +1063,39 @@ where
     Ok(if value.is_finite() { value } else { 0.0 })
 }
 
+/// Tolerant deserializer for the brain-triage string fields: a JSON string, or
+/// `null` / any other value -> empty. Models routinely write `null` for "no
+/// question" or "no kind", and serde default only covers an ABSENT field, so one
+/// `null` failed the WHOLE BrainRoute parse and dropped a real build to the
+/// fallback route (no Director, no routed QC) - the same failure the array and
+/// number fields already guard against. An empty value never authorizes a write.
+fn de_lenient_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct BrainRoute {
     /// `chat | explain | quick_edit | debug | build` (free text; mapped tolerantly).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     class: String,
     /// `greenfield | frontend_only | backend_only | bugfix | refactor | docs_only | light`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     kind: String,
     /// `simple | medium | complex` — maps to a depth.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     complexity: String,
     /// `read_only | mutating` — the model's semantic reading of whether this
     /// request authorizes workspace changes. Kept separate from task size so a
     /// quoted/hypothetical build can remain an Explain turn. Missing or malformed
     /// values never authorize a write.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     authorization: String,
     /// What the request needs (roles / capabilities) — informs the team.
     #[serde(default, deserialize_with = "de_string_or_vec")]
@@ -1090,7 +1107,7 @@ struct BrainRoute {
     // (that's the plan's job — see `plan_state`), so it's intentionally not a field
     // here. serde ignores the unknown key, keeping the brain's schema unchanged.
     /// A clarifying question, when the request is genuinely ambiguous.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_string")]
     clarify_question: String,
     /// Discrete options for the clarifying question.
     #[serde(default, deserialize_with = "de_string_or_vec")]

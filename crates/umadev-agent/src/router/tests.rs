@@ -27,6 +27,112 @@ mod tests {
         }
     }
 
+    /// A resident session whose read-only fork answers the routing consult with
+    /// a fixed reply, so a test drives the live `consult_route` path.
+    struct ForkReplies(&'static str);
+    /// The fork itself: it streams the reply and finishes the turn.
+    struct ScriptedFork(std::collections::VecDeque<umadev_runtime::SessionEvent>);
+    #[async_trait]
+    impl BaseSession for ScriptedFork {
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            self.0.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _request: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl BaseSession for ForkReplies {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Ok(Box::new(ScriptedFork(std::collections::VecDeque::from([
+                umadev_runtime::SessionEvent::TextDelta(self.0.to_string()),
+                umadev_runtime::SessionEvent::TurnDone {
+                    status: umadev_runtime::TurnStatus::Completed,
+                    usage: None,
+                },
+            ]))))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            None
+        }
+        async fn respond(
+            &mut self,
+            _request: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn brain_route_parse_tolerates_null_strings() {
+        // Models write `null` for "no question" or "no kind". That is an empty
+        // value, not a broken reply that throws the whole verdict away.
+        let brain: BrainRoute = serde_json::from_str(
+            r#"{"class":"build","authorization":"mutating","kind":null,"complexity":"complex","clarify_question":null}"#,
+        )
+        .expect("a null string field is an empty value");
+        assert_eq!(brain.class, "build");
+        assert_eq!(brain.authorization, "mutating");
+        assert!(brain.kind.is_empty());
+        assert!(brain.clarify_question.is_empty());
+
+        let odd: BrainRoute = serde_json::from_str(
+            r#"{"class":null,"kind":7,"complexity":true,"authorization":null,"clarify_question":{}}"#,
+        )
+        .expect("a non-string scalar is an empty value too");
+        for field in [
+            &odd.class,
+            &odd.kind,
+            &odd.complexity,
+            &odd.authorization,
+            &odd.clarify_question,
+        ] {
+            assert!(field.is_empty(), "{field:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn consult_route_keeps_a_model_verdict_that_has_null_fields() {
+        let mut session = ForkReplies(
+            r#"{"class":"build","authorization":"mutating","kind":"greenfield","complexity":"complex","clarify_question":null,"clarify_options":null,"confidence":0.9}"#,
+        );
+        let (routed, readonly) = route_with_context_and_readonly_session(
+            Some(&mut session),
+            &opts(),
+            "做一个带登录的 SaaS 仪表盘",
+            "",
+        )
+        .await;
+        close_readonly_session(readonly).await;
+        assert_eq!(routed.source, RouteSource::Brain);
+        assert_eq!(routed.fallback_reason, None);
+        assert_eq!(routed.plan.class, RouteClass::Build);
+        assert!(routed.plan.needs_clarify.is_none());
+    }
+
     #[test]
     fn triage_prompt_sizes_a_document_as_docs_only_simple() {
         // The PRIMARY brain-first fix: the triage prompt must instruct the borrowed
