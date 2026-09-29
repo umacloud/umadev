@@ -742,7 +742,10 @@ test(
         `catch (error) { fs.writeFileSync(process.argv[3], String(error && error.code || error)); }\n`,
     );
     const manager = path.join(binDir, 'npm.cmd');
-    const manifest = JSON.stringify(trustedUpdateManifest(expected));
+    // cmd.exe expands `%2` in the registry's encoded scope separator (`%2f`) as
+    // the batch file's second argument, so double every `%` to echo the manifest
+    // verbatim.
+    const manifest = JSON.stringify(trustedUpdateManifest(expected)).replace(/%/g, '%%');
     fs.writeFileSync(
       manager,
       `@echo off\r\n` +
