@@ -9081,6 +9081,9 @@ mod tests {
         git(&["init"]);
         git(&["config", "user.email", "umadev-test@example.invalid"]);
         git(&["config", "user.name", "UmaDev Test"]);
+        // The host lane refuses a commit it would have to sign; model a user who
+        // does not sign, whatever the machine's global git config says.
+        git(&["config", "commit.gpgSign", "false"]);
         std::fs::write(root.join("tracked.txt"), "initial\n").unwrap();
         git(&["add", "tracked.txt"]);
         git(&["commit", "-m", "initial"]);
