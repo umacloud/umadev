@@ -8959,6 +8959,110 @@ async fn a_budget_pause_after_a_blocked_step_resumes_to_a_clean_delivery() {
     );
 }
 
+#[tokio::test]
+async fn resume_preflight_never_flips_done_steps_to_blocked() {
+    // A Fast single-turn plan (which runs no surface preflight) parked at a final
+    // review outage, or a plan saved before file surfaces existed, reaches `/continue`
+    // with a Done, file-less Build step. The preflight gates only work that will still
+    // run: the Done step stays Done and the parked review is retried, instead of every
+    // `/continue` failing "execution contract is incomplete".
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let route = build_route();
+    let o = opts(tmp.path());
+    let plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "build".into(),
+            title: "Build it in one turn".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Done,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    plan_state::save(&plan, tmp.path()).unwrap();
+    save_operational_review_checkpoint(
+        tmp.path(),
+        &OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(tmp.path()),
+            required_seats: Some(route.team.clone()),
+            entry_task_run_id: None,
+            consecutive_outages: 1,
+            evidence: OperationalReviewEvidence::default(),
+            terminally_settled: false,
+        },
+    )
+    .unwrap();
+
+    let mut sess = FakeSession::new(
+        vec![text_turn("final report")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+    assert!(
+        matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+        "the parked final review resumes over the Done step: {outcome:?}"
+    );
+    let saved = plan_state::load(tmp.path()).expect("the plan stays on disk");
+    assert_eq!(
+        saved.steps.iter().find(|s| s.id == "build").unwrap().status,
+        StepStatus::Done,
+        "a Done step is never flipped to Blocked by the resume preflight"
+    );
+}
+
+#[test]
+fn the_final_gate_notes_a_completed_step_without_a_surface_instead_of_blocking() {
+    // The same kind of plan when source changed after the pause: the full final
+    // gate runs its scope check. A Done step never runs a writer again, so the base
+    // is not told to "re-plan" it (it cannot); its changes cannot be attributed, so
+    // the user sees that the scope was not checked.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let o = opts(tmp.path());
+    let plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "single-turn-build".into(),
+            title: "Build it in one turn".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Done,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    plan_state::save(&plan, tmp.path()).unwrap();
+    std::fs::write(tmp.path().join("later.ts"), "export const later = 2;\n").unwrap();
+
+    let floor = acceptance_floor(&o, Some(&build_route()), None);
+    assert!(
+        !floor
+            .blocking
+            .iter()
+            .any(|b| b.contains("execution contract incomplete") || b.contains("later.ts")),
+        "{:?}",
+        floor.blocking
+    );
+    assert!(
+        floor.notes.iter().any(|n| n.contains("single-turn-build")),
+        "{:?}",
+        floor.notes
+    );
+}
+
 #[test]
 fn plan_progress_recitation_is_bounded_and_honest() {
     // PLAN RECITATION lock test: the compact per-step "where we are in the plan"

@@ -43,7 +43,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::bounded_fs::{read_utf8_beneath, Utf8ReadBudget};
-use crate::plan_state::{Plan, StepKind};
+use crate::plan_state::{Plan, StepKind, StepStatus};
 
 /// One scope finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,19 +179,20 @@ const MAX_ROUTE_INPUT_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 ///
 /// Returns contract findings; current execution-scope violations are blocking.
 /// Empty when the run diff is unreadable/no baseline exists, a review-only plan has
-/// no writer, or every changed path was claimed.
+/// no writer, a completed step's changes cannot be attributed (see
+/// [`completed_steps_without_surface`]), or every changed path was claimed.
 ///
 /// Bounded: one shadow-repo diff, one backend-route extraction over the changed set,
 /// and at most one before/after manifest comparison per changed manifest.
 #[must_use]
 pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
-    // EXECUTION-CONTRACT GATE: every mutating step contributes to the denominator.
-    // Missing declarations are not an IO/parser surprise; they are an explicit plan
-    // defect. Report it instead of switching the whole floor off.
+    // EXECUTION-CONTRACT GATE: every mutating step that will still run contributes to
+    // the denominator. Missing declarations are not an IO/parser surprise; they are
+    // an explicit plan defect. Report it instead of switching the whole floor off.
     let missing: Vec<&str> = plan
         .steps
         .iter()
-        .filter(|step| step.kind == StepKind::Build && step.files.is_empty())
+        .filter(|step| step.lacks_pending_surface())
         .map(|step| step.id.as_str())
         .collect();
     if !missing.is_empty() {
@@ -203,6 +204,14 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
             ),
             file: String::new(),
         }];
+    }
+    // A COMPLETED step with no surface (a fast single-turn plan, or one saved before
+    // surfaces were required) never runs a writer again, so it is no plan defect the
+    // base could repair; but its changes cannot be attributed to any claim, so this
+    // run's scope cannot be judged. Fail-open, like an unreadable run diff; the final
+    // gate tells the user.
+    if !completed_steps_without_surface(plan).is_empty() {
+        return Vec::new();
     }
 
     let claims: Vec<&str> = plan
@@ -346,6 +355,19 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
         });
     }
     out
+}
+
+/// Completed Build steps that declared no file surface. Their changes cannot be
+/// attributed to any claim, so [`unclaimed_changes`] cannot judge the run's scope.
+#[must_use]
+pub fn completed_steps_without_surface(plan: &Plan) -> Vec<String> {
+    plan.steps
+        .iter()
+        .filter(|step| {
+            step.kind == StepKind::Build && step.status == StepStatus::Done && step.files.is_empty()
+        })
+        .map(|step| step.id.clone())
+        .collect()
 }
 
 /// Whether a declared claim covers a changed path. A claim is either an exact
@@ -657,6 +679,33 @@ mod tests {
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(findings[0].blocking);
         assert!(findings[0].message.contains("contract incomplete"));
+    }
+
+    #[test]
+    fn a_completed_step_without_a_surface_is_no_contract_failure_to_repair() {
+        let Some(tmp) = baselined_workspace() else {
+            return;
+        };
+        // A fast single-turn plan (or one saved before surfaces were required) can
+        // reach the final gate with a Done, surface-less Build step. It never runs a
+        // writer again, so the base is not told to "re-plan" it; its changes just
+        // cannot be attributed, so the scope check stands down.
+        write(tmp.path(), "src/built.ts", "export const built = 1;\n");
+        let mut plan = plan_claiming(&[]);
+        plan.steps[0].status = StepStatus::Done;
+        assert!(unclaimed_changes(tmp.path(), &plan).is_empty());
+        assert_eq!(completed_steps_without_surface(&plan), vec!["impl"]);
+
+        // The same step still to run would start an unconstrained writer: blocking.
+        plan.steps[0].status = StepStatus::Pending;
+        let findings = unclaimed_changes(tmp.path(), &plan);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.blocking && f.message.contains("contract incomplete")),
+            "{findings:?}"
+        );
+        assert!(completed_steps_without_surface(&plan).is_empty());
     }
 
     #[test]

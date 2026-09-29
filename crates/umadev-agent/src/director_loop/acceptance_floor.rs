@@ -153,6 +153,18 @@ pub(super) fn acceptance_floor(
             }
         }
     }
+    // A completed step that declared no surface leaves this run's changes
+    // unattributable, so the scope check above stood down: say so rather than
+    // silently, and never as a finding the base is asked to repair.
+    if let Some(plan) = crate::plan_state::load(root) {
+        let steps = crate::scope_creep::completed_steps_without_surface(&plan);
+        if !steps.is_empty() {
+            notes.push(umadev_i18n::tlf(
+                "qc.scope_not_judged",
+                &[&steps.join(", ")],
+            ));
+        }
+    }
 
     // BUGFIX: require a reproduction test (red→green). A fix that lands no test
     // asserting the bug can silently regress. Fail-open: only fires when the route
