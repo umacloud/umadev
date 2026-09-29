@@ -9493,3 +9493,98 @@ async fn run_lane_host_requests_fall_back_to_protocol_shaped_rejection_with_no_s
         "folder trust with no surface stays KeepGated: {resolved:?}"
     );
 }
+
+#[tokio::test]
+async fn resolve_host_request_does_not_auto_allow_an_upstream_boundary() {
+    use umadev_runtime::{HostApprovalOption, HostApprovalOptionKind, HostRequest, HostResponse};
+    // Grok sends `session/request_permission` under Auto only when its own
+    // policy still demands a confirmation, and the host flags that request.
+    // The contract (GROK_BUILD_SOURCE_CONTRACT §6): show it to a live user, or
+    // return a safe non-approval when there is none — never auto-select
+    // allow_once. The chat lane already does; the /run and continuous lanes
+    // resolve through here.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let options = opts(tmp.path());
+    assert_eq!(options.mode, TrustMode::Auto);
+    let (events, rec) = sink();
+    let approval = |metadata: serde_json::Value| HostRequest::Approval {
+        action: "Bash".to_string(),
+        target: "npm test".to_string(),
+        message: None,
+        options: vec![
+            HostApprovalOption {
+                id: "allow-once".to_string(),
+                label: "Allow once".to_string(),
+                kind: HostApprovalOptionKind::AllowOnce,
+            },
+            HostApprovalOption {
+                id: "reject-once".to_string(),
+                label: "Reject".to_string(),
+                kind: HostApprovalOptionKind::RejectOnce,
+            },
+        ],
+        metadata,
+    };
+    let boundary = approval(serde_json::json!({
+        "requestedProfile": "auto",
+        "upstreamPermissionBoundary": true
+    }));
+    let decided = |response: HostResponse| match response {
+        HostResponse::Approval {
+            decision,
+            selected_option_id,
+            ..
+        } => (decision, selected_option_id),
+        other => panic!("an approval must be answered as one: {other:?}"),
+    };
+
+    // No live user: the only safe answer is a denial, and the user is told.
+    assert_eq!(
+        decided(resolve_host_request(&options, &events, "b1", &boundary).await),
+        (ApprovalDecision::Deny, Some("reject-once".to_string()))
+    );
+    assert!(rec
+        .events()
+        .iter()
+        .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("npm test"))));
+
+    // The same ordinary request without the flag stays Auto's to allow.
+    let ordinary = approval(serde_json::json!({"requestedProfile": "auto"}));
+    assert_eq!(
+        decided(resolve_host_request(&options, &events, "o1", &ordinary).await),
+        (ApprovalDecision::Allow, Some("allow-once".to_string()))
+    );
+
+    // A live user decides the boundary even though Auto would allow the action.
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe = Arc::clone(&asked);
+    let approve: crate::interaction::ApprovalFn = Arc::new(move |_action, _target| {
+        probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { true }) as crate::interaction::ApprovalFuture
+    });
+    let interaction = || RunInteraction {
+        steer: None,
+        approval: Some(Arc::clone(&approve)),
+        host_request: None,
+        confirm_gates: false,
+    };
+    let hosted = crate::interaction::hosted(
+        interaction(),
+        resolve_host_request(&options, &events, "b2", &boundary),
+    )
+    .await;
+    assert_eq!(
+        decided(hosted),
+        (ApprovalDecision::Allow, Some("allow-once".to_string()))
+    );
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // That approval is not remembered: the next boundary request asks again.
+    let again = crate::interaction::hosted(
+        interaction(),
+        resolve_host_request(&options, &events, "b3", &boundary),
+    )
+    .await;
+    assert_eq!(decided(again).0, ApprovalDecision::Allow);
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

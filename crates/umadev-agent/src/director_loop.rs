@@ -29,6 +29,7 @@ use crate::trust::requires_confirmation_with_ledger;
 use umadev_spec::Phase;
 
 mod declared_evidence;
+mod host_approval;
 mod operational_review;
 mod quality_evidence;
 pub(crate) mod resume;
@@ -5435,12 +5436,10 @@ pub(crate) async fn resolve_host_request(
 ) -> HostResponse {
     match request {
         HostRequest::Approval {
-            action,
-            target,
             options: approval_options,
             ..
         } => {
-            let resolved = resolve_approval(options, events, action, target).await;
+            let resolved = host_approval::resolve(options, events, request).await;
             HostResponse::Approval {
                 decision: resolved.decision,
                 selected_option_id: approval_option_id(approval_options, resolved.decision),
