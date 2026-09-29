@@ -2384,6 +2384,71 @@ mod tests {
     }
 
     #[test]
+    fn mutation_floor_never_promotes_plain_questions() {
+        // Each question opens with a noun built from a write verb (开发环境,
+        // 实现原理, 更新日志…). A correct read-only verdict must stand; the floor
+        // must not turn the question into a writable turn on a new branch.
+        let read_only = BrainRoute {
+            class: "explain".to_string(),
+            authorization: "read_only".to_string(),
+            kind: "light".to_string(),
+            complexity: "simple".to_string(),
+            confidence: 0.99,
+            ..Default::default()
+        };
+        let modes = [
+            crate::trust::TrustMode::Guarded,
+            crate::trust::TrustMode::Auto,
+        ];
+        for request in [
+            "开发环境怎么启动？",
+            "请问，实现原理是什么？",
+            "更新日志在哪里看？",
+            "修改记录在哪看？",
+            "保存按钮在哪个组件里？",
+            "创建时间是怎么算的？",
+            "完成度怎么样？",
+            "重构的话风险大吗？",
+            "优化空间还有多大？",
+            "删除按钮是做什么用的？",
+            "开发环境怎么启动",
+            "实现原理是什么",
+            "重构的话风险大吗",
+        ] {
+            for mode in modes {
+                let route = apply_route_ceilings(
+                    brain_to_route_in_mode(&read_only, request, mode),
+                    request,
+                    mode,
+                );
+                assert!(!route.class.mutates_workspace(), "{mode:?}: {request}");
+            }
+            assert!(
+                !safe_fallback_route(request).class.mutates_workspace(),
+                "fallback: {request}"
+            );
+        }
+        for request in [
+            "完成这个功能",
+            "修复登录页的空指针",
+            "开发环境怎么启动？顺便修复登录页的空指针",
+        ] {
+            for mode in modes {
+                let route = apply_route_ceilings(
+                    brain_to_route_in_mode(&read_only, request, mode),
+                    request,
+                    mode,
+                );
+                assert!(route.class.mutates_workspace(), "{mode:?}: {request}");
+            }
+            assert!(
+                safe_fallback_route(request).class.mutates_workspace(),
+                "fallback: {request}"
+            );
+        }
+    }
+
+    #[test]
     fn read_only_brain_classes_remain_valid_without_write_authorization() {
         for (class, expected) in [("chat", RouteClass::Chat), ("explain", RouteClass::Explain)] {
             for authorization in ["", "unexpected_value", "read_only"] {

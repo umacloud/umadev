@@ -2318,8 +2318,12 @@ fn safe_fallback_route(requirement: &str) -> RoutePlan {
 /// queries. These shapes never earn write authority from a create keyword alone.
 fn fallback_requires_read_only(requirement: &str) -> bool {
     let q = requirement.trim().to_lowercase();
+    let unpunctuated = q.trim_end_matches(['。', '.', '!', '！']);
     q.contains('?')
         || q.contains('？')
+        || ["吗", "嗎", "呢"]
+            .iter()
+            .any(|particle| unpunctuated.ends_with(particle))
         || [
             "如何",
             "怎么",
@@ -2330,6 +2334,11 @@ fn fallback_requires_read_only(requirement: &str) -> bool {
             "是什麼",
             "什么意思",
             "什麼意思",
+            "在哪",
+            "哪里",
+            "哪裡",
+            "哪个",
+            "哪個",
             "能否解释",
             "能否解釋",
             "解释‘",
@@ -2641,32 +2650,87 @@ fn explicit_mutation_command(requirement: &str) -> bool {
 
     // Inspect clause starts, not arbitrary substrings. This recognizes a direct
     // command after a status question while avoiding past-tense summaries such as
-    // "本次改动，修复了三个问题".
-    q.split(['?', '？', ',', '，', ';', '；', '.', '。', '!', '！', '\n'])
-        .map(str::trim)
-        .filter(|clause| !clause.is_empty())
-        .any(|clause| {
-            if mutation_question(clause)
-                || past_tense_prefix
-                    .iter()
-                    .any(|prefix| clause.starts_with(prefix))
-            {
-                return false;
-            }
-            let command = command_lead
+    // "本次改动，修复了三个问题". A clause that asks something is a question even
+    // when it opens with a noun built from a write verb (开发环境怎么启动,
+    // 实现原理是什么, 更新日志在哪里看), so only a clause that orders the change
+    // counts. An explicit command lead (请 / 帮我) keeps a how-clause inside an
+    // order writable (请修改一下如何处理空值的逻辑); a question mark never does.
+    const DELIMITERS: [char; 11] = ['?', '？', ',', '，', ';', '；', '.', '。', '!', '！', '\n'];
+    q.split_inclusive(DELIMITERS).any(|piece| {
+        let asked = piece.ends_with(['?', '？']);
+        let clause = piece.trim_end_matches(DELIMITERS).trim();
+        if clause.is_empty()
+            || asked
+            || mutation_question(clause)
+            || past_tense_prefix
                 .iter()
-                .find_map(|prefix| clause.strip_prefix(prefix))
-                .map(str::trim_start)
-                .unwrap_or(clause);
-            direct_prefix
+                .any(|prefix| clause.starts_with(prefix))
+        {
+            return false;
+        }
+        let lead = command_lead
+            .iter()
+            .find_map(|prefix| clause.strip_prefix(prefix));
+        if lead.is_none() && clause_asks_a_question(clause) {
+            return false;
+        }
+        let command = lead.map_or(clause, str::trim_start);
+        direct_prefix
+            .iter()
+            .any(|prefix| command.starts_with(prefix))
+            || (object_first_prefix
                 .iter()
                 .any(|prefix| command.starts_with(prefix))
-                || (object_first_prefix
-                    .iter()
-                    .any(|prefix| command.starts_with(prefix))
-                    && clear_mutation_request(command))
-                || resultative_create_command(clause)
-        })
+                && clear_mutation_request(command))
+            || resultative_create_command(clause)
+    })
+}
+
+/// Whether one clause asks something: a question particle at its end, an
+/// interrogative word (怎么, 什么, 哪里, 多少, 是否…), or an English wh-word
+/// opening it.
+fn clause_asks_a_question(clause: &str) -> bool {
+    const ASKING: &[&str] = &[
+        "怎么",
+        "怎麼",
+        "怎样",
+        "怎樣",
+        "如何",
+        "什么",
+        "什麼",
+        "为何",
+        "為何",
+        "哪里",
+        "哪裡",
+        "哪儿",
+        "哪兒",
+        "哪个",
+        "哪個",
+        "哪些",
+        "哪一",
+        "哪种",
+        "哪種",
+        "在哪",
+        "多少",
+        "多大",
+        "多久",
+        "多长",
+        "多長",
+        "是否",
+        "能否",
+        "能不能",
+        "可不可以",
+        "要不要",
+        "啥",
+    ];
+    ["吗", "嗎", "呢"]
+        .iter()
+        .any(|particle| clause.ends_with(particle))
+        || ASKING.iter().any(|word| clause.contains(word))
+        || clause
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .next()
+            .is_some_and(|word| matches!(word, "how" | "what" | "where" | "why" | "which" | "who"))
 }
 
 fn request_has_git_commit_plus_additional_work(requirement: &str) -> bool {
