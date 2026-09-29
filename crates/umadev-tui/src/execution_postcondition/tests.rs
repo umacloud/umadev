@@ -25,6 +25,9 @@ fn dirty_git_repo() -> tempfile::TempDir {
         root.path(),
         &["config", "user.email", "umadev-test@example.invalid"],
     );
+    // The lane refuses signed commits; keep a developer's global signing
+    // setting out of these fixtures.
+    git(root.path(), &["config", "commit.gpgSign", "false"]);
     for path in ["one.txt", "two.txt", "three.txt"] {
         std::fs::write(root.path().join(path), "before\n").unwrap();
     }
@@ -1030,7 +1033,6 @@ async fn malicious_fsmonitor_and_signing_programs_are_not_executed() {
         ],
     );
     git(root.path(), &["config", "core.fsmonitorHookVersion", "2"]);
-    git(root.path(), &["config", "commit.gpgSign", "true"]);
     git(
         root.path(),
         &["config", "gpg.program", signer.to_string_lossy().as_ref()],
@@ -1056,6 +1058,40 @@ async fn malicious_fsmonitor_and_signing_programs_are_not_executed() {
         !fsmonitor_marker.exists(),
         "the configured fsmonitor program must not run"
     );
+    assert!(
+        !signer_marker.exists(),
+        "the configured signing program must not run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn host_commit_with_gpgsign_true_is_refused() {
+    let root = dirty_git_repo();
+    let (signer, signer_marker) = install_malicious_git_program(root.path(), "signer");
+    git(root.path(), &["config", "commit.gpgSign", "true"]);
+    git(
+        root.path(),
+        &["config", "gpg.program", signer.to_string_lossy().as_ref()],
+    );
+    let head = git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap();
+    let index = GitIndexSnapshot::capture(root.path()).unwrap();
+
+    let note = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap_err()
+    .into_note();
+
+    assert!(note.contains("git-signing-requires-native-git"), "{note}");
+    assert!(note.contains("commit.gpgSign"), "{note}");
+    assert_eq!(
+        git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap(),
+        head
+    );
+    assert!(index.matches_current().unwrap());
     assert!(
         !signer_marker.exists(),
         "the configured signing program must not run"

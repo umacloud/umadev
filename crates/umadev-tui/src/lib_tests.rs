@@ -4556,6 +4556,9 @@ fn init_git_repo() -> tempfile::TempDir {
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.t"]);
     run(&["config", "user.name", "t"]);
+    // The host commit lane refuses signed commits; keep a developer's global
+    // signing setting out of these fixtures.
+    run(&["config", "commit.gpgSign", "false"]);
     tmp
 }
 

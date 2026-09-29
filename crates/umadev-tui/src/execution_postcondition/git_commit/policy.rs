@@ -4,10 +4,10 @@ use super::{
     git_identity_config, git_mutating_output, git_name_only, git_operation_in_progress,
     git_optional_text, git_output, git_required_text, git_staged_paths,
     is_high_risk_git_commit_path, is_internal_umadev_path, normalize_exact_git_path,
-    reject_active_commit_hooks, reject_git_environment_redirects, snapshot_blocked,
-    stage_paths_without_filters, validate_git_commit_scope, BTreeSet, Duration, ExecutionContract,
-    GitCommitBaseline, GitIndexSnapshot, GitTransactionGuard, GitValidationRollback,
-    InertHooksDirectory, Path, ResidentExecutionBlocked, WorkspaceBaseline,
+    reject_active_commit_hooks, reject_commit_signing, reject_git_environment_redirects,
+    snapshot_blocked, stage_paths_without_filters, validate_git_commit_scope, BTreeSet, Duration,
+    ExecutionContract, GitCommitBaseline, GitIndexSnapshot, GitTransactionGuard,
+    GitValidationRollback, InertHooksDirectory, Path, ResidentExecutionBlocked, WorkspaceBaseline,
 };
 
 impl GitCommitBaseline {
@@ -53,6 +53,7 @@ impl GitCommitBaseline {
         // refresh the index. A second check immediately before mutation closes
         // the ordinary preflight window; every mutation also overrides hooks.
         reject_active_commit_hooks(root)?;
+        reject_commit_signing(root)?;
         let (identity_name, identity_email) = git_identity_config(root)?;
         Ok(Self {
             head: git_optional_text(root, &["rev-parse", "--verify", "HEAD"])?,
@@ -183,6 +184,7 @@ impl GitCommitBaseline {
             ));
         }
         reject_active_commit_hooks(root)?;
+        reject_commit_signing(root)?;
         self.index.verify_unchanged()
     }
 
