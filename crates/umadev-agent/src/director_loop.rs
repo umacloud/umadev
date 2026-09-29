@@ -4710,8 +4710,12 @@ async fn attempt_replan_blocked_subtree(
          `acceptance`: source-present|build-test|contract|design-tokens|review-clean; \
          `evidence` (preferred): an array of machine-checkable proofs, e.g. \
          {\"kind\":\"file-exists\",\"path\":\"src/foo.ts\"}, {\"kind\":\"build-clean\"}. \
+         `files` (REQUIRED for EVERY build step): the paths the step will create or modify, \
+         {\"create\":[\"src/orders/api.ts\"],\"modify\":[\"src/routes.ts\"]}; the new steps \
+         also inherit the replaced steps' surface, so do not repeat it. \
          JSON shape: {\"steps\":[{\"id\":\"…\",\"title\":\"…\",\"seat\":\"…\",\"kind\":\"build\",\
-         \"depends_on\":[],\"acceptance\":\"…\",\"evidence\":[…]}]}";
+         \"depends_on\":[],\"acceptance\":\"…\",\"evidence\":[…],\"files\":{\"create\":[…],\
+         \"modify\":[…]}}]}";
     let gap_line = if gap_evidence.is_empty() {
         "(the step produced no verifiable progress / no positive evidence)".to_string()
     } else {
@@ -4729,10 +4733,18 @@ async fn attempt_replan_blocked_subtree(
         .iter()
         .find(|s| s.id == blocked_id)
         .map_or("?", |s| s.seat.role_id());
+    let replaced_surface = plan
+        .steps
+        .iter()
+        .filter(|s| s.id == blocked_id || stranded.iter().any(|id| id == &s.id))
+        .flat_map(|s| s.files.all())
+        .collect::<Vec<_>>()
+        .join(", ");
     let user = format!(
         "BLOCKED step: {blocked_id} — {blocked_title} (seat {blocked_seat}).\n\
          Why it blocked (typed gap evidence): {gap_line}.\n\
-         STRANDED dependent steps needing a new route:\n{stranded_line}\n\n\
+         STRANDED dependent steps needing a new route:\n{stranded_line}\n\
+         Their file surface, which the replacement inherits: {replaced_surface}\n\n\
          Overall requirement:\n{}\n\n\
          Return ONE JSON object with the replacement sub-DAG.",
         options.requirement

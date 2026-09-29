@@ -1010,12 +1010,18 @@ impl Plan {
     /// are restored (an already-`Done` step is NOT re-driven); the NEW steps keep
     /// `Pending` (fresh work the scheduler will pick up by readiness).
     ///
+    /// The replacement takes over the retired steps' territory: every NEW Build step
+    /// inherits their declared file surface (on top of any it declares), so it runs
+    /// under a bounded execution contract and whatever the blocked step already wrote
+    /// stays claimed instead of reading as unplanned work at the final gate.
+    ///
     /// Returns `true` ONLY when the merge actually CHANGES the plan — the replacement
     /// must introduce at least one genuinely-new step id (a real route around the
     /// blocker). An empty / unparseable sub-DAG, a reply that re-emits only existing
-    /// ids, or a normalisation that survives nothing new leaves `self` **unchanged** and
-    /// returns `false` (fail-open → the caller keeps today's honest stranded-Blocked
-    /// report). Never panics.
+    /// ids, a normalisation that survives nothing new, or a Build step left with no
+    /// file surface to run under leaves `self` **unchanged** and returns `false`
+    /// (fail-open → the caller keeps today's honest stranded-Blocked report). Never
+    /// panics.
     pub fn merge_replan(&mut self, replaced: &HashSet<String>, new_steps: Vec<PlanStep>) -> bool {
         if new_steps.is_empty() {
             return false;
@@ -1038,6 +1044,15 @@ impl Plan {
             .filter(|s| !replaced.contains(&s.id))
             .map(|s| (s.id.trim().to_string(), s.status))
             .collect();
+        let mut inherited = StepFiles::default();
+        for s in self
+            .steps
+            .iter()
+            .filter(|s| replaced.contains(&s.id) && s.kind == StepKind::Build)
+        {
+            extend_unique(&mut inherited.create, &s.files.create);
+            extend_unique(&mut inherited.modify, &s.files.modify);
+        }
         // Build the merged node list: SURVIVORS first (so `normalized`'s first-seen
         // dedup keeps them over any colliding new id), then the new sub-DAG.
         let mut merged: Vec<PlanStep> = self
@@ -1060,11 +1075,20 @@ impl Plan {
         let Some(mut normalized) = candidate.normalized(None) else {
             return false; // nothing usable survived normalisation → fail-open
         };
-        // Restore the survivors' statuses; NEW steps keep `normalized`'s fresh Pending.
+        // Restore the survivors' statuses; NEW steps keep `normalized`'s fresh Pending
+        // and inherit the retired steps' file surface.
         for s in &mut normalized.steps {
             if let Some(&st) = survivor_status.get(&s.id) {
                 s.status = st;
+            } else if s.kind == StepKind::Build {
+                extend_unique(&mut s.files.create, &inherited.create);
+                extend_unique(&mut s.files.modify, &inherited.modify);
             }
+        }
+        // A replacement must be executable: a Build step still without a file surface
+        // would fail the execution-contract preflight with a zero change budget.
+        if normalized.steps.iter().any(PlanStep::lacks_pending_surface) {
+            return false;
         }
         // Final guard: the normalised merge must still carry a genuinely-new step id
         // (one absent from the OLD plan) — else the sub-DAG collapsed to nothing new and
@@ -2124,6 +2148,15 @@ fn parse_brain_files(v: &serde_json::Value) -> StepFiles {
 /// the scope check's matching work stays proportional to the plan, not to a runaway
 /// reply.
 const MAX_DECLARED_PATHS: usize = 64;
+
+/// Append each path of `from` that `into` does not hold yet, keeping order.
+fn extend_unique(into: &mut Vec<String>, from: &[String]) {
+    for path in from {
+        if !into.contains(path) {
+            into.push(path.clone());
+        }
+    }
+}
 
 /// Canonicalise ONE declared path: trim, normalise `\` → `/`, strip a leading `./`
 /// and a single leading `/` (declarations are repo-relative), and reject an empty
@@ -4720,10 +4753,14 @@ mod tests {
             step("api", &["scaffold"]),
             step("ui", &["api"]),
         ]);
+        for s in &mut p.steps {
+            s.files.create = vec![format!("src/{}/", s.id)];
+        }
         mark(&mut p, "scaffold", StepStatus::Done);
         mark(&mut p, "api", StepStatus::Blocked);
         let replaced: HashSet<String> = ["api".to_string(), "ui".to_string()].into_iter().collect();
-        let new_steps = vec![step("api2", &["scaffold"]), step("ui2", &["api2"])];
+        let mut new_steps = vec![step("api2", &["scaffold"]), step("ui2", &["api2"])];
+        new_steps[1].files.modify = vec!["src/app.tsx".to_string()];
         assert!(p.merge_replan(&replaced, new_steps));
         let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
         // The blocked subtree is gone; the fresh route is spliced in.
@@ -4741,6 +4778,28 @@ mod tests {
             StepStatus::Pending
         );
         assert_eq!(deps_of(&p, "api2"), &["scaffold".to_string()]);
+        // The new route inherits the retired steps' surface, on top of its own.
+        let files = |id: &str| p.steps.iter().find(|s| s.id == id).unwrap().files.clone();
+        assert_eq!(files("api2").create, vec!["src/api/", "src/ui/"]);
+        assert_eq!(files("ui2").create, vec!["src/api/", "src/ui/"]);
+        assert_eq!(files("ui2").modify, vec!["src/app.tsx"]);
+        assert_eq!(files("scaffold").create, vec!["src/scaffold/"]);
+    }
+
+    #[test]
+    fn merge_replan_rejects_a_subdag_with_no_file_surface_to_run_under() {
+        // Retired steps from a plan saved before surfaces were required leave nothing
+        // to inherit; a new Build step declaring none would fail the preflight.
+        let mut p = plan(vec![step("a", &[]), step("b", &["a"])]);
+        mark(&mut p, "a", StepStatus::Blocked);
+        let before = p.clone();
+        let replaced: HashSet<String> = ["a".to_string(), "b".to_string()].into_iter().collect();
+        assert!(!p.merge_replan(&replaced, vec![step("a2", &[])]));
+        assert_eq!(p, before, "an unrunnable sub-DAG leaves the plan unchanged");
+
+        let mut runnable = step("a2", &[]);
+        runnable.files.create = vec!["src/a2.ts".to_string()];
+        assert!(p.merge_replan(&replaced, vec![runnable]));
     }
 
     #[test]
