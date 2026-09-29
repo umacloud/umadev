@@ -57,7 +57,7 @@ fn sanitize_question_option(option: HostQuestionOption) -> HostQuestionOption {
     }
 }
 
-fn sanitize_question(question: HostQuestion) -> HostQuestion {
+pub(crate) fn sanitize_question(question: HostQuestion) -> HostQuestion {
     HostQuestion {
         id: redact_text(&question.id),
         header: question.header.map(|value| redact_text(&value)),

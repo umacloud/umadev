@@ -6000,7 +6000,9 @@ async fn handle_user_input_request(
         }
     }
     let params = sanitize_value(normalized_params.clone());
-    let questions = parse_host_questions(&params);
+    // Grok matches an answer against its own question and option text, so the
+    // pending state keeps that text; the user is shown a redacted copy.
+    let questions = parse_host_questions(normalized_params);
     if questions.is_empty() {
         reply_rpc_error(
             writer,
@@ -6012,36 +6014,10 @@ async fn handle_user_input_request(
         return;
     }
     let req_id = rpc_id_string(&raw_id);
-    let pending_questions = questions
-        .iter()
-        .map(|question| PendingQuestion {
-            id: question.id.clone(),
-            prompt: question.prompt.clone(),
-            option_labels: question
-                .options
-                .iter()
-                .flat_map(|option| {
-                    [
-                        (option.value.clone(), option.label.clone()),
-                        (option.label.clone(), option.label.clone()),
-                    ]
-                })
-                .collect(),
-            option_previews: question
-                .options
-                .iter()
-                .filter_map(|option| {
-                    option.preview.as_ref().map(|preview| {
-                        [
-                            (option.value.clone(), preview.clone()),
-                            (option.label.clone(), preview.clone()),
-                        ]
-                    })
-                })
-                .flatten()
-                .collect(),
-            multi_select: matches!(question.kind, HostQuestionKind::MultiChoice),
-        })
+    let pending_questions = questions.iter().map(pending_question).collect();
+    let questions = questions
+        .into_iter()
+        .map(crate::redaction::sanitize_question)
         .collect();
     let request = PendingHostRequest::UserInput {
         raw_id: raw_id.clone(),
@@ -6083,6 +6059,34 @@ async fn handle_user_input_request(
         },
     )
     .await;
+}
+
+/// The pending state of one question, which the user answers from its
+/// redacted copy.
+///
+/// The peer matches an answer against its own text: Grok keys it by the
+/// question and names the chosen options by their labels. The user sees a
+/// redacted copy and answers with its option values, so every shown value and
+/// label maps to the peer's own label and preview.
+fn pending_question(question: &HostQuestion) -> PendingQuestion {
+    let shown = crate::redaction::sanitize_question(question.clone());
+    let mut option_labels = HashMap::new();
+    let mut option_previews = HashMap::new();
+    for (option, shown_option) in question.options.iter().zip(&shown.options) {
+        for key in [&shown_option.value, &shown_option.label] {
+            option_labels.insert(key.clone(), option.label.clone());
+            if let Some(preview) = &option.preview {
+                option_previews.insert(key.clone(), preview.clone());
+            }
+        }
+    }
+    PendingQuestion {
+        id: shown.id,
+        prompt: question.prompt.clone(),
+        option_labels,
+        option_previews,
+        multi_select: matches!(question.kind, HostQuestionKind::MultiChoice),
+    }
 }
 
 async fn handle_permission_expansion_request(
@@ -8901,8 +8905,10 @@ fn grok_accepted_result(
         }
         wire_answers.insert(question.prompt.clone(), json!(labels));
 
+        // The user was shown, and echoes, the redacted preview; Grok gets its own.
         let supplied_preview = annotation.and_then(|annotation| annotation.preview.as_deref());
-        if supplied_preview.is_some_and(|preview| Some(preview) != selected_preview.as_deref()) {
+        let shown_preview = selected_preview.as_deref().map(redact_text);
+        if supplied_preview.is_some_and(|preview| Some(preview) != shown_preview.as_deref()) {
             return Err("Grok question annotation preview did not match the selected option");
         }
         if let Some(notes) = notes.as_deref() {
@@ -9749,6 +9755,9 @@ mod background_control_tests;
 
 #[cfg(test)]
 mod kimi_wire_tests;
+
+#[cfg(test)]
+mod grok_question_tests;
 
 #[cfg(test)]
 mod tests {
