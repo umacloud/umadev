@@ -1,11 +1,19 @@
-//! Commit orders that do not open the request.
+//! Commit orders that do not open the request, and the Git context that keeps
+//! a question or a failure report about a commit read-only.
 //!
 //! `提交` is also the everyday word for "submit" (提交按钮, 用户提交后推送通知),
-//! so the firewall does not match it anywhere in the text: a commit counts
-//! where a clause begins.
+//! so neither check matches it anywhere in the text: a commit counts where a
+//! clause begins, or next to Git wording, a VCS object or a path.
 
-use super::natural::strip_git_commit_politeness;
-use super::{git_commit_request_has_additional_work, parse_git_commit_clause, GitCommitIntent};
+use super::natural::{
+    commit_object, strip_commit_determiner, strip_git_commit_politeness, COMMIT_DETERMINERS,
+    COMMIT_EDITS, COMMIT_OBJECTS,
+};
+use super::scope::{git_commit_control_text, parse_git_commit_paths};
+use super::{
+    git_commit_request_has_additional_work, parse_git_commit_clause, parse_git_commit_intent,
+    GitCommitIntent,
+};
 
 /// Whether the control text orders a Git commit as its own clause after other
 /// work (`修复登录问题后提交git记录`, `fix the bug and commit`) or after a wish
@@ -34,6 +42,21 @@ pub(super) fn names_git_commit_clause(control: &str) -> bool {
                 | GitCommitIntent::NaturalPaths(_) => true,
             }
     })
+}
+
+/// Whether the request is about a Git commit at all, so that a question or a
+/// failure word in it keeps the turn read-only. `提交` alone does not count
+/// (`提交按钮样式有问题`, `提交订单接口报错`): the request must parse as a
+/// commit, use Git wording, or put a VCS object or a path next to `提交`.
+pub(in crate::router) fn git_commit_context(requirement: &str) -> bool {
+    let control = git_commit_control_text(requirement);
+    !control.is_empty()
+        && (names_git_word(&control)
+            || !matches!(
+                parse_git_commit_intent(requirement),
+                GitCommitIntent::NotCommit
+            )
+            || submit_names_vcs_object(&control))
 }
 
 /// Byte offsets where a clause may begin: the start, and just after each
@@ -135,4 +158,70 @@ fn strip_clause_leads(mut clause: &str) -> &str {
             None => return trimmed,
         }
     }
+}
+
+/// `git` or `commit` as an ASCII word: not `github`, `commitment`, `committee`.
+fn names_git_word(text: &str) -> bool {
+    text.split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|word| {
+            matches!(
+                word,
+                "git" | "commit" | "commits" | "committed" | "committing"
+            )
+        })
+}
+
+/// `提交` next to what a commit takes: a VCS object before or after it
+/// (`提交代码`, `代码提交失败`, `把修改提交`, `提交所有修改`), or a path after it
+/// (`提交 README.md`).
+fn submit_names_vcs_object(control: &str) -> bool {
+    control.match_indices("提交").any(|(index, submit)| {
+        let after = &control[index + submit.len()..];
+        vcs_object_ends(control[..index].trim_end())
+            || vcs_object_starts(after.trim_start())
+            || path_starts(after)
+    })
+}
+
+fn vcs_object_starts(text: &str) -> bool {
+    let text = text.strip_prefix("一下").unwrap_or(text);
+    let (determined, rest) = strip_commit_determiner(text);
+    commit_object(rest, determined).is_some_and(|(_, unmistakable)| unmistakable)
+}
+
+fn vcs_object_ends(text: &str) -> bool {
+    COMMIT_OBJECTS.iter().any(|object| text.ends_with(object))
+        || COMMIT_EDITS.iter().any(|edit| {
+            text.strip_suffix(edit).is_some_and(|lead| {
+                ["把", "将", "將"]
+                    .iter()
+                    .chain(COMMIT_DETERMINERS)
+                    .any(|marker| lead.ends_with(marker))
+            })
+        })
+}
+
+/// A path right after `提交`: after a space, or glued but ASCII-led
+/// (`提交README.md`), so `提交表单到/api/submit` stays a form submission.
+fn path_starts(text: &str) -> bool {
+    let spaced = text.starts_with(char::is_whitespace);
+    let text = text.trim_start();
+    if !spaced
+        && !text
+            .starts_with(|character: char| character.is_ascii_alphanumeric() || character == '.')
+    {
+        return false;
+    }
+    let token: String = text
+        .chars()
+        .take_while(|character| {
+            !character.is_whitespace()
+                && !matches!(
+                    character,
+                    '，' | '。' | '；' | '！' | '？' | '、' | ',' | ';' | '!' | '?'
+                )
+        })
+        .collect();
+    let token = token.trim_end_matches(['吗', '嗎', '呢', '了', '吧']);
+    parse_git_commit_paths(token).is_some_and(|paths| !paths.is_empty())
 }

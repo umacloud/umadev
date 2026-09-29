@@ -45,7 +45,7 @@ use crate::runner::RunOptions;
 
 mod git_commit;
 use git_commit::{
-    git_commit_control_text, git_commit_request_has_additional_work,
+    git_commit_context, git_commit_control_text, git_commit_request_has_additional_work,
     git_commit_request_is_question_or_negated, git_commit_scope_text,
     request_is_git_commit_diagnostic, unquoted_lowercase_text,
 };
@@ -1887,8 +1887,10 @@ pub fn apply_authorization_ceiling(mut plan: RoutePlan, requirement: &str) -> Ro
     }
     let q = git_commit_control_text(requirement);
     let compact: String = q.chars().filter(|c| !c.is_whitespace()).collect();
-    let commit_question = (q.contains("commit") || compact.contains("提交"))
-        && git_commit_request_is_question_or_negated(&q, &compact);
+    // Only a real Git commit context counts. `提交` is also the everyday "submit",
+    // so `表单提交前检查是否登录` or `校验失败时不要提交表单` stay the model's call.
+    let commit_question =
+        git_commit_context(requirement) && git_commit_request_is_question_or_negated(&q, &compact);
     if commit_question && plan.class.mutates_workspace() {
         plan.class = RouteClass::Explain;
         plan.kind = TaskKind::Light;

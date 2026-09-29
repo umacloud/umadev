@@ -4,6 +4,7 @@ mod natural;
 mod quote;
 mod scope;
 
+pub(super) use clause::git_commit_context;
 use literal::{literal_git_commit_policy, literal_git_commit_tail};
 use natural::{
     commit_phrase_is_modifier, commit_tail_chains_git_work, find_safe_git_receipt_suffix,
@@ -663,10 +664,11 @@ pub(super) fn request_is_git_commit_diagnostic(requirement: &str) -> bool {
         ]
         .iter()
         .any(|needle| q.contains(needle));
-    let commit_context = q.contains("commit") || compact.contains("提交");
-    commit_context
+    // A failure word next to the everyday "submit" (提交按钮有问题, 提交订单接口报错)
+    // is product work, not a Git diagnostic.
+    diagnostic
+        && git_commit_context(requirement)
         && !git_commit_request_has_additional_work(&q, &compact)
-        && diagnostic
         && matches!(
             parse_git_commit_intent(requirement),
             GitCommitIntent::NotCommit

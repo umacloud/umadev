@@ -1901,6 +1901,53 @@ mod tests {
     }
 
     #[test]
+    fn submit_wording_does_not_force_read_only() {
+        let writable = BrainRoute {
+            class: "quick_edit".to_string(),
+            authorization: "mutating".to_string(),
+            kind: "light".to_string(),
+            complexity: "simple".to_string(),
+            ..Default::default()
+        };
+        let route = |request: &str| {
+            apply_route_ceilings(
+                brain_to_route_in_mode(&writable, request, crate::trust::TrustMode::Guarded),
+                request,
+                crate::trust::TrustMode::Guarded,
+            )
+        };
+        // A status/error word or a question word next to an everyday 提交 is
+        // not a Git diagnostic or a commit question: the edit stays writable.
+        for request in [
+            "给提交按钮加上 loading 状态",
+            "提交按钮在加载时显示 loading 状态",
+            "把提交接口的错误提示改成中文",
+            "提交按钮样式有问题，改成蓝色",
+            "修改提交记录页面的状态显示",
+            "提交订单接口报错 500，修一下",
+            "提交修改后的表单报错了，帮我修一下",
+            "做一个用户注册页面，提交时校验邮箱格式是否正确",
+            "表单提交前检查是否登录",
+            "校验失败时不要提交表单",
+            "build a committee voting page where members can vote",
+        ] {
+            assert!(!request_has_git_commit_operation(request), "{request}");
+            assert!(route(request).class.mutates_workspace(), "{request}");
+        }
+        // Questions and failure reports about a real Git commit stay read-only.
+        for request in [
+            "提交这些文件吗？",
+            "可以提交 README.md 吗？",
+            "不要提交当前改动",
+            "git commit 失败了，帮我排查",
+            "代码提交失败了，帮我看看",
+            "提交代码报错了",
+        ] {
+            assert!(!route(request).class.mutates_workspace(), "{request}");
+        }
+    }
+
+    #[test]
     fn compound_commit_work_overrides_a_read_only_brain_verdict() {
         let read_only = BrainRoute {
             class: "explain".to_string(),
