@@ -413,6 +413,39 @@ async fn bare_commit_excludes_untracked_umadev_runtime_state() {
     assert!(root.path().join(".umadev/state.json").exists());
 }
 
+#[tokio::test]
+async fn common_commit_phrasings_run_the_host_transaction_and_its_preflight() {
+    // `提交代码` and `commit it` once reached the AI base, which could stage a
+    // dirty `.env` itself. They now run the host transaction: one commit of the
+    // dirty set, and the credential preflight still refuses a secret.
+    for request in ["提交代码", "帮我提交一下代码", "commit it"] {
+        let root = dirty_git_repo();
+        let reply = crate::host_git::execute_host_git_commit(root.path(), request)
+            .await
+            .unwrap_or_else(|note| panic!("{request}: {note}"));
+        assert!(reply.contains("[ok]"), "{request}: {reply}");
+        assert_eq!(git_count(root.path(), "HEAD").unwrap(), 2, "{request}");
+        let dirty = git_dirty_paths(root.path()).unwrap();
+        assert!(
+            ["one.txt", "two.txt", "three.txt"]
+                .iter()
+                .all(|path| !dirty.contains(*path)),
+            "{request}: {dirty:?}"
+        );
+
+        let root = dirty_git_repo();
+        std::fs::write(root.path().join(".env"), "TOKEN=secret\n").unwrap();
+        let note = crate::host_git::execute_host_git_commit(root.path(), request)
+            .await
+            .unwrap_err();
+        assert!(
+            note.contains("git-sensitive-path-blocked"),
+            "{request}: {note}"
+        );
+        assert_eq!(git_count(root.path(), "HEAD").unwrap(), 1, "{request}");
+    }
+}
+
 #[test]
 fn literal_commit_rejects_staged_umadev_runtime_state() {
     let root = dirty_git_repo();

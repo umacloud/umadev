@@ -1586,6 +1586,15 @@ mod tests {
             "提交当前改动功能有 bug",
         ] {
             assert!(!request_is_git_commit(request), "{request}");
+            // The UI checks the wider host firewall before any routing. Only a
+            // commit whose scope is missing is held back for a clearer request;
+            // everything else here must stay ordinary conversation or work.
+            let ambiguous_commit = matches!(request, "执行提交" | "提交这些文件");
+            assert_eq!(
+                request_has_git_commit_operation(request),
+                ambiguous_commit,
+                "{request}"
+            );
         }
     }
 
@@ -2188,6 +2197,112 @@ mod tests {
             assert!(
                 !request_has_git_commit_operation(request),
                 "read-only conversation must remain available: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn firewall_passes_submit_feature_requests_to_routing() {
+        // 提交 is also the everyday word for "submit". A button label, a form
+        // flow, a notification, or a hook that mentions Git is product work for
+        // the base, so the host firewall must let it reach normal routing.
+        for request in [
+            "加一个确认提交按钮",
+            "把按钮文字改成确认提交",
+            "用户提交后推送通知给管理员",
+            "创建一个提交反馈的页面",
+            "创建一个提交按钮",
+            "创建一个提交模板",
+            "create a commit hook",
+            "提交文件时显示上传进度",
+            "写一个统计 git 提交次数的脚本",
+            "给项目加一个 git commit 前自动跑 eslint 的钩子",
+            "make a commitment to ship the beta this week",
+            "确认提交后跳转到首页",
+            "提交修改后的表单",
+            "提交代码时自动格式化",
+            "写一个脚本，提交代码前自动运行 lint",
+            "用户填写完表单后提交",
+            "add a hook that runs eslint before git commit",
+            "写一个 git commit 消息生成器",
+            "给仓库加一个 commit-msg 钩子",
+            "git commit 前自动运行测试",
+            "做一个在线判题页面，点击后提交代码到判题服务",
+            "提交后推送通知给管理员",
+            "提交代码审查请求的页面",
+            "create a commit message template",
+        ] {
+            assert!(!request_has_git_commit_operation(request), "{request}");
+            assert!(!request_is_git_commit(request), "{request}");
+        }
+    }
+
+    #[test]
+    fn common_commit_phrasings_use_host_transaction() {
+        for request in [
+            "提交代码",
+            "帮我提交一下代码",
+            "把代码提交了",
+            "提交改动",
+            "提交所有修改",
+            "提交当前代码",
+            "把修改提交到本地仓库",
+            "commit",
+            "commit it",
+            "commit the code",
+            "提交代码吧",
+            "把刚才的修改提交一下",
+            "將代碼提交",
+            "提交當前代碼",
+            "please commit",
+            "commit the current changes",
+        ] {
+            assert_eq!(
+                parse_git_commit_intent(request),
+                GitCommitIntent::NaturalAllDirty,
+                "{request}"
+            );
+            assert!(request_is_git_commit(request), "{request}");
+            assert!(request_has_git_commit_operation(request), "{request}");
+            let host = parse_host_git_commit_request(request)
+                .unwrap_or_else(|| panic!("host-owned commit: {request}"));
+            assert_eq!(host.verifier, None, "{request}");
+            let route = deterministic_route(request);
+            assert_eq!(route.class, RouteClass::QuickEdit, "{request}");
+            assert!(route.team.is_empty(), "{request}");
+        }
+        assert_eq!(
+            parse_git_commit_intent("提交申请表单"),
+            GitCommitIntent::NotCommit
+        );
+
+        // A commit named together with another action, or in the middle of a
+        // sentence, stays behind the host boundary: refused, never delegated.
+        for request in [
+            "提交代码，然后推送",
+            "提交代码并推送",
+            "提交代码到远程仓库",
+            "把代码提交到远程",
+            "commit it and push",
+            "commit and push",
+            "确认提交，然后推送",
+            "修复bug然后提交代码",
+            "fix the bug and commit",
+            "提交后推送",
+            "提交完推送",
+            "帮我做一次 git commit",
+            "i want you to commit these changes",
+            "我想提交git记录",
+            "修复bug然后提交代码并推送",
+            "fix the bug and commit it, then push",
+            "提交 README.md，然后 cargo test",
+            "make a commit now",
+            "create a commit for these changes",
+        ] {
+            assert!(request_has_git_commit_operation(request), "{request}");
+            assert!(
+                parse_host_git_commit_request(request).is_none_or(|parsed| parsed.verifier.is_some()),
+                "{request}"
             );
         }
     }

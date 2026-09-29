@@ -226,6 +226,64 @@ fn guarded_explicit_confirmation_and_auto_each_make_exactly_one_host_commit() {
     }
 }
 
+#[test]
+fn common_commit_phrasings_make_one_host_commit_without_the_base() {
+    // `提交代码` and `commit it` once skipped the host transaction and opened
+    // the AI base, which could run `git add` / `git commit` itself.
+    for requirement in ["提交代码", "commit it"] {
+        let fixture = Fixture::new();
+        let before_count = fixture.commit_count();
+
+        let output = fixture
+            .command(requirement, "auto")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run host commit");
+
+        assert!(
+            output.status.success(),
+            "{requirement}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            fixture.commit_count(),
+            before_count + 1,
+            "{requirement} must create exactly one commit"
+        );
+        fixture.assert_no_ai_pipeline_side_effects(&output);
+    }
+}
+
+#[test]
+fn submit_feature_request_reaches_the_base_instead_of_the_git_boundary() {
+    // 提交 is also the everyday "submit": a confirm-submit button is product
+    // work for the base, not a Git commit for the host to refuse.
+    let fixture = Fixture::new();
+    let before_count = fixture.commit_count();
+
+    let output = fixture
+        .command("加一个确认提交按钮", "auto")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run feature request");
+
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("宿主独占") && !combined.contains("host-owned"),
+        "a feature request was refused as a Git commit:\n{combined}"
+    );
+    assert!(
+        fixture.base_marker.exists(),
+        "the feature request must reach the base:\n{combined}"
+    );
+    assert_eq!(fixture.commit_count(), before_count);
+}
+
 fn prepend_path(first: &Path) -> OsString {
     let mut paths = vec![first.to_path_buf()];
     paths.extend(std::env::split_paths(
