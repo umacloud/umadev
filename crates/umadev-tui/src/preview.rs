@@ -19,11 +19,9 @@ const PREVIEW_OWNER_SCRIPT: &str =
 /// npm/pnpm `.cmd` shim is found on `PATH` and Rust's hardened batch-argument
 /// encoder handles its argv. A command without a `cd X &&` prefix runs in the
 /// workspace root, through `sh -c` on Unix so a recorded command keeps its shell
-/// syntax; after a `cd X &&` prefix, Unix uses `sh -c` in `X` only when the rest
-/// needs a shell ([`needs_shell`]). Windows never uses `cmd /c`: `cmd.exe` would
-/// look the program up in the workspace before `PATH`, so a static-HTML
-/// repository could ship a `python3.bat` that the automatic post-build preview
-/// then ran on the host.
+/// syntax. Windows never uses `cmd /c`: `cmd.exe` would look the program up in
+/// the workspace before `PATH`, so a static-HTML repository could ship a
+/// `python3.bat` that the automatic post-build preview then ran on the host.
 pub(super) fn parse_run_command(
     command: &str,
     project_root: &std::path::Path,
@@ -41,9 +39,8 @@ pub(super) fn parse_run_command(
             if !cfg!(windows) && needs_shell(rest) {
                 // A further `&&` chain, env assignment, quoting, or redirect is
                 // shell syntax: run it verbatim through `sh -c` in the `cd`
-                // directory rather than splitting it into argv. Windows has no
-                // shell it can hand this to safely (see above), so it keeps the
-                // direct spawn.
+                // directory rather than splitting it into argv. (Windows has no
+                // safe shell for this; see the doc comment above.)
                 return (
                     resolved,
                     "sh".to_string(),

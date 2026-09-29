@@ -8569,6 +8569,7 @@ mod tests {
         let workspace = std::env::temp_dir().join(format!("sd-ui-test-workspace-{pid}-{id}"));
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&workspace);
+        crate::app::workspace_trust::trust_for_test(&workspace);
         let mut app = App::new(
             "demo",
             UserConfig {

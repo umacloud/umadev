@@ -164,10 +164,14 @@ pub struct PipelineConfig {
     /// Overridable per run by the `UMADEV_STRICT_COVERAGE=1` environment flag.
     #[serde(default)]
     pub strict_coverage: bool,
-    // There is deliberately no gate auto-approval switch here. `.umadevrc`
-    // travels with the repository, so a cloned project could otherwise start
-    // itself in Auto. Only the user raises the tier (`/mode auto`, Shift+Tab,
-    // `--mode auto`); an old `auto_approve_gates` key is ignored.
+    /// Legacy switch for auto-approving the ordinary document/preview gates.
+    /// `.umadevrc` travels with the repository, so it may keep the gates
+    /// asking (`false`, the default) but never turn this on: `true` is ignored
+    /// at load. Auto is chosen by the user on this machine (Shift+Tab or
+    /// `/mode auto` in the TUI, `--mode auto` on the CLI), and only in a
+    /// project the user trusts (see [`crate::workspace_trust`]).
+    #[serde(default)]
+    pub auto_approve_gates: bool,
 }
 
 impl Default for PipelineConfig {
@@ -176,6 +180,7 @@ impl Default for PipelineConfig {
             skip_phases: Vec::new(),
             max_review_rounds: default_review_rounds(),
             strict_coverage: false,
+            auto_approve_gates: false,
         }
     }
 }
@@ -471,6 +476,12 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     // Clamp quality threshold and top_k to sensible bounds.
     cfg.quality.threshold = cfg.quality.threshold.min(100);
     cfg.quality.keep_only_stricter();
+    if cfg.pipeline.auto_approve_gates {
+        tracing::warn!(
+            "Ignored `.umadevrc` [pipeline] auto_approve_gates = true: a repository config cannot choose Auto; pick it with Shift+Tab, `/mode auto` or `--mode auto`."
+        );
+        cfg.pipeline.auto_approve_gates = false;
+    }
     cfg.knowledge.top_k = cfg.knowledge.top_k.clamp(1, 50);
     // Normalise the codex sandbox to a canonical kebab id; an unrecognised
     // explicitly invalid value falls back to the restricted `workspace-write`
@@ -867,18 +878,33 @@ mod tests {
         // must keep both and only touch [codex] sandbox_mode.
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "# my notes\n[pipeline]\nmax_review_rounds = 2\n",
+            "# my notes\n[pipeline]\nauto_approve_gates = false\n",
         )
         .unwrap();
         persist_codex_sandbox(tmp.path(), CodexSandbox::DangerFullAccess).unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
         assert!(body.contains("# my notes"), "comment preserved");
-        assert!(body.contains("max_review_rounds = 2"), "sibling preserved");
+        assert!(
+            body.contains("auto_approve_gates = false"),
+            "sibling preserved"
+        );
         assert!(body.contains("danger-full-access"));
         // And it round-trips through the loader as the chosen tier.
         let cfg = load_project_config(tmp.path());
         assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
-        assert_eq!(cfg.pipeline.max_review_rounds, 2);
+        assert!(!cfg.pipeline.auto_approve_gates);
+    }
+
+    #[test]
+    fn a_repository_config_cannot_turn_on_auto_approval() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!load_project_config(tmp.path()).pipeline.auto_approve_gates);
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[pipeline]\nauto_approve_gates = true\n",
+        )
+        .unwrap();
+        assert!(!load_project_config(tmp.path()).pipeline.auto_approve_gates);
     }
 
     #[test]

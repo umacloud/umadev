@@ -521,7 +521,9 @@ impl ClaudeSession {
         // args carry no firmware, so this is a no-op there. Fail-open (a temp-write
         // error keeps the inline arg). The guard is held on the session so the file
         // lives for the child's lifetime and is cleaned up on drop.
-        let (args, firmware_file) = maybe_divert_firmware(&prog, &lead, args);
+        // An untrusted project's own settings, hooks and MCP servers never load.
+        let args = [args, &crate::project_config::claude_args(workspace)].concat();
+        let (args, firmware_file) = maybe_divert_firmware(&prog, &lead, &args);
         let mut cmd = Command::new(&prog);
         cmd.args(&lead);
         cmd.args(&args);
@@ -4205,6 +4207,53 @@ mod tests {
          printf '%s\\n' '{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"{\\\"accepts\\\":true}\"}}}'\n\
          printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
          cat >/dev/null\n";
+
+    /// Launch the argv-recording fake in `workspace` and return the argv it got.
+    #[cfg(unix)]
+    async fn recorded_launch_argv(workspace: &std::path::Path) -> Vec<String> {
+        let fake = write_fake_claude(
+            workspace,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv.tmp && mv argv.tmp argv.txt\ncat >/dev/null\n",
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            workspace,
+            None,
+            "sid-main",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        let recorded = workspace.join("argv.txt");
+        for _ in 0..250 {
+            if recorded.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let argv = std::fs::read_to_string(&recorded).expect("the fake recorded its argv");
+        let _ = session.end().await;
+        std::fs::remove_file(&recorded).unwrap();
+        argv.lines().map(str::to_string).collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_loads_project_settings_and_mcp_servers_only_in_a_trusted_project() {
+        let tmp = tempfile_dir();
+        let expected = session_args("sid-main", None, false, None);
+
+        // Untrusted: exactly the usual argv plus user-only settings and no MCP.
+        let mut restricted = expected.clone();
+        restricted.extend(["--setting-sources", "user", "--strict-mcp-config"].map(String::from));
+        assert_eq!(recorded_launch_argv(&tmp).await, restricted);
+
+        // Trusted: the argv is unchanged.
+        crate::project_config::set_project_trusted(&tmp, true);
+        assert_eq!(recorded_launch_argv(&tmp).await, expected);
+        crate::project_config::set_project_trusted(&tmp, false);
+    }
 
     /// Drain a driven fork's events until its `TurnDone`, collecting the text.
     #[cfg(unix)]

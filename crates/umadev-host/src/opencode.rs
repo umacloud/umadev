@@ -359,13 +359,14 @@ impl Runtime for OpenCodeDriver {
             .map_err(crate::map_subprocess_error)?;
         let prompt = merge_prompt(&req);
         let args = self.call_args(&req.model);
+        let env = crate::project_config::opencode_env(&ws);
         let out = run_subprocess(SubprocessCall {
             program: &self.program,
             args: &args,
             prompt: &prompt,
             workspace: &ws,
             timeout: self.timeout,
-            env: &[],
+            env: &env,
         })
         .await
         .map_err(crate::map_subprocess_error)?;
@@ -413,6 +414,7 @@ impl Runtime for OpenCodeDriver {
         let model = req.model.clone();
         let program = self.program.clone();
         let timeout = self.timeout;
+        let env = crate::project_config::opencode_env(&ws);
 
         // Accumulate the raw stream so a mid-stream failure can salvage whatever
         // already arrived (opencode's answer IS its plain stdout) instead of
@@ -425,7 +427,7 @@ impl Runtime for OpenCodeDriver {
                 prompt: &prompt,
                 workspace: &ws,
                 timeout,
-                env: &[],
+                env: &env,
             },
             &|line: &str| {
                 stream_buf.push_line(line);

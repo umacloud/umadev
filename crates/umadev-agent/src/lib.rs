@@ -111,6 +111,7 @@ pub mod trust;
 pub mod usage_ledger;
 pub mod verify;
 pub mod workspace_diff;
+pub mod workspace_trust;
 
 #[cfg(test)]
 mod test_support;

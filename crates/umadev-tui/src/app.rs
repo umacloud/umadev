@@ -41,6 +41,7 @@ mod run_pause;
 mod submission;
 mod task_control;
 mod usage_meter;
+pub(crate) mod workspace_trust;
 
 use animation_settings::{
     animation_settings_root, animations_enabled_default, read_animation_settings,
@@ -752,9 +753,9 @@ pub enum Action {
     /// Backend was switched (saved to config); the engine task should be
     /// restarted on next `StartRun`.
     BackendChanged,
-    /// The active Codex sandbox changed. A resident app-server thread keeps the
-    /// permissions it was started with, so the event loop must close and
-    /// immediately pre-load the session again before the next turn.
+    /// The active Codex sandbox, or the project's trust, changed. A resident
+    /// base keeps the permissions and project configuration it was started
+    /// with, so the event loop must close and pre-load the session again.
     SandboxChanged,
     /// `/init` changed project guidance or the effective slug. Re-prime the
     /// resident base so it reads the initialized workspace before the next turn.
@@ -3021,19 +3022,24 @@ pub struct App {
     /// Its settle/cancel path must never reset a parked Director run or consume
     /// any resident base-session identity.
     pub(crate) host_git_in_flight: bool,
-    /// Session-level gate auto-approval set via `/manual` (`Some(false)`) or
-    /// `/auto` (`Some(true)`). `None` → the default `guarded` tier. Lets the
-    /// user flip review mode mid-session without losing it on restart-of-flow.
+    /// Session-level review-mode override set via `/manual` (`Some(false)`) or
+    /// `/auto` (`Some(true)`). `None` → gates pause for review. Lets the user
+    /// flip review mode mid-session without losing it on restart-of-flow.
     ///
     /// Kept as the compatibility surface for the binary `/auto` `/manual`
     /// toggle; `trust_mode_override` is the richer three-tier control that
     /// supersedes it. The two stay consistent — flipping one updates the other.
     pub auto_approve_override: Option<bool>,
 
-    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`,
-    /// Shift+Tab). `None` → the default `guarded` tier. When `Some`, it takes
-    /// precedence and also drives the legacy `auto_approve_override`.
+    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`).
+    /// `None` → Guarded. When `Some`, it also drives the legacy
+    /// `auto_approve_override`. Auto is only ever chosen here, in the session:
+    /// no repository file can select it.
     pub trust_mode_override: Option<umadev_agent::TrustMode>,
+
+    /// Whether the user trusts this project (`None`: not asked yet, untrusted).
+    /// See [`umadev_agent::workspace_trust`].
+    pub(crate) workspace_trust: Option<bool>,
 
     /// Per-project collaborative trust ledger (`.umadev/trust.json`). Records
     /// how many times in a row each gate passed; after a threshold it *suggests*
@@ -3175,7 +3181,7 @@ pub struct App {
     /// `PhaseStarted` so the status bar can show per-phase elapsed time.
     pub phase_started_at: Option<std::time::Instant>,
 
-    /// When the tier auto-approves gates and a gate just opened, this holds
+    /// When the Auto tier is on and a gate just opened, this holds
     /// the gate to auto-continue. The event loop picks it up right after
     /// `apply_engine_event` returns and fires `Action::Continue`.
     pub pending_auto_continue: Option<Gate>,
@@ -3750,6 +3756,7 @@ impl App {
             host_git_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
+            workspace_trust: workspace_trust::load(&project_root),
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
             backends: Vec::new(),
             backend_probe_generation: 0,
@@ -4824,6 +4831,7 @@ impl App {
             return;
         }
         self.greeted = true;
+        self.ask_workspace_trust_if_undecided();
         // Value-first: lead with the OUTCOME, not the architecture/config.
         // Localized (zh-CN / zh-TW / en) via the i18n catalog.
         self.push(
@@ -7212,6 +7220,7 @@ impl App {
             CmdGroup::Pipeline,
             "tui.cmd.mode",
         ),
+        Self::cmd("trust", &[], None, CmdGroup::Pipeline, "tui.cmd.trust"),
         Self::cmd(
             "diff",
             &[],
@@ -10808,6 +10817,9 @@ impl App {
     /// **Fail-open:** an out-of-range index, no active picker, or no active gate
     /// → [`Action::None`] (the gate is left untouched).
     fn gate_choice_pick(&mut self, idx: usize) -> Action {
+        if let Some(action) = self.pick_workspace_trust(idx) {
+            return action;
+        }
         if self.gate_query_in_flight {
             self.push(
                 ChatRole::System,
@@ -12887,6 +12899,7 @@ impl App {
             "manual" => self.slash_set_review_mode(false),
             "auto" => self.slash_set_review_mode(true),
             "mode" => self.slash_mode(rest),
+            "trust" => self.slash_trust(),
             "thinking" => self.slash_thinking(rest),
             "sandbox" => self.slash_sandbox(rest),
             "lang" => self.slash_lang(rest),
@@ -15521,11 +15534,8 @@ impl App {
             TrustMode::Plan | TrustMode::Auto => TrustMode::Guarded,
             TrustMode::Guarded => TrustMode::Auto,
         };
-        if self.mode_change_blocked_while_busy(next) {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
-            );
+        if let Some(refusal) = self.mode_change_refusal(next) {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, refusal));
             return;
         }
         self.set_trust_mode(next);
@@ -15536,22 +15546,20 @@ impl App {
     }
 
     /// Resolve the active trust tier: an explicit `/mode` (or `/auto` /
-    /// `/manual`, Shift+Tab) session override wins; otherwise `guarded`.
-    ///
-    /// Project configuration never selects the tier. `.umadevrc` travels with
-    /// the repository, so honouring it would let a cloned project start itself
-    /// in Auto; only the user raises the tier, one session at a time.
+    /// `/manual`) session override, else Guarded, never above what the
+    /// project's trust allows. A repository's `.umadevrc` cannot raise it.
     #[must_use]
     pub fn effective_trust_mode(&self) -> umadev_agent::TrustMode {
-        if let Some(m) = self.trust_mode_override {
-            return m;
-        }
-        // Legacy binary override (set via `/auto` / `/manual` before any
-        // `/mode`) still maps onto a tier for back-compat.
-        match self.auto_approve_override {
-            Some(true) => umadev_agent::TrustMode::Auto,
-            Some(false) | None => umadev_agent::TrustMode::Guarded,
-        }
+        use umadev_agent::TrustMode;
+        // The legacy binary override (`/auto` / `/manual` before any `/mode`)
+        // still maps onto a tier for back-compat.
+        let chosen = self
+            .trust_mode_override
+            .unwrap_or(match self.auto_approve_override {
+                Some(true) => TrustMode::Auto,
+                _ => TrustMode::Guarded,
+            });
+        umadev_agent::workspace_trust::cap_tier(chosen, self.workspace_trusted())
     }
 
     /// Codex sandbox a newly opened worker will actually request for the
@@ -15576,19 +15584,6 @@ impl App {
             && (self.has_interruptible_work() || self.thinking)
     }
 
-    /// Whether a tier change to `next` must be refused because a turn is live.
-    /// The ONE guard shared by `/mode`, `/manual`/`/auto`, AND Shift+Tab: a
-    /// mid-turn DOWNGRADE (e.g. Auto→Guarded) would flip the chip to a tighter
-    /// tier while the running base process keeps its wider launch authority —
-    /// the chip would say 手动审核 while writes still flow unasked (the reported
-    /// chip/authority mismatch window). Shift+Tab used to check only the codex
-    /// idle rule and so bypassed this; routing all three through here closes it.
-    fn mode_change_blocked_while_busy(&self, next: umadev_agent::TrustMode) -> bool {
-        (self.effective_trust_mode().is_downgrade_to(next)
-            && (self.has_interruptible_work() || self.thinking))
-            || self.codex_mode_change_requires_idle(next)
-    }
-
     /// Whether gates currently auto-approve (true) or pause for review (false).
     /// Kept for the prompt meta-row chip + back-compat; `auto` tier → true.
     #[must_use]
@@ -15602,11 +15597,8 @@ impl App {
         } else {
             umadev_agent::TrustMode::Guarded
         };
-        if self.mode_change_blocked_while_busy(mode) {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
-            );
+        if let Some(refusal) = self.mode_change_refusal(mode) {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, refusal));
             return Action::None;
         }
         self.set_trust_mode(mode);
@@ -15639,11 +15631,8 @@ impl App {
         }
         match umadev_agent::TrustMode::parse(arg) {
             Some(mode) => {
-                if self.mode_change_blocked_while_busy(mode) {
-                    self.push(
-                        ChatRole::System,
-                        umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
-                    );
+                if let Some(refusal) = self.mode_change_refusal(mode) {
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, refusal));
                     return Action::None;
                 }
                 self.set_trust_mode(mode);

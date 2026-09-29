@@ -434,6 +434,16 @@ fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
         TrustMode::Auto
     );
 
+    // A saved Auto tier resumes only in a project the user trusts.
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+    state.permission_profile = Some(BasePermissionProfile::Auto);
+    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
+    assert_eq!(
+        persisted_run_mode(tmp.path(), TrustMode::Guarded),
+        TrustMode::Guarded
+    );
+    crate::app::workspace_trust::trust_for_test(tmp.path());
+
     for (profile, expected) in [
         (BasePermissionProfile::Plan, TrustMode::Plan),
         (BasePermissionProfile::Auto, TrustMode::Auto),
@@ -2764,6 +2774,7 @@ fn shift_tab_cycles_only_between_writable_tiers_never_read_only_plan() {
         tmp.path().join("config.toml"),
         tmp.path().to_path_buf(),
     );
+    app.workspace_trust = Some(true);
 
     // Auto → Guarded (NOT Plan). The reported bug: Shift+Tab from Auto landed in
     // read-only Plan, stripping ALL write permission ("current turn is read-only,
@@ -4954,9 +4965,9 @@ fn parse_run_command_cd_form() {
 #[test]
 fn parse_run_command_cd_form_shells_out_for_chains_and_env_assignments() {
     // Only the leading `cd` is peeled off; on Unix anything that needs a shell
-    // (a further `&&` chain, an env assignment, quotes, redirects) must run via
+    // (a further `&&` chain, an env assignment, quotes, redirects) runs via
     // `sh -c` in the `cd` directory instead of becoming argv. Windows never
-    // hands a run to `cmd /c` (see `parse_run_command_never_hands_windows_runs_to_cmd`).
+    // hands a run to `cmd /c`, so it spawns the resolved program directly.
     let root = std::path::PathBuf::from("/proj");
     for (command, rest) in [
         (
@@ -4972,8 +4983,9 @@ fn parse_run_command_cd_form_shells_out_for_chains_and_env_assignments() {
     ] {
         let (dir, prog, args) = parse_run_command(command, &root);
         assert_eq!(dir, std::path::PathBuf::from("/proj/web"), "{command}");
+        assert_ne!(prog, "cmd", "{command}");
         if cfg!(windows) {
-            assert_ne!(prog, "cmd", "{command}");
+            assert_eq!((prog, args), expected_root_run(rest), "{command}");
         } else {
             assert_eq!(prog, "sh", "{command}");
             assert_eq!(args, vec!["-c".to_string(), rest.into()], "{command}");

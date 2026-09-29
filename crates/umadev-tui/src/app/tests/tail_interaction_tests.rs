@@ -2707,7 +2707,8 @@ fn notable_warning_still_shows_in_transcript() {
 
 #[test]
 fn default_trust_mode_is_guarded() {
-    // With no session override the tier is the human-in-the-loop default.
+    // With no session choice the tier is the human-in-the-loop default, even
+    // in a trusted project.
     let a = fresh_app(Some("offline"));
     assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
     assert!(!a.auto_approve_on());
@@ -2758,21 +2759,77 @@ fn shift_tab_toggles_guarded_auto_and_never_enters_read_only_plan() {
 }
 
 #[test]
-fn project_config_never_selects_auto() {
-    // `.umadevrc` travels with the repository. The old
-    // `auto_approve_gates = true` let a cloned project start itself in Auto;
-    // it is now ignored, and only the user raises the tier.
-    let mut a = fresh_app(Some("offline"));
-    std::fs::write(
-        a.project_root.join(".umadevrc"),
-        "[pipeline]\nauto_approve_gates = true\n",
-    )
-    .unwrap();
-    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-    assert!(!a.auto_approve_on());
+fn a_repository_umadevrc_never_selects_auto() {
+    // Auto is chosen on this machine, in the session. A cloned repository's
+    // `.umadevrc` asking for it is ignored whether or not the project is trusted.
+    for trusted in [true, false] {
+        let mut a = fresh_app(Some("offline"));
+        std::fs::write(
+            a.project_root.join(".umadevrc"),
+            "[pipeline]\nauto_approve_gates = true\n",
+        )
+        .unwrap();
+        a.workspace_trust = Some(trusted);
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+        assert!(!a.auto_approve_on());
+    }
+}
 
-    a.set_trust_mode(umadev_agent::TrustMode::Auto);
-    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
+#[test]
+fn an_untrusted_project_runs_at_most_guarded() {
+    use umadev_agent::TrustMode;
+    let mut a = fresh_app(Some("offline"));
+    a.workspace_trust = Some(false);
+    // Every way of selecting Auto is refused, and the tier is unchanged.
+    a.cycle_approval_mode();
+    assert_eq!(a.effective_trust_mode(), TrustMode::Guarded);
+    let _ = a.try_slash_command("/mode auto");
+    let _ = a.try_slash_command("/auto");
+    assert_eq!(a.effective_trust_mode(), TrustMode::Guarded);
+    assert!(a.history.back().unwrap().body().contains("/trust"));
+    // An override set any other way is still capped.
+    a.trust_mode_override = Some(TrustMode::Auto);
+    assert_eq!(a.effective_trust_mode(), TrustMode::Guarded);
+    // Plan stays available.
+    let _ = a.try_slash_command("/mode plan");
+    assert_eq!(a.effective_trust_mode(), TrustMode::Plan);
+}
+
+#[test]
+fn the_first_run_in_an_undecided_project_asks_and_trust_can_be_revoked() {
+    use umadev_agent::TrustMode;
+    let mut a = fresh_app(Some("offline"));
+    let root = a.project_root.clone();
+    // Forget the trust `fresh_app` granted: the next launch asks.
+    umadev_agent::workspace_trust::record(&root, false).unwrap();
+    a.workspace_trust = None;
+    a.greeted = false;
+    a.push_greeting();
+    assert!(
+        a.gate_choice.is_some(),
+        "an undecided project is asked about"
+    );
+
+    // Enter picks the first option, Trust; the base is restarted to load it.
+    assert!(matches!(
+        a.apply_key(KeyCode::Enter),
+        Action::SandboxChanged
+    ));
+    assert!(a.gate_choice.is_none());
+    assert_eq!(umadev_agent::workspace_trust::decision(&root), Some(true));
+    assert!(umadev_host::project_config::loads_project_config(&root));
+    a.set_trust_mode(TrustMode::Auto);
+    assert_eq!(a.effective_trust_mode(), TrustMode::Auto);
+
+    // `/trust` asks again; Don't trust revokes it and leaves Auto.
+    let _ = a.try_slash_command("/trust");
+    assert!(matches!(
+        a.apply_key(KeyCode::Char('2')),
+        Action::SandboxChanged
+    ));
+    assert_eq!(umadev_agent::workspace_trust::decision(&root), Some(false));
+    assert!(!umadev_host::project_config::loads_project_config(&root));
+    assert_eq!(a.effective_trust_mode(), TrustMode::Guarded);
 }
 
 #[test]

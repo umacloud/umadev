@@ -684,6 +684,8 @@ async fn spawn_serve(
     cmd.args(serve_args());
     cmd.current_dir(workspace);
     cmd.env("OPENCODE_SERVER_PASSWORD", &password);
+    // An untrusted project's `opencode.json`, plugins and agents never load.
+    cmd.envs(crate::project_config::opencode_env(workspace));
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

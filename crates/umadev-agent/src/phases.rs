@@ -2088,21 +2088,21 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
             Some((at.with_timezone(&chrono::Utc), r)).filter(|(at, _)| *at <= now)
         })
         .collect();
+    // Stable, so rows sharing a stamp keep their append order.
+    rows.sort_by_key(|(at, _)| *at);
+    let (newest, last) = rows.last()?;
     // The latest run is the trailing batch of rows. A batch is appended in one
     // tight loop, but timestamps have 1 s resolution, so a batch can straddle a
     // second boundary — matching only the newest timestamp would drop its
-    // earlier rows (e.g. a failed build). Order by stamp (stable, so a batch
-    // keeps its append order), then walk back from the newest row while rows
-    // stay within a second of it, carry the same tree fingerprint, and don't
-    // repeat a step (each run records a step once).
-    rows.sort_by_key(|(at, _)| *at);
-    let (last_at, last) = rows.last()?;
+    // earlier rows (e.g. a failed build). Walk back from the newest row while
+    // rows stay within a second of it, carry the same tree fingerprint, and
+    // don't repeat a step (each run records a step once).
     let mut seen_steps = std::collections::HashSet::new();
     let latest: Vec<&VRow> = rows
         .iter()
         .rev()
         .take_while(|(at, r)| {
-            (*last_at - *at).num_seconds() <= 1
+            (*newest - *at).num_seconds() <= 1
                 && r.source_fingerprint == last.source_fingerprint
                 && seen_steps.insert(r.step.as_str())
         })
@@ -2513,34 +2513,56 @@ fn render_quality_md(r: &QualityReport) -> String {
 // delivery (UD-EVID-005) — proof pack
 // =====================================================================
 
+/// The quality verdict a delivery acts on, as the caller holds it in memory.
+///
+/// Only a verdict from a gate this process ran can graduate skills or word a
+/// lesson as "passed": `output/<slug>-quality-gate.json` is model-writable, so
+/// a report read back from it is display-only.
+#[derive(Debug, Clone, Copy)]
+pub enum DeliveryVerdict<'a> {
+    /// No gate ran in this process (a `/redo` of delivery alone): the run is
+    /// treated as not having passed, and the report on disk is only shown.
+    Unjudged,
+    /// The gate JSON the scored quality phase produced (see
+    /// [`run_quality_report`]); it is also recorded in the compliance mapping.
+    Gate(&'a str),
+    /// The director's final review settled clean. That path runs no scored
+    /// quality phase, so there is no gate JSON to record, but the review is
+    /// the gate its delivery is conditioned on.
+    ReviewedClean,
+}
+
 /// Run the `delivery` phase (`UD-EVID-005`). Emits compliance mapping
 /// and a proof-pack zip in `release/`.
 ///
-/// Without the gate JSON of a quality phase this process just ran, the run
-/// is treated as not having passed: nothing is graduated or recorded as
-/// validated, and the report on disk is only shown. See
-/// [`run_delivery_with_quality`].
+/// This is [`run_delivery_with_quality`] with [`DeliveryVerdict::Unjudged`]:
+/// nothing is graduated or recorded as validated.
 pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
-    run_delivery_with_quality(opts, None)
+    run_delivery_with_quality(opts, DeliveryVerdict::Unjudged)
 }
 
-/// [`run_delivery`] for a caller holding the gate JSON its quality phase
-/// produced (see [`run_quality_report`]). Only that verdict can graduate
-/// skills or word a lesson as "passed": `output/<slug>-quality-gate.json` is
-/// model-writable, so a report read back from it is display-only.
+/// [`run_delivery`] acting on the quality verdict the caller's gate produced.
 pub fn run_delivery_with_quality(
     opts: &RunOptions,
-    quality_json: Option<&str>,
+    verdict: DeliveryVerdict<'_>,
 ) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
 
     // The verdict gates both the skill graduation below AND the wording of the
     // captured-pattern lesson (we must never sediment "passed the quality
-    // gate" when it did not pass). Fail-closed: no in-memory verdict, or one
-    // that does not parse, reads as "not passed".
+    // gate" when it did not pass). Fail-closed: no in-memory verdict, or gate
+    // JSON that does not parse, reads as "not passed".
+    let quality_json = match verdict {
+        DeliveryVerdict::Gate(json) => Some(json),
+        DeliveryVerdict::Unjudged | DeliveryVerdict::ReviewedClean => None,
+    };
     let quality_report = quality_json.and_then(|j| serde_json::from_str::<QualityReport>(j).ok());
-    let quality_passed = quality_report.as_ref().is_some_and(|r| r.passed);
+    let quality_passed = match verdict {
+        DeliveryVerdict::Gate(_) => quality_report.as_ref().is_some_and(|r| r.passed),
+        DeliveryVerdict::ReviewedClean => true,
+        DeliveryVerdict::Unjudged => false,
+    };
 
     // 0. Capture validated patterns (D2: success -> sediment -> retrieval loop)
     let arch_text = read_phase_artifact(
@@ -6548,10 +6570,32 @@ mod tests {
             "a report read back from output/ validated a pattern"
         );
 
-        run_delivery_with_quality(&o, Some(&passing)).unwrap();
+        run_delivery_with_quality(&o, DeliveryVerdict::Gate(&passing)).unwrap();
         assert!(
             validated() > 0,
             "the in-memory pass must record the patterns"
+        );
+    }
+
+    #[test]
+    fn delivery_after_a_clean_final_review_records_validated_patterns() {
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        run_research(&o, None).unwrap();
+        run_docs(&o, &DocsContent::default()).unwrap();
+        run_spec(&o).unwrap();
+        run_frontend(&o).unwrap();
+        run_backend(&o).unwrap();
+        run_quality_report(&o).unwrap();
+        run_delivery(&o).unwrap();
+        let validated =
+            || crate::lessons::read_raw_lessons(tmp.path(), "validated-decisions.jsonl").len();
+        assert_eq!(validated(), 0, "an unjudged delivery validated a pattern");
+
+        run_delivery_with_quality(&o, DeliveryVerdict::ReviewedClean).unwrap();
+        assert!(
+            validated() > 0,
+            "the director's clean final review is the verdict its delivery acts on"
         );
     }
 

@@ -258,6 +258,9 @@ impl CodexDriver {
             // `complete` returned that whole banner as the "answer".
             "--json".to_string(),
         ]);
+        // An untrusted project's `.codex/` config, hooks and exec policies stay off.
+        let workspace = self.workspace.clone().unwrap_or_else(default_workspace);
+        args.extend(crate::project_config::codex_exec_args(&workspace));
         args
     }
 }

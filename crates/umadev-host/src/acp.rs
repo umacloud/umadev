@@ -1841,6 +1841,11 @@ impl AcpSession {
         // validation happened first, ACP arguments would later target a batch
         // shim through `spawn_parts` rather than the intended native binary.
         let program = resolve_and_validate_vendor_program(vendor, program)?;
+        if matches!(vendor, AcpVendor::Kimi) {
+            if let Some(reason) = crate::project_config::kimi_refusal(workspace) {
+                return Err(SessionOpenError::from(SessionError::Start(reason)));
+            }
+        }
         let grok_client_source_capabilities = if matches!(vendor, AcpVendor::Grok) {
             match grok_preflight_override {
                 Some(capabilities) => capabilities,

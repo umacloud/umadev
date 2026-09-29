@@ -391,8 +391,8 @@ fn fresh_app(backend: Option<&str>) -> App {
         ..Default::default()
     };
     // PID + counter keeps the workspace unique across parallel test processes.
-    // The default tier is Guarded, so gate-card tests see the manual-approval
-    // path. Remove any leftover dir
+    // The .umadevrc disables auto_approve_gates so
+    // gate-card tests see the manual-approval path. Remove any leftover dir
     // from a PRIOR run first so a persisted `.umadev/chat/` (Wave 5) can't
     // bleed into a test that expects a clean conversation buffer.
     let workspace = std::env::temp_dir().join(format!("sd-test-ws-{pid}-{id}"));
@@ -400,8 +400,11 @@ fn fresh_app(backend: Option<&str>) -> App {
     let _ = std::fs::create_dir_all(&workspace);
     let _ = std::fs::write(
         workspace.join(".umadevrc"),
-        "[pipeline]\nmax_review_rounds = 3\n",
+        "[pipeline]\nauto_approve_gates = false\n",
     );
+    // The tests below exercise a project the user trusts; the untrusted and
+    // undecided cases set `workspace_trust` themselves.
+    super::workspace_trust::trust_for_test(&workspace);
     let mut app = App::new(
         "demo",
         cfg,
@@ -1895,6 +1898,7 @@ fn temp_app() -> (App, tempfile::TempDir) {
         lang: Some("zh-CN".to_string()),
         ..Default::default()
     };
+    super::workspace_trust::trust_for_test(tmp.path());
     let app = App::new(
         "demo",
         cfg,
@@ -9743,7 +9747,8 @@ fn slash_deploy_floor_requires_confirm_even_in_auto_mode() {
         tmp.path().join("config.toml"),
         tmp.path().to_path_buf(),
     );
-    // Force the strictest-skipping tier; the floor must still gate.
+    // Force the strictest-skipping tier in a trusted project; the floor must still gate.
+    app.workspace_trust = Some(true);
     app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
     assert_eq!(app.effective_trust_mode(), umadev_agent::TrustMode::Auto);
     let preview = app.slash_deploy("");

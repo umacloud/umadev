@@ -64,8 +64,8 @@ pub enum TrustMode {
     Guarded,
     /// Fully autonomous — every gate auto-approves and the pipeline drives
     /// end-to-end. Only the user selects it (`/mode auto`, `/auto`, Shift+Tab,
-    /// `--mode auto`), never project configuration. (Reversibility escalation
-    /// still applies as a hard floor.)
+    /// `--mode auto`), and only in a project they trust; project configuration
+    /// never does. (Reversibility escalation still applies as a hard floor.)
     Auto,
 }
 
