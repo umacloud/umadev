@@ -684,6 +684,8 @@ async fn spawn_serve(
     cmd.args(serve_args());
     cmd.current_dir(workspace);
     cmd.env("OPENCODE_SERVER_PASSWORD", &password);
+    // An untrusted project's `opencode.json`, plugins and agents never load.
+    cmd.envs(crate::project_config::opencode_env(workspace));
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -714,8 +716,14 @@ async fn spawn_serve(
     let stderr_drain = child.stderr.take().map_or_else(StderrDrain::empty, |pipe| {
         StderrDrain::spawn(pipe, stderr.clone())
     });
-    let base_url = match read_listening_url(stdout, serve_timeout).await {
-        Ok(url) => url,
+    let http = read_listening_url(stdout, serve_timeout)
+        .await
+        .and_then(|base_url| {
+            HttpCtx::new(base_url, &password, workspace)
+                .map_err(|error| format!("could not build the OpenCode loopback client: {error}"))
+        });
+    let http = match http {
+        Ok(http) => http,
         Err(error) => {
             // `serve` start timed out / failed: kill the whole tree, not just the
             // trampoline, so no native `opencode serve` grandchild is orphaned.
@@ -728,7 +736,6 @@ async fn spawn_serve(
             return Err(SessionError::Start(error));
         }
     };
-    let http = HttpCtx::new(base_url, &password, workspace);
     Ok(SpawnedServe {
         child,
         #[cfg(windows)]
@@ -1525,7 +1532,7 @@ impl HttpCtx {
     /// Build the HTTP context. The directory is percent-encoded for the
     /// `x-opencode-directory` header (header values must be ASCII) and reused as
     /// the `?directory=` query the event stream filters on.
-    fn new(base_url: String, password: &str, workspace: &Path) -> Self {
+    fn new(base_url: String, password: &str, workspace: &Path) -> reqwest::Result<Self> {
         Self::new_with_timeout(base_url, password, workspace, JSON_REQUEST_TIMEOUT)
     }
 
@@ -1538,7 +1545,7 @@ impl HttpCtx {
         password: &str,
         workspace: &Path,
         json_timeout: Duration,
-    ) -> Self {
+    ) -> reqwest::Result<Self> {
         use std::fmt::Write as _;
         // base64 without pulling a crate: opencode auth is
         // `Basic base64("opencode:<password>")` (server/auth.ts).
@@ -1553,23 +1560,26 @@ impl HttpCtx {
                 let _ = write!(encoded, "%{b:02X}");
             }
         }
-        Self {
+        // Both clients only ever talk to the loopback `opencode serve` child, so
+        // they must never route through HTTP(S)_PROXY / ALL_PROXY: a proxy would
+        // receive the server password and every prompt and response. A builder
+        // failure therefore fails the session start; falling back to
+        // `Client::new()` would silently honour those proxies again.
+        Ok(Self {
             // A client with no global request timeout: the SSE stream is a
             // long-lived GET, so a per-call timeout would kill the event stream.
-            client: reqwest::Client::builder()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            client: reqwest::Client::builder().no_proxy().build()?,
             // A SEPARATE client WITH a request timeout for the short JSON calls
             // (create / prompt / abort / delete / permission-reply) so a wedged
             // server can never hang start / send / interrupt / end.
             json_client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(json_timeout)
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .build()?,
             base_url,
             auth,
             directory: encoded,
-        }
+        })
     }
 
     /// Common headers every authenticated (non-streaming) JSON call carries.
@@ -3358,19 +3368,24 @@ async fn read_bounded_serve_line<R: tokio::io::AsyncBufRead + Unpin>(
 /// (`opencode server listening on http://127.0.0.1:54321`, per `serve.ts`).
 /// Returns the bare `scheme://host:port` (no trailing path), trimming any
 /// trailing punctuation. Exposed for tests.
+///
+/// Only a plain-HTTP loopback address with a numeric port is accepted. UmaDev
+/// sends the server password, the workspace path and every prompt to this URL,
+/// and anything on stdout before the banner (a plugin or config the server
+/// loaded from the repository) could otherwise point it at another host.
 #[must_use]
 pub fn parse_listening_url(line: &str) -> Option<String> {
-    let idx = line.find("http://").or_else(|| line.find("https://"))?;
-    let rest = &line[idx..];
+    const SCHEME: &str = "http://";
+    let rest = &line[line.find(SCHEME)?..];
     // Stop at the first whitespace / trailing punctuation; the listen line has
     // no path component, so the url is `scheme://host:port`.
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let url = rest[..end].trim_end_matches(['.', ',', ')', '"', '\'']);
-    if url.len() > "http://".len() {
-        Some(url.to_string())
-    } else {
-        None
-    }
+    let url = rest[..end].trim_end_matches(['.', ',', ')', '"', '\'', '/']);
+    let (host, port) = url.strip_prefix(SCHEME)?.rsplit_once(':')?;
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]");
+    let port_ok = port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port != 0);
+    (loopback && port_ok).then(|| url.to_string())
 }
 
 /// Split a `provider/model` id into `(provider, model)`; `None` for a bare id
@@ -3426,7 +3441,7 @@ fn plan_session_ruleset() -> Value {
 }
 
 /// Build the `POST /session` permission ruleset for the autonomy tier — the
-/// opencode counterpart of codex's `approvalPolicy` (`never` vs `on-request`) and
+/// opencode counterpart of codex's `approvalPolicy` (`never` vs `untrusted`) and
 /// claude's `--permission-mode` (`acceptEdits` vs `default`), so all three native
 /// bases share ONE gate posture.
 ///
@@ -3438,7 +3453,7 @@ fn plan_session_ruleset() -> Value {
 ///   patches, shells, delegation, unknown future tools, and MCP-provided tools all
 ///   raise `permission.asked` (→ a `NeedApproval` the orchestrator answers via the
 ///   trust-tiered `approval_decision`). opencode evaluates a specific permission
-///   over the wildcard floor. Mirrors codex's `on-request`, while making the
+///   over the wildcard floor. Mirrors codex's `untrusted`, while making the
 ///   authorization boundary fail-closed when the tool vocabulary grows.
 ///
 /// Runtime/protocol failures remain fail-open to UmaDev's governance contract (an
@@ -3640,6 +3655,32 @@ mod tests {
         assert!(parse_listening_url("http://").is_none());
     }
 
+    #[test]
+    fn parse_listening_url_accepts_only_a_loopback_server() {
+        for line in [
+            "plugin: docs at http://evil.example:80",
+            "listening on http://10.0.0.5:4096",
+            "listening on http://127.0.0.1@evil.example:80",
+            "listening on http://127.0.0.1.evil.example:80",
+            "listening on https://127.0.0.1:4096",
+            "listening on http://127.0.0.1:4096/redirect",
+            "listening on http://127.0.0.1:0",
+            "listening on http://127.0.0.1:99999",
+            "listening on http://127.0.0.1",
+        ] {
+            assert!(parse_listening_url(line).is_none(), "{line}");
+        }
+        for (line, url) in [
+            (
+                "listening on http://localhost:4096/",
+                "http://localhost:4096",
+            ),
+            ("listening on http://[::1]:4096", "http://[::1]:4096"),
+        ] {
+            assert_eq!(parse_listening_url(line).as_deref(), Some(url), "{line}");
+        }
+    }
+
     #[tokio::test]
     async fn bounded_serve_reader_discards_oversize_and_recovers_at_next_line() {
         let bytes = b"0123456789\nlistening on http://127.0.0.1:7\r\nlast";
@@ -3696,7 +3737,8 @@ mod tests {
             "http://127.0.0.1:1".to_string(),
             "pw",
             Path::new("/tmp/my proj/uni cafe"),
-        );
+        )
+        .unwrap();
         // Spaces -> %XX; path separators preserved.
         assert!(ctx.directory.starts_with("/tmp/my%20proj/"));
         assert!(!ctx.directory.contains(' '));
@@ -4594,7 +4636,8 @@ mod tests {
             "pw",
             Path::new("/proj"),
             Duration::from_millis(50),
-        );
+        )
+        .unwrap();
         let (tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let lifecycle = Arc::new(Mutex::new(ChildLifecycle::default()));
         let result = settle_children(
@@ -4663,7 +4706,7 @@ mod tests {
             }
         });
 
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let lifecycle = Arc::new(Mutex::new(ChildLifecycle::default()));
         let settle_state = Arc::new(AtomicU8::new(0));
@@ -5128,7 +5171,7 @@ mod tests {
 
         // Build a session directly against the fake server (bypass the serve
         // spawn — that path is covered by the unix fake-sh port-parse test).
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let session_id = http
             .create_session(Some("build"), None, true)
             .await
@@ -5252,7 +5295,7 @@ mod tests {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
             }
         });
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let id = http
             .create_readonly_session(Some("anthropic/claude-sonnet"))
             .await
@@ -5304,7 +5347,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let opening = tokio::spawn(async move { http.start_readonly_fork(None).await });
         tokio::time::timeout(Duration::from_secs(2), seen_rx)
             .await
@@ -5502,7 +5545,8 @@ mod tests {
             "pw",
             Path::new("/proj"),
             Duration::from_millis(300),
-        );
+        )
+        .unwrap();
         let started = tokio::time::Instant::now();
         let res = http.create_session(None, None, false).await;
         assert!(
@@ -5528,7 +5572,8 @@ mod tests {
             "pw",
             Path::new("/proj"),
             Duration::from_millis(300),
-        );
+        )
+        .unwrap();
         let mut fork = OpenCodeForkSession {
             http,
             session_id: "ses_x".to_string(),
@@ -5574,7 +5619,8 @@ mod tests {
                 "pw",
                 Path::new("/proj"),
                 Duration::from_millis(100),
-            ),
+            )
+            .unwrap(),
             session_id: "ses_drop".to_string(),
             events: rx,
             sse_task: Some(sse_task),
@@ -5616,7 +5662,7 @@ mod tests {
         });
         let (_tx, rx) = mpsc::channel(1);
         let mut fork = OpenCodeForkSession {
-            http: HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")),
+            http: HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap(),
             session_id: "ses_readonly".to_string(),
             events: rx,
             sse_task: None,
@@ -5669,7 +5715,7 @@ mod tests {
                 .unwrap();
             }
         });
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
 
         respond_to_interaction(
             &http,
@@ -5727,7 +5773,7 @@ mod tests {
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
 
         http.finish_session("ses_writer", SessionLifecycle::Persistent)
             .await
@@ -5765,7 +5811,7 @@ mod tests {
         // End-to-end: a guarded (`autonomous = false`) create_session POSTs the
         // ask-by-default ruleset, so opencode will raise `permission.asked` for a
         // write, patch, shell, future tool, or MCP mutator — the same
-        // human-in-the-loop posture codex gets from `on-request`.
+        // human-in-the-loop posture codex gets from `untrusted`.
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -5792,7 +5838,7 @@ mod tests {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
             }
         });
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let id = http
             .create_session(Some("build"), None, false)
             .await
@@ -5828,7 +5874,7 @@ mod tests {
             .await
             .unwrap();
         });
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         http.prompt_async("ses_model", "continue", Some("anthropic/claude-sonnet"))
             .await
             .unwrap();
@@ -5857,7 +5903,7 @@ mod tests {
             .unwrap();
         });
 
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let (_tx, rx) = mpsc::channel(1);
         let mut session = OpenCodeForkSession {
             http,
@@ -5937,7 +5983,7 @@ mod tests {
                 let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
             }
         });
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         let id = http
             .create_session(Some("build"), None, true)
             .await
@@ -5962,7 +6008,7 @@ mod tests {
                 .await;
             }
         });
-        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj")).unwrap();
         // A 500 surfaces as an Err string, not a panic (fail-open at the caller).
         let res = http.create_session(None, None, true).await;
         assert!(res.is_err(), "HTTP 500 must surface as Err: {res:?}");
@@ -5973,7 +6019,8 @@ mod tests {
     async fn pump_sse_emits_failed_turndone_when_stream_unreachable() {
         // No server listening -> the SSE connect fails -> a terminal Failed
         // TurnDone is emitted (fail-open: the runner never hangs).
-        let http = HttpCtx::new("http://127.0.0.1:1".to_string(), "pw", Path::new("/proj"));
+        let http =
+            HttpCtx::new("http://127.0.0.1:1".to_string(), "pw", Path::new("/proj")).unwrap();
         let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(pump_sse(http, "ses_dead".to_string(), tx));
         match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
@@ -6304,7 +6351,7 @@ mod tests {
     }
 
     #[test]
-    fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_OPENCODE_SESSION_SECRET_83";
         let mut tracker = PartTracker::default();
         let text = serde_json::json!({
@@ -6340,8 +6387,8 @@ mod tests {
         events.extend(translate_frame_tracked(&tool, "ses_secret", &mut tracker));
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
         assert!(audit_view.contains("safe-page-3"));
 

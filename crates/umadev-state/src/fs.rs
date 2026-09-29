@@ -7,6 +7,13 @@ use std::time::SystemTime;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// The state directory name, both per project (`<workspace>/.umadev`)
+/// and global (`~/.umadev`). It holds chat transcripts, approval state and
+/// shadow checkpoints that capture gitignored files such as `.env`, so every
+/// managed creation makes it owner-only and gives it a self-ignoring
+/// `.gitignore` (see [`seed_state_dir_ignore`]).
+const STATE_DIR_NAME: &str = ".umadev";
+
 /// Return whether an advisory file-lock failure means another holder currently
 /// owns the lock.
 ///
@@ -123,17 +130,30 @@ pub fn ensure_real_child_dir(parent: &Path, name: &str) -> std::io::Result<PathB
     }
     let child = parent.join(name);
     match symlink_metadata_path(&child) {
-        Ok(meta) if metadata_is_real_dir(&meta) => Ok(child),
+        Ok(meta) if metadata_is_real_dir(&meta) => {
+            if name == STATE_DIR_NAME {
+                if let Ok((_, existing)) = open_managed_directory(&child) {
+                    seed_state_dir_ignore(&existing);
+                }
+            }
+            Ok(child)
+        }
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "managed path is not a real directory",
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let (managed_parent, child_name) = ManagedParent::open_for(&child)?;
-            match managed_parent.create_dir(&child_name) {
+            let state_dir = name == STATE_DIR_NAME;
+            match managed_parent.create_dir(&child_name, state_dir) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
+            }
+            if state_dir {
+                if let Ok((_, created)) = open_managed_directory(&child) {
+                    seed_state_dir_ignore(&created);
+                }
             }
             managed_parent
                 .directory_state(&child_name)
@@ -359,9 +379,11 @@ impl ManagedParent {
         retry_transient(|| self.capability.remove_dir(name))
     }
 
-    fn create_dir(&self, name: &OsStr) -> std::io::Result<()> {
+    /// Create one directory entry. `state_dir` marks the top-level
+    /// [`STATE_DIR_NAME`] directory, which is created owner-only.
+    fn create_dir(&self, name: &OsStr, state_dir: bool) -> std::io::Result<()> {
         validate_child_name(name)?;
-        retry_transient(|| self.capability.create_dir(name))
+        retry_transient(|| create_dir_entry(&self.capability, name, state_dir))
     }
 
     fn rename(&self, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
@@ -627,7 +649,7 @@ impl RootedDir {
     /// accepted, and optional parent creation also stays below this root.
     pub fn create_dir(&self, relative: &Path, create_parents: bool) -> std::io::Result<()> {
         let (parent, name) = self.parent(relative, create_parents)?;
-        parent.create_dir(&name)
+        parent.create_dir(&name, is_state_dir(relative))
     }
 
     /// Ensure one real directory exists below this capability. A concurrent
@@ -637,7 +659,7 @@ impl RootedDir {
         use cap_fs_ext::DirExt as _;
 
         let (parent, name) = self.parent(relative, create_parents)?;
-        match parent.create_dir(&name) {
+        match parent.create_dir(&name, is_state_dir(relative)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -658,6 +680,9 @@ impl RootedDir {
             }
         }
         let directory = parent.capability.open_dir_nofollow(&name)?;
+        if is_state_dir(relative) {
+            seed_state_dir_ignore(&directory);
+        }
         if !directory
             .into_std_file()
             .metadata()
@@ -1744,11 +1769,12 @@ fn parent_from(
 
     let parts = relative_parts(relative)?;
     let mut capability = root.capability.try_clone()?;
-    for part in &parts[..parts.len() - 1] {
+    for (index, part) in parts[..parts.len() - 1].iter().enumerate() {
+        let state_dir = index == 0 && part == STATE_DIR_NAME;
         match capability.open_dir_nofollow(part) {
             Ok(next) => capability = next,
             Err(error) if create_parents && error.kind() == std::io::ErrorKind::NotFound => {
-                match capability.create_dir(part) {
+                match create_dir_entry(&capability, part, state_dir) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(error),
@@ -1756,6 +1782,9 @@ fn parent_from(
                 capability = capability.open_dir_nofollow(part)?;
             }
             Err(error) => return Err(error),
+        }
+        if state_dir {
+            seed_state_dir_ignore(&capability);
         }
     }
     let directory = capability.try_clone()?.into_std_file();
@@ -1766,6 +1795,55 @@ fn parent_from(
         },
         parts.last().expect("non-empty path checked above").clone(),
     ))
+}
+
+/// Whether a rooted `relative` path names the top-level [`STATE_DIR_NAME`]
+/// directory itself (a nested `.umadev`, e.g. inside a memory tombstone
+/// payload, is ordinary data).
+fn is_state_dir(relative: &Path) -> bool {
+    relative.as_os_str() == STATE_DIR_NAME
+}
+
+/// Create one directory entry in `parent`: owner-only (0700 on unix) for the
+/// top-level state directory, the platform default for everything else.
+fn create_dir_entry(
+    parent: &cap_std::fs::Dir,
+    name: &OsStr,
+    state_dir: bool,
+) -> std::io::Result<()> {
+    if !state_dir {
+        return parent.create_dir(name);
+    }
+    #[cfg(unix)]
+    let builder = {
+        use cap_std::fs::DirBuilderExt as _;
+        let mut builder = cap_std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = cap_std::fs::DirBuilder::new();
+    parent.create_dir_with(name, &builder)
+}
+
+/// Give an opened top-level [`STATE_DIR_NAME`] directory a `.gitignore` of
+/// `*` when it has none, so the directory ignores itself: `git add -A` in a
+/// project that never ran `umadev init` cannot stage transcripts or the
+/// checkpoint store, whatever the root `.gitignore` says. Best-effort by
+/// design — an existing entry of any kind is left alone, and a failure never
+/// blocks the write that opened the directory.
+fn seed_state_dir_ignore(state: &cap_std::fs::Dir) {
+    let ignore = OsStr::new(".gitignore");
+    let (Ok(directory), Ok(capability)) = (state.try_clone(), state.try_clone()) else {
+        return;
+    };
+    let parent = ManagedParent {
+        directory: directory.into_std_file(),
+        capability,
+    };
+    if matches!(parent.file_state(ignore), Ok(None)) {
+        let _ = publish_new_private_in(&parent, ignore, b"*\n");
+    }
 }
 
 fn open_managed_directory(path: &Path) -> std::io::Result<(File, cap_std::fs::Dir)> {
@@ -2527,7 +2605,7 @@ pub fn remove_empty_dir(path: &Path) -> std::io::Result<bool> {
 /// sharing conflicts are retried for a bounded interval.
 pub fn create_dir(path: &Path) -> std::io::Result<()> {
     let (parent, name) = ManagedParent::open_for(path)?;
-    parent.create_dir(&name)
+    parent.create_dir(&name, false)
 }
 
 /// Rename a managed path, retrying transient Windows sharing violations so the
@@ -2638,6 +2716,59 @@ mod tests {
                 "repeated cleanup of an absent tree is idempotent"
             );
         }
+    }
+
+    #[test]
+    fn every_managed_creation_makes_the_state_dir_private_and_self_ignoring() {
+        let check = |root: &Path| {
+            let state = root.join(STATE_DIR_NAME);
+            assert_eq!(fs::read(state.join(".gitignore")).unwrap(), b"*\n");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(&state).unwrap().permissions().mode();
+                assert_eq!(mode & 0o077, 0, "{mode:o}");
+            }
+        };
+        let direct = tempfile::tempdir().unwrap();
+        ensure_real_child_dir(direct.path(), STATE_DIR_NAME).unwrap();
+        check(direct.path());
+
+        let rooted = tempfile::tempdir().unwrap();
+        RootedDir::open(rooted.path())
+            .unwrap()
+            .atomic_write(Path::new(".umadev/chat/one.json"), b"{}", true)
+            .unwrap();
+        check(rooted.path());
+
+        let ensured = tempfile::tempdir().unwrap();
+        RootedDir::open(ensured.path())
+            .unwrap()
+            .ensure_dir(Path::new(STATE_DIR_NAME), false)
+            .unwrap();
+        check(ensured.path());
+
+        // Other directories — a nested `.umadev` included — are plain data.
+        let plain = ensure_real_child_dir(direct.path(), "output").unwrap();
+        assert!(!plain.join(".gitignore").exists());
+        RootedDir::open(direct.path())
+            .unwrap()
+            .atomic_write(Path::new("payload/.umadev/memory/x"), b"x", true)
+            .unwrap();
+        assert!(!direct.path().join("payload/.umadev/.gitignore").exists());
+    }
+
+    #[test]
+    fn an_existing_state_dir_gains_an_ignore_file_but_keeps_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join(STATE_DIR_NAME);
+        fs::create_dir(&state).unwrap();
+        ensure_real_child_dir(temp.path(), STATE_DIR_NAME).unwrap();
+        assert_eq!(fs::read(state.join(".gitignore")).unwrap(), b"*\n");
+
+        fs::write(state.join(".gitignore"), b"custom\n").unwrap();
+        ensure_real_child_dir(temp.path(), STATE_DIR_NAME).unwrap();
+        assert_eq!(fs::read(state.join(".gitignore")).unwrap(), b"custom\n");
     }
 
     #[test]

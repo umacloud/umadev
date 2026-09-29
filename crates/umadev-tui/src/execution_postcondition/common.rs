@@ -191,14 +191,50 @@ async fn run_git_status_command(
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// A read-only `git` invocation for the automatic working-tree snapshots taken
+/// around every turn. These run without the user asking, so a repository that
+/// arrived with its `.git/config` (an archive or shared folder rather than a
+/// clone) must not be able to execute anything through it: fsmonitor, hooks and
+/// filter drivers are all disabled (see [`umadev_process::git`]), and a
+/// background snapshot never takes the index lock the base may need. `None`
+/// when the repository configuration cannot be inspected; the snapshot is then
+/// skipped like any other failed one.
+async fn git_snapshot_command(root: &Path) -> Option<tokio::process::Command> {
+    umadev_process::git::hardened_git_tokio_command(root, umadev_process::git::GitAccess::ReadOnly)
+        .await
+        .ok()
+}
+
 /// Async hot-path snapshot used before and after ordinary resident turns. Git
 /// owns a dedicated process tree, has a hard deadline, and drains only bounded
 /// output; an incomplete snapshot is discarded instead of being treated as a
 /// truthful partial status.
 pub(crate) async fn git_status_porcelain_bounded(root: &Path) -> Option<String> {
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(root).args(["status", "--porcelain"]);
+    let mut command = git_snapshot_command(root).await?;
+    command.args([
+        "status",
+        "--porcelain",
+        umadev_process::git::IGNORE_DIRTY_SUBMODULES,
+    ]);
     run_git_status_command(command, git_status_options()).await
+}
+
+/// A compact `git diff --stat` of the working tree (unstaged changes), run in
+/// `root`, used only to give the agentic system prompt a sense of what is
+/// already modified. **Fail-open**: any failure returns `None` and the prompt
+/// simply omits the diff-stat section.
+pub(crate) async fn git_diff_stat(root: &Path) -> Option<String> {
+    let mut command = git_snapshot_command(root).await?;
+    command
+        .args([
+            "diff",
+            "--stat",
+            umadev_process::git::IGNORE_DIRTY_SUBMODULES,
+        ])
+        .args(umadev_process::git::NO_DIFF_PROGRAMS);
+    let stat = run_git_status_command(command, git_status_options()).await?;
+    let stat = stat.trim();
+    (!stat.is_empty()).then(|| stat.to_string())
 }
 
 /// Compare a prior complete status with a fresh bounded snapshot. Any missing,
@@ -284,7 +320,10 @@ pub(crate) fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Op
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{changed_files_after_git_status, run_git_status_command, GIT_STATUS_READER_GRACE};
+    use super::{
+        changed_files_after_git_status, git_diff_stat, git_status_porcelain_bounded,
+        run_git_status_command, GIT_STATUS_READER_GRACE,
+    };
     use std::time::{Duration, Instant};
 
     fn options(timeout: Duration, stdout_bytes: usize) -> umadev_process::BoundedCommandOptions {
@@ -337,5 +376,84 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_status_snapshot_never_runs_repository_fsmonitor() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let marker = repo.path().join("fsmonitor-ran");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "--quiet"]);
+        let hook = format!("touch '{}'; exit 1", marker.display());
+        git(&["config", "core.fsmonitor", &hook]);
+        std::fs::write(repo.path().join("file.txt"), "x").unwrap();
+
+        let status = git_status_porcelain_bounded(repo.path()).await;
+        assert!(status.is_some_and(|out| out.contains("file.txt")));
+        assert!(!marker.exists(), "repository core.fsmonitor was executed");
+    }
+
+    #[tokio::test]
+    async fn automatic_snapshots_never_run_repository_filters_or_hooks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let mut command = std::process::Command::new("git");
+            umadev_process::git::remove_git_environment(&mut command);
+            let status = command
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=UmaDev", "-c", "user.email=umadev@local"])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repo.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
+        std::fs::write(repo.join("file.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "--quiet", "--no-verify", "-m", "initial"]);
+        for (key, marker) in [
+            ("filter.x.clean", "clean-ran"),
+            ("filter.x.process", "process-ran"),
+            ("diff.x.textconv", "textconv-ran"),
+        ] {
+            let program = format!("touch '{}'; cat", temp.path().join(marker).display());
+            git(&["config", key, &program]);
+        }
+        let hook = repo.join(".git/hooks/post-index-change");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\n",
+            temp.path().join("hook-ran").display()
+        );
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Stat-dirty and content-dirty: Git must re-read the file on every scan.
+        std::fs::write(repo.join("file.txt"), "two\n").unwrap();
+
+        let status = git_status_porcelain_bounded(&repo).await;
+        assert!(status.is_some_and(|out| out.contains("file.txt")));
+        let stat = git_diff_stat(&repo).await;
+        assert!(stat.is_some_and(|out| out.contains("file.txt")));
+        let ran = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with("-ran"))
+            .collect::<Vec<_>>();
+        assert!(ran.is_empty(), "repository programs executed: {ran:?}");
     }
 }

@@ -838,6 +838,21 @@ fn sensitive_blocks_dotgit_config() {
 }
 
 #[test]
+fn sensitive_blocks_the_shadow_checkpoint_repository() {
+    // Hooks or a `commondir` planted there would run with the next automatic
+    // checkpoint, so the agent may not write into it in any spelling.
+    for path in [
+        ".umadev/checkpoints.git/hooks/reference-transaction",
+        "/home/u/proj/.umadev/checkpoints.git/commondir",
+        ".UMADEV\\Checkpoints.GIT\\config",
+    ] {
+        let d = check_sensitive_path(path, "x");
+        assert!(d.block, "{path}");
+        assert_eq!(d.clause, "UD-SEC-001");
+    }
+}
+
+#[test]
 fn sensitive_blocks_dotgit_objects_nested() {
     // Nested path inside .git must still be caught.
     let d = check_sensitive_path("/home/u/proj/.git/objects/ab/cdef", "x");

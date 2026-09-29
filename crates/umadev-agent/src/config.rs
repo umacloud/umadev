@@ -7,8 +7,8 @@
 //! ```toml
 //! # .umadevrc
 //! [quality]
-//! threshold = 85              # override quality gate pass threshold
-//! skip_checks = ["dark_mode"] # skip specific quality checks
+//! threshold = 95              # raise the quality gate pass threshold (never lower)
+//! skip_checks = ["dark_mode"] # skip specific non-security quality checks
 //!
 //! [pipeline]
 //! skip_phases = ["research"]  # skip research if you already did it
@@ -67,14 +67,23 @@ pub struct ProjectConfig {
 }
 
 /// Quality gate customization.
+///
+/// `.umadevrc` travels with the repository, so a clone or a contributor PR
+/// controls it: it may make the gate stricter, never weaker. A threshold
+/// below the default and a skip of a [protected check](PROTECTED_QUALITY_CHECKS)
+/// are dropped at load and listed in [`Self::ignored`] for the gate report.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QualityConfig {
-    /// Minimum score to pass (default 90).
+    /// Minimum score to pass (default 90; a lower value is ignored).
     #[serde(default = "default_threshold")]
     pub threshold: u32,
-    /// Check names to skip (e.g. `dark_mode`).
+    /// Check names to skip (e.g. `dark_mode`); protected checks stay.
     #[serde(default)]
     pub skip_checks: Vec<String>,
+    /// Human-readable notes for every repository override that was ignored
+    /// because it would have weakened the gate. Never read from the file.
+    #[serde(skip)]
+    pub ignored: Vec<String>,
 }
 
 impl Default for QualityConfig {
@@ -82,6 +91,54 @@ impl Default for QualityConfig {
         Self {
             threshold: default_threshold(),
             skip_checks: Vec::new(),
+            ignored: Vec::new(),
+        }
+    }
+}
+
+/// Quality checks a repository `.umadevrc` cannot skip: they guard leaked
+/// secrets, security findings, access control and the build/test evidence.
+pub const PROTECTED_QUALITY_CHECKS: &[&str] = &[
+    "No leaked secrets",
+    "Pre-PR security scan",
+    "Auth coverage",
+    "Input validation coverage",
+    "Build & test results",
+];
+
+/// The `skip_checks` spelling of a check name (`Dark mode support` →
+/// `dark_mode_support`); a skip entry matches either form.
+#[must_use]
+pub fn quality_check_key(name: &str) -> String {
+    name.to_ascii_lowercase().replace(' ', "_")
+}
+
+impl QualityConfig {
+    /// Drop every override that would weaken the gate, noting each in
+    /// [`Self::ignored`].
+    fn keep_only_stricter(&mut self) {
+        if self.threshold < default_threshold() {
+            self.ignored.push(format!(
+                "Ignored `.umadevrc` [quality] threshold = {}: a repository config may only raise the pass threshold ({}).",
+                self.threshold,
+                default_threshold()
+            ));
+            self.threshold = default_threshold();
+        }
+        let ignored = &mut self.ignored;
+        self.skip_checks.retain(|skip| {
+            let protected = PROTECTED_QUALITY_CHECKS
+                .iter()
+                .find(|name| skip == *name || *skip == quality_check_key(name));
+            if let Some(name) = protected {
+                ignored.push(format!(
+                    "Ignored `.umadevrc` [quality] skip_checks entry `{skip}`: `{name}` is a security check and always runs."
+                ));
+            }
+            protected.is_none()
+        });
+        for note in &self.ignored {
+            tracing::warn!("{note}");
         }
     }
 }
@@ -107,13 +164,13 @@ pub struct PipelineConfig {
     /// Overridable per run by the `UMADEV_STRICT_COVERAGE=1` environment flag.
     #[serde(default)]
     pub strict_coverage: bool,
-    /// Auto-approve the pipeline's ordinary document/preview gates without
-    /// waiting for input (default `true`). The gates (`docs_confirm`,
-    /// `preview_confirm`) still appear as checkpoints in the event stream and
-    /// status bar. This setting does not bypass irreversible-action
-    /// confirmations, deterministic acceptance, or the trust-mode safety
-    /// floor. Set it to `false` to require manual gate approval.
-    #[serde(default = "default_auto_approve")]
+    /// Legacy switch for auto-approving the ordinary document/preview gates.
+    /// `.umadevrc` travels with the repository, so it may keep the gates
+    /// asking (`false`, the default) but never turn this on: `true` is ignored
+    /// at load. Auto is chosen by the user on this machine (Shift+Tab or
+    /// `/mode auto` in the TUI, `--mode auto` on the CLI), and only in a
+    /// project the user trusts (see [`crate::workspace_trust`]).
+    #[serde(default)]
     pub auto_approve_gates: bool,
 }
 
@@ -123,13 +180,9 @@ impl Default for PipelineConfig {
             skip_phases: Vec::new(),
             max_review_rounds: default_review_rounds(),
             strict_coverage: false,
-            auto_approve_gates: default_auto_approve(),
+            auto_approve_gates: false,
         }
     }
-}
-
-fn default_auto_approve() -> bool {
-    true
 }
 
 fn default_review_rounds() -> usize {
@@ -376,6 +429,13 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     }
     // Clamp quality threshold and top_k to sensible bounds.
     cfg.quality.threshold = cfg.quality.threshold.min(100);
+    cfg.quality.keep_only_stricter();
+    if cfg.pipeline.auto_approve_gates {
+        tracing::warn!(
+            "Ignored `.umadevrc` [pipeline] auto_approve_gates = true: a repository config cannot choose Auto; pick it with Shift+Tab, `/mode auto` or `--mode auto`."
+        );
+        cfg.pipeline.auto_approve_gates = false;
+    }
     cfg.knowledge.top_k = cfg.knowledge.top_k.clamp(1, 50);
     // Normalise the codex sandbox to a canonical kebab id; an unrecognised
     // explicitly invalid value falls back to the restricted `workspace-write`
@@ -513,6 +573,29 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_config_cannot_weaken_the_quality_gate() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[quality]\nthreshold = 0\nskip_checks = [\"no_leaked_secrets\", \"Pre-PR security scan\", \"dark_mode_support\"]\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path()).quality;
+        assert_eq!(cfg.threshold, 90, "a lower threshold is ignored");
+        assert_eq!(
+            cfg.skip_checks,
+            ["dark_mode_support"],
+            "only non-security skips stay"
+        );
+        assert_eq!(
+            cfg.ignored.len(),
+            3,
+            "each ignored override is reported: {:?}",
+            cfg.ignored
+        );
+    }
+
+    #[test]
     fn threshold_clamped_to_100() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 999\n").unwrap();
@@ -635,11 +718,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "[quality]\nthreshold = 80\nskip_checks = [\"dark_mode\"]\n\n[pipeline]\nmax_review_rounds = 2\n",
+            "[quality]\nthreshold = 95\nskip_checks = [\"dark_mode\"]\n\n[pipeline]\nmax_review_rounds = 2\n",
         )
         .unwrap();
         let cfg = load_project_config(tmp.path());
-        assert_eq!(cfg.quality.threshold, 80);
+        assert_eq!(cfg.quality.threshold, 95);
         assert_eq!(cfg.quality.skip_checks, vec!["dark_mode"]);
         assert_eq!(cfg.pipeline.max_review_rounds, 2);
     }
@@ -764,6 +847,18 @@ mod tests {
         let cfg = load_project_config(tmp.path());
         assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
         assert!(!cfg.pipeline.auto_approve_gates);
+    }
+
+    #[test]
+    fn a_repository_config_cannot_turn_on_auto_approval() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!load_project_config(tmp.path()).pipeline.auto_approve_gates);
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[pipeline]\nauto_approve_gates = true\n",
+        )
+        .unwrap();
+        assert!(!load_project_config(tmp.path()).pipeline.auto_approve_gates);
     }
 
     #[test]

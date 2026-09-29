@@ -1,9 +1,11 @@
 //! Kernel guard files, the external workspace namespace, and local Git excludes.
 //!
 //! The external guard excludes cooperating v2 clients even if an in-workspace
-//! guard pathname is replaced. On Unix it is host-local. On Windows it assumes
-//! one stable user temp directory for the same OS identity. It does not protect
-//! an older client: old releases know only the permanent in-workspace fence.
+//! guard pathname is replaced. On Unix it is host-local, in the user's
+//! `$XDG_RUNTIME_DIR` or else the private UmaDev state directory. On Windows it
+//! assumes one stable user temp directory for the same OS identity. It does
+//! not protect an older client: old releases know only the permanent
+//! in-workspace fence.
 
 use std::fs::File;
 use std::io;
@@ -85,7 +87,7 @@ pub(super) fn external_guard_dir() -> io::Result<PathBuf> {
     #[cfg(unix)]
     let uid = current_unix_uid();
     #[cfg(unix)]
-    let base = PathBuf::from(format!("/tmp/.umadev-run-locks-{uid}"));
+    let base = unix_guard_parent()?.join("umadev-run-locks");
     #[cfg(windows)]
     // Correct exclusion assumes this OS identity receives one stable user temp directory.
     let base = std::env::temp_dir().join("umadev-run-locks");
@@ -141,9 +143,30 @@ pub(super) fn external_guard_dir() -> io::Result<PathBuf> {
     Ok(base)
 }
 
+/// Where the Unix guard namespace lives: the per-user `$XDG_RUNTIME_DIR`
+/// when the session has one, else the user's private UmaDev state directory.
+/// Never a predictable name in the shared `/tmp`, where another local user
+/// could pre-create the directory and block every run of this user.
+#[cfg(unix)]
+fn unix_guard_parent() -> io::Result<PathBuf> {
+    #[cfg(test)]
+    crate::test_support::isolate_state_directory();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute() && umadev_state::fs::real_dir(dir));
+    runtime
+        .or_else(|| umadev_state::privacy::state_directory(true))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no private directory for the external run-lock namespace",
+            )
+        })
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn current_unix_uid() -> u32 {
+pub(super) fn current_unix_uid() -> u32 {
     // SAFETY: `geteuid` has no preconditions and only returns process identity metadata.
     unsafe { libc::geteuid() }
 }

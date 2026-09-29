@@ -18,10 +18,25 @@ impl App {
                 .is_some()
     }
 
+    /// `/continue [adopt]`. `adopt` is the explicit consent to run saved state
+    /// this installation did not write, after [`Self::show_unowned_run`] showed it.
+    pub(super) fn continue_run_command(&mut self, rest: &str) -> Action {
+        if rest.trim() == "adopt" && self.has_run_resume_target() {
+            // Consent is given either way; a stored adoption only saves asking again.
+            let _ = umadev_agent::run_provenance::adopt(&self.project_root);
+            return self.resume_saved_run(true);
+        }
+        self.continue_run_action()
+    }
+
     /// Shared state transition for `/continue` and its exact natural-language
     /// aliases, kept outside semantic routing so a routing timeout cannot demote
     /// an existing run to read-only or synthesize a replacement plan.
     pub(super) fn continue_run_action(&mut self) -> Action {
+        self.resume_saved_run(false)
+    }
+
+    fn resume_saved_run(&mut self, adopted: bool) -> Action {
         let replay_requirement = self.resume_run_requirement();
         if self.reject_replayed_host_git_operation(&replay_requirement) {
             return Action::None;
@@ -31,6 +46,15 @@ impl App {
         // before that write, not merely before the later ResumeRun dispatch.
         if has_resume_target && self.effective_trust_mode() == umadev_agent::TrustMode::Plan {
             self.reject_director_execution_in_plan();
+            return Action::None;
+        }
+        // Saved state this installation did not write (for example shipped with
+        // the repository) is shown, never resumed on a bare 「继续」/`/continue`.
+        if has_resume_target
+            && !adopted
+            && !umadev_agent::run_provenance::is_own(&self.project_root)
+        {
+            self.show_unowned_run();
             return Action::None;
         }
         let rearmed_review =
@@ -244,5 +268,35 @@ impl App {
             );
         }
         self.refresh_status();
+    }
+
+    /// Show the saved plan and workflow state that UmaDev on this machine did not
+    /// write, and how to run it on purpose (`/continue adopt`).
+    fn show_unowned_run(&mut self) {
+        const MAX_SHOWN_STEPS: usize = 30;
+        let mut summary = String::new();
+        if let Some(state) = umadev_agent::read_workflow_state(&self.project_root) {
+            for (label, value) in [
+                ("requirement", state.requirement.as_str()),
+                ("phase", state.phase.as_str()),
+                ("gate", state.active_gate.as_str()),
+            ] {
+                if !value.trim().is_empty() {
+                    summary.push_str(&format!("{label}: {}\n", value.trim()));
+                }
+            }
+        }
+        if let Some(plan) = umadev_agent::load_plan(&self.project_root) {
+            for step in plan.steps.iter().take(MAX_SHOWN_STEPS) {
+                summary.push_str(&format!("- [{}] {}\n", step.status.as_str(), step.title));
+            }
+            if plan.steps.len() > MAX_SHOWN_STEPS {
+                summary.push_str(&format!("… +{}\n", plan.steps.len() - MAX_SHOWN_STEPS));
+            }
+        }
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "continue.unowned_run", &[summary.trim_end()]),
+        );
     }
 }

@@ -22,6 +22,7 @@ const {
   registryLatestRelease,
   validateTrustedUpdateManifest,
   exactUpdateCommand,
+  packageManagerSpawnOptions,
   sweepAbandonedStagingDirs,
   ABANDONED_STAGING_MIN_AGE_MS,
   ensureModelCacheDirectory,
@@ -199,6 +200,22 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
     'npm install -g @umatech/umadev@1.0.73 --registry=https://registry.npmjs.org --force',
   );
   assert.throws(() => exactUpdateCommand('npm', 'latest; touch /tmp/owned'));
+});
+
+test('terminal contract: package managers never run from the caller cwd', () => {
+  const options = packageManagerSpawnOptions(
+    { stdio: 'ignore', timeout: 1 },
+    { PATH: '/usr/bin', NoDefaultCurrentDirectoryInExePath: '0' },
+  );
+  assert.equal(options.shell, true);
+  assert.equal(options.stdio, 'ignore');
+  assert.equal(options.timeout, 1);
+  // cmd.exe would otherwise run an `npm.cmd` committed to the repo the user is in.
+  assert.equal(options.env.NoDefaultCurrentDirectoryInExePath, '1');
+  assert.equal(options.env.PATH, '/usr/bin');
+  assert.ok(path.isAbsolute(options.cwd));
+  assert.notEqual(path.resolve(options.cwd), path.resolve(process.cwd()));
+  assert.ok([os.homedir(), os.tmpdir()].includes(options.cwd));
 });
 
 test('terminal contract: an oversized registry response cannot hang update', async (t) => {

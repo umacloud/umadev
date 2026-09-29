@@ -380,17 +380,8 @@ async fn run_deploy_command(
     timeout_secs: u64,
 ) -> DeployProof {
     let started = Instant::now();
-    // Run through `sh -c` (Unix) / `cmd /c` (Windows) so multi-token commands
-    // like `npx vercel --prod --yes` execute as written.
-    let (shell, shell_arg) = if cfg!(windows) {
-        ("cmd", "/c")
-    } else {
-        ("sh", "-c")
-    };
-    let mut dcmd = Command::new(shell);
-    dcmd.arg(shell_arg).arg(&command).current_dir(workspace);
     let output = match umadev_process::run_bounded_detached_command(
-        dcmd,
+        deploy_spawn_command(&command, workspace, cfg!(windows)),
         umadev_process::BoundedCommandOptions {
             timeout: Duration::from_secs(timeout_secs),
             stdout_bytes: OUTPUT_CAP / 2,
@@ -528,6 +519,31 @@ fn log_tail(stdout: &str, stderr: &str) -> String {
     tail_capped(&combined, CAPTURE_CAP)
 }
 
+/// The child that runs the confirmed deploy `command` in `workspace`.
+///
+/// Unix runs it through `sh -c`, so a command the user typed keeps its shell
+/// syntax. Windows never goes through `cmd /c`: `cmd.exe` looks the first word up
+/// in the workspace before `PATH`, so a `flyctl.cmd` committed to the repository
+/// would run in place of the `flyctl` the preflight found. There the first word
+/// is resolved on `PATH`, the same lookup [`which`] made, and spawned directly
+/// with the remaining words as its arguments. `windows` selects the platform so
+/// both shapes are testable everywhere.
+fn deploy_spawn_command(command: &str, workspace: &Path, windows: bool) -> Command {
+    let mut child = if windows {
+        let mut words = command.split_whitespace();
+        let program = words.next().unwrap_or_default();
+        let mut child = Command::new(umadev_process::path_lookup::resolve_on_path(program));
+        child.args(words);
+        child
+    } else {
+        let mut child = Command::new("sh");
+        child.arg("-c").arg(command);
+        child
+    };
+    child.current_dir(workspace);
+    child
+}
+
 /// Keep the last `cap` bytes of `s`, trimmed to a char boundary, prefixed with
 /// a marker when truncation happened.
 fn tail_capped(s: &str, cap: usize) -> String {
@@ -541,34 +557,9 @@ fn tail_capped(s: &str, cap: usize) -> String {
     format!("...[truncated]\n{}", &s[start..])
 }
 
-/// Check whether a PATH-resolvable binary exists. Splits `PATH` on the
-/// platform-native separator and honours `PATHEXT` on Windows so `which("npx")`
-/// finds `npx.cmd`. Mirrors the verify/runtime-proof helpers.
+/// Check whether a PATH-resolvable binary exists.
 fn which(bin: &str) -> bool {
-    let Ok(path_var) = std::env::var("PATH") else {
-        return false;
-    };
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.BAT;.CMD;.COM".to_string())
-            .split(';')
-            .map(str::to_string)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    for dir in path_var.split(separator) {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in &exts {
-            if Path::new(dir).join(format!("{bin}{ext}")).is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    umadev_process::path_lookup::is_installed(bin)
 }
 
 #[cfg(test)]
@@ -868,6 +859,32 @@ mod tests {
             assert!(body.contains("\"platform\": \"netlify\""));
             assert!(body.contains("demo.example.app"));
         }
+    }
+
+    #[test]
+    fn a_windows_deploy_spawns_its_program_without_cmd() {
+        let workspace = Path::new("workspace");
+        let command = deploy_spawn_command("flyctl deploy --remote-only", workspace, true);
+        let std = command.as_std();
+        let program = Path::new(std.get_program());
+        let stem = program.file_stem().and_then(|stem| stem.to_str()).unwrap();
+        assert_eq!(stem, "flyctl");
+        assert_eq!(
+            std.get_args().collect::<Vec<_>>(),
+            ["deploy", "--remote-only"]
+        );
+        assert_eq!(std.get_current_dir(), Some(workspace));
+    }
+
+    #[test]
+    fn a_unix_deploy_keeps_its_shell_syntax() {
+        let command = deploy_spawn_command("npm run build && npx surge", Path::new("ws"), false);
+        let std = command.as_std();
+        assert_eq!(std.get_program(), "sh");
+        assert_eq!(
+            std.get_args().collect::<Vec<_>>(),
+            ["-c", "npm run build && npx surge"]
+        );
     }
 
     #[test]

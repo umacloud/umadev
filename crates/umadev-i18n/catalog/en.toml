@@ -107,7 +107,7 @@
 "mode.auto_chip" = "auto-approve (shift+Tab for manual)"
 "mode.manual_chip" = "manual review (shift+Tab for auto)"
 "mode.plan_chip" = "plan · read-only requested (/mode to switch)"
-"mode.guarded_chip" = "guarded · review each gate (/mode to switch)"
+"mode.guarded_chip" = "guarded · review gates (/mode)"
 "mode.plan.on" = "[ok] Plan mode: on. UmaDev refuses explicit execution before any lock, branch, run state, artifact, or writer session. Normal conversation requests the base's strongest planning/read-only profile; actual filesystem enforcement, network access, and local-port access remain vendor/platform/policy specific and are unverified unless the base reports effective state. Switch to /mode guarded or /mode auto to execute."
 "mode.guarded.on" = "[ok] Guarded mode: on (default). UmaDev requests normal development access while every checkpoint pauses for your review; type c to approve, or text to revise. Actions touching .git / the network / destructive shell always require confirmation. The base's effective filesystem/network/local-port access may still be restricted by its platform or enterprise policy."
 "mode.auto.on" = "[ok] Autonomous mode: on. UmaDev requests full development access and auto-approves ordinary checkpoints. Only genuinely irreversible/destructive actions (rm -rf, force-push, .git rewrites, deploy/push/publish, credential exfiltration, writes outside the workspace) still ask for confirmation. Effective filesystem, network, and local-port access depend on the base, platform, inherited sandbox, and enterprise policy; a request is not proof of access. Governance hooks and the audit trail stay fully active."
@@ -115,6 +115,13 @@
 "mode.unknown" = "Unknown mode \"{}\". Options: plan (read-only plan) / guarded (review each gate, default) / auto (fully autonomous)."
 "mode.plan.gate" = "[plan] Plan mode: execution was not started; no lock, branch, workflow/governance state, artifact, or writer session was created. Continue chatting with the base's requested planning/read-only profile (effective sandbox capabilities are vendor/platform specific), or switch to /mode guarded or /mode auto and re-enter the request to execute."
 "trust.suggest_auto" = "[trust] You've approved {} times in a row at the `{}` gate — want to let it auto-advance? Type /mode auto for fully autonomous, or keep reviewing manually (this hint shows once and never changes your default automatically)."
+"workspace_trust.question" = "Trust this project? UmaDev and its base read files from it that can run code and widen permissions: .umadevrc, saved run state, the base's own settings, hooks and MCP servers."
+"workspace_trust.trust" = "Trust this project: load its settings; Auto is available"
+"workspace_trust.distrust" = "Don't trust: at most Guarded, and bases ignore its own settings"
+"workspace_trust.trusted" = "[ok] Trusted this project on this machine. Bases now load its own settings, hooks and MCP servers, and /mode auto is available. /trust changes this."
+"workspace_trust.untrusted" = "[trust] Not trusting this project. It runs at most in Guarded, and bases start without its own settings, hooks or MCP servers (Kimi Code is refused when it ships MCP servers). /trust changes this."
+"workspace_trust.save_failed" = "[warn] Applied for this session, but the decision could not be saved, so you will be asked again next time: {}"
+"workspace_trust.auto_refused" = "Auto is only available in a project you trust. Run /trust first; the tier stays as it is."
 "trust.reason.reversible" = "reversible in-project edit"
 "trust.reason.git" = "touches .git internals (can rewrite history)"
 "trust.reason.network" = "reaches the network (push/pull/download)"
@@ -631,6 +638,7 @@
 "continue.resuming_chat" = "Resuming the previous conversation — the base picks up with full context."
 "continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
+"continue.unowned_run" = "The saved run in .umadev was not written by UmaDev on this machine (it may have come with the repository), so it was not resumed. Review it:\n{}\nTo run this plan as shown, send /continue adopt. To start over, type a new requirement."
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
 "revise.no_gate" = "No checkpoint is open, nothing to revise — to change output, wait for the run to pause at a checkpoint (confirm the core docs / confirm the frontend preview)."
 
@@ -770,6 +778,7 @@
 # /preview
 "preview.detected" = "[preview] Detected {}, starting preview…\n  command: `{}` -> {}"
 "preview.starting" = "Starting dev server and opening the preview: {}\n  command: `{}`"
+"preview.confirm_command" = "The preview command below was read from the frontend notes, which the repository or the model can edit. Not run yet:\n  {}\n  -> {}\nCheck it, then type /preview confirm to run it."
 "preview.opened" = "Opened the preview: {}\n  (no Run command found; if the page won't open, start the dev server manually)"
 "preview.none_yet" = "No previewable frontend yet. Type a requirement and run through the frontend phase (it pauses at the preview gate),\n                   or confirm the base wrote a Preview URL into output/xxx-frontend-notes.md."
 "preview.gate_announce" = "[preview] Frontend generated, preview at: {}\n                       Open it in the browser to see the result. Happy? type c to continue (into the backend);\n                       to change it, describe your edits. You can also /preview to auto-start the dev server, /stop-preview to stop."
@@ -1050,7 +1059,6 @@
 "diag.call_failed" = "[warn] {} phase: base call failed ({}) — falling back to an OFFLINE SKELETON for this phase (not a real generation). {}"
 
 # quality gate — inline score + findings instead of pointing at the JSON
-"quality.gate_unreadable" = "[warn] Quality gate file was written but can't be read back ({}) — treating as not-passed to avoid masking a write failure."
 "quality.gate_blocked" = "[warn] Quality gate did NOT pass (score {}/100) — blocking delivery (UD-EVID-003). Fix the items below, then:\n  /redo to re-run the whole pipeline\n  or /continue after fixing to resume"
 "quality.top_findings_header" = "Top findings to fix:"
 
@@ -1073,6 +1081,7 @@
 # Ctrl+click opened a URL / file from the transcript ({} = the opened target; iTerm2's native Cmd+click is unaffected)
 "tui.link.opened" = "Opened {}"
 "tui.link.open_failed" = "Could not open {}"
+"tui.link.revealed" = "Showed {} in its folder (not opened: it could run as a program)"
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"
@@ -1256,6 +1265,7 @@
 "tui.cmd.cancel" = "stop the running pipeline / agentic round"
 "tui.cmd.adopt" = "adopt an existing project (detect stack, index source, derive contract)"
 "tui.cmd.mode" = "trust tier: plan / guarded / auto"
+"tui.cmd.trust" = "trust or stop trusting this project"
 "tui.cmd.sandbox" = "Codex base launch sandbox: read-only / workspace-write / danger-full-access"
 "tui.cmd.lessons" = "reusable rules distilled from incidents/outcomes (not an incident list)"
 "tui.cmd.memory" = "safely inspect and manage project/global memory policy, retention, export, and soft deletion"

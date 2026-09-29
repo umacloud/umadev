@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use umadev_process::git::GitAccess;
 
 use crate::phases::QualityReport;
 use crate::security::SecurityScan;
@@ -544,7 +545,15 @@ fn git_diff(project_root: &Path) -> Option<String> {
 fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
     let out = crate::external_command::bounded_git_output(
         project_root,
-        &["diff", "--no-ext-diff", "--find-renames", against],
+        GitAccess::ReadOnly,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            umadev_process::git::IGNORE_DIRTY_SUBMODULES,
+            "--find-renames",
+            against,
+        ],
         REVIEW_GIT_TIMEOUT,
         REVIEW_DIFF_BYTES,
     )?;
@@ -561,6 +570,7 @@ fn merge_base_with_default(project_root: &Path) -> Option<String> {
     for base in ["origin/main", "origin/master", "main", "master"] {
         let out = crate::external_command::bounded_git_output(
             project_root,
+            GitAccess::ReadOnly,
             &["merge-base", "HEAD", base],
             REVIEW_GIT_TIMEOUT,
             8 * 1024,
@@ -757,6 +767,59 @@ mod tests {
                 !std::path::Path::new(&rel).is_absolute(),
                 "{hostile:?} -> absolute {rel:?}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_review_diff_runs_no_repository_diff_or_filter_program() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::external_command::bounded_git_output(
+                &root,
+                GitAccess::Mutating,
+                args,
+                REVIEW_GIT_TIMEOUT,
+                64 * 1024,
+            );
+            assert!(output.is_some_and(|output| output.status.success()));
+        };
+        if crate::external_command::bounded_git_output(
+            tmp.path(),
+            GitAccess::ReadOnly,
+            &["--version"],
+            REVIEW_GIT_TIMEOUT,
+            1024,
+        )
+        .is_none()
+        {
+            return;
+        }
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
+        fs::write(root.join("app.ts"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        for (key, marker) in [
+            ("filter.x.clean", "clean"),
+            ("filter.x.smudge", "smudge"),
+            ("diff.x.textconv", "textconv"),
+            ("diff.x.command", "command"),
+            ("diff.external", "external"),
+        ] {
+            let program = format!("touch '{}'; cat", tmp.path().join(marker).display());
+            git(&["config", key, &program]);
+        }
+        fs::write(root.join("app.ts"), "two\n").unwrap();
+
+        let diff = git_diff(&root).expect("review diff");
+        assert!(diff.contains("+two"), "{diff}");
+        for marker in ["clean", "smudge", "textconv", "command", "external"] {
+            assert!(!tmp.path().join(marker).exists(), "{marker} ran");
         }
     }
 

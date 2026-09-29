@@ -25,6 +25,7 @@
 
 use std::path::Path;
 use std::time::Duration;
+use umadev_process::git::GitAccess;
 
 use crate::review::{build_review_report, render_review_md};
 
@@ -391,7 +392,8 @@ pub enum BranchIsolation {
     },
     /// Isolation was deliberately skipped — fail-open. The run proceeds in the
     /// working tree exactly as before. Carries a short machine-ish reason
-    /// (`not-a-repo` / `git-unavailable` / `dirty-tree` / `detached` / `error`)
+    /// (`not-a-repo` / `git-unavailable` / `dirty-tree` / `detached` /
+    /// `repository-filters` / `error`)
     /// for the audit note; never an error the host has to handle.
     Skipped(&'static str),
 }
@@ -471,8 +473,14 @@ pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolati
     // gets a FRESH, uniquely-suffixed sibling derived from the real current HEAD.
     if git_branch_exists(project_root, &target) {
         if branch_descends_from_head(project_root, &target) {
-            if run_git(project_root, &["switch", &target]).is_some()
-                || run_git(project_root, &["checkout", &target]).is_some()
+            // This switch rewrites work-tree files, and repository-defined filter
+            // drivers stay blanked for it: git-crypt or a repository-local LFS
+            // setup would check out ciphertext or pointer files. Stay in place.
+            if umadev_process::git::repository_defines_filters(project_root).unwrap_or(true) {
+                return BranchIsolation::Skipped("repository-filters");
+            }
+            if run_git_mutating(project_root, &["switch", &target]).is_some()
+                || run_git_mutating(project_root, &["checkout", &target]).is_some()
             {
                 return BranchIsolation::Isolated {
                     branch: target,
@@ -490,8 +498,8 @@ pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolati
             return BranchIsolation::Skipped("dirty-tree");
         }
         let fresh = unique_branch_name(project_root, &target);
-        let created = run_git(project_root, &["switch", "-c", &fresh]).is_some()
-            || run_git(project_root, &["checkout", "-b", &fresh]).is_some();
+        let created = run_git_mutating(project_root, &["switch", "-c", &fresh]).is_some()
+            || run_git_mutating(project_root, &["checkout", "-b", &fresh]).is_some();
         return if created {
             BranchIsolation::Isolated {
                 branch: fresh,
@@ -511,8 +519,8 @@ pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolati
     // Create the sibling branch FROM the current HEAD and switch to it. Try the
     // modern `switch -c` first, fall back to `checkout -b` for older git. No
     // `-f`/`--force`: a refusal means we leave the user where they were.
-    let created = run_git(project_root, &["switch", "-c", &target]).is_some()
-        || run_git(project_root, &["checkout", "-b", &target]).is_some();
+    let created = run_git_mutating(project_root, &["switch", "-c", &target]).is_some()
+        || run_git_mutating(project_root, &["checkout", "-b", &target]).is_some();
     if created {
         BranchIsolation::Isolated {
             branch: target,
@@ -621,30 +629,36 @@ fn git_current_branch(project_root: &Path) -> String {
 /// `true` iff `git status --porcelain` reports any change (staged, unstaged, or
 /// untracked) — i.e. there is something to commit into the PR.
 fn git_has_changes(project_root: &Path) -> bool {
-    run_git(project_root, &["status", "--porcelain"])
-        .map(|s| {
-            s.lines().any(|line| {
-                // Porcelain line: "XY <path>" (2 status chars + space, then path;
-                // a rename is "XY old -> new"). IGNORE UmaDev's OWN artifact dirs
-                // (`.umadev/`, `output/`): a run-lock / governance-context / plan we
-                // just wrote is NOT the user's uncommitted work, and must not make
-                // the tree read as "dirty" and skip branch isolation (the run lock
-                // under `.umadev/` is written before isolation runs). We only care
-                // whether the USER has uncommitted edits.
-                let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
-                let path = path.rsplit(" -> ").next().unwrap_or(path);
-                // UmaDev's own tooling dirs, written before isolation runs and never
-                // the user's product code: `.umadev/` (run-lock/plan/audit),
-                // `output/` (artifacts), `.claude/` (the governance PreToolUse-hook
-                // settings UmaDev installs). A `switch -c` carries any of these over
-                // to the isolation branch harmlessly anyway.
-                let our_dir = |d: &str| {
-                    path.starts_with(&format!("{d}/")) || path.starts_with(&format!("{d}\\"))
-                };
-                !path.is_empty() && !our_dir(".umadev") && !our_dir("output") && !our_dir(".claude")
-            })
+    run_git(
+        project_root,
+        &[
+            "status",
+            "--porcelain",
+            umadev_process::git::IGNORE_DIRTY_SUBMODULES,
+        ],
+    )
+    .map(|s| {
+        s.lines().any(|line| {
+            // Porcelain line: "XY <path>" (2 status chars + space, then path;
+            // a rename is "XY old -> new"). IGNORE UmaDev's OWN artifact dirs
+            // (`.umadev/`, `output/`): a run-lock / governance-context / plan we
+            // just wrote is NOT the user's uncommitted work, and must not make
+            // the tree read as "dirty" and skip branch isolation (the run lock
+            // under `.umadev/` is written before isolation runs). We only care
+            // whether the USER has uncommitted edits.
+            let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            // UmaDev's own tooling dirs, written before isolation runs and never
+            // the user's product code: `.umadev/` (run-lock/plan/audit),
+            // `output/` (artifacts), `.claude/` (the governance PreToolUse-hook
+            // settings UmaDev installs). A `switch -c` carries any of these over
+            // to the isolation branch harmlessly anyway.
+            let our_dir =
+                |d: &str| path.starts_with(&format!("{d}/")) || path.starts_with(&format!("{d}\\"));
+            !path.is_empty() && !our_dir(".umadev") && !our_dir("output") && !our_dir(".claude")
         })
-        .unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// PR-specific change probe. Unlike run-isolation's [`git_has_changes`], this
@@ -653,18 +667,25 @@ fn git_has_changes(project_root: &Path) -> bool {
 /// and installed Claude hook remain excluded. The caller assesses readiness
 /// before writing the new PR body, so that body cannot manufacture readiness.
 fn git_has_pr_changes(project_root: &Path) -> bool {
-    run_git(project_root, &["status", "--porcelain"])
-        .map(|status| {
-            status.lines().any(|line| {
-                let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
-                let path = path.rsplit(" -> ").next().unwrap_or(path);
-                let our_transient_dir = |dir: &str| {
-                    path.starts_with(&format!("{dir}/")) || path.starts_with(&format!("{dir}\\"))
-                };
-                !path.is_empty() && !our_transient_dir(".umadev") && !our_transient_dir(".claude")
-            })
+    run_git(
+        project_root,
+        &[
+            "status",
+            "--porcelain",
+            umadev_process::git::IGNORE_DIRTY_SUBMODULES,
+        ],
+    )
+    .map(|status| {
+        status.lines().any(|line| {
+            let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            let our_transient_dir = |dir: &str| {
+                path.starts_with(&format!("{dir}/")) || path.starts_with(&format!("{dir}\\"))
+            };
+            !path.is_empty() && !our_transient_dir(".umadev") && !our_transient_dir(".claude")
         })
-        .unwrap_or(false)
+    })
+    .unwrap_or(false)
 }
 
 /// `true` iff any configured remote URL points at github.com.
@@ -698,11 +719,23 @@ fn gh_logged_in(project_root: &Path) -> bool {
     .unwrap_or(false)
 }
 
-/// Run a git subcommand in `project_root`, returning stdout on success. Any
-/// spawn error / non-zero exit → `None` (fail-open).
+/// Run a read-only git subcommand in `project_root`, returning stdout on
+/// success. Any spawn error / non-zero exit → `None` (fail-open).
 fn run_git(project_root: &Path, args: &[&str]) -> Option<String> {
+    run_git_with(project_root, GitAccess::ReadOnly, args)
+}
+
+/// [`run_git`] for the branch switches run isolation performs. The repository's
+/// hooks and filter drivers stay disabled for these as well: isolation runs
+/// automatically at every run start.
+fn run_git_mutating(project_root: &Path, args: &[&str]) -> Option<String> {
+    run_git_with(project_root, GitAccess::Mutating, args)
+}
+
+fn run_git_with(project_root: &Path, access: GitAccess, args: &[&str]) -> Option<String> {
     let out = crate::external_command::bounded_git_output(
         project_root,
+        access,
         args,
         PR_GIT_TIMEOUT,
         PR_PROBE_BYTES,
@@ -1038,6 +1071,41 @@ mod tests {
             }
         );
         assert_eq!(git_current_branch(root), "umadev/x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolation_never_runs_repository_filters() {
+        if !git_available() {
+            return;
+        }
+        let tmp = init_repo("main");
+        let root = tmp.path();
+        fs::write(root.join(".gitattributes"), "* filter=x\n").unwrap();
+        run_git(root, &["add", "-A"]).unwrap();
+        run_git(root, &["commit", "-q", "-m", "attributes"]).unwrap();
+        // A prior run's isolation branch whose checkout rewrites `seed.txt`.
+        let _ = ensure_isolation_branch(root, "x");
+        fs::write(root.join("seed.txt"), "v2").unwrap();
+        run_git(root, &["commit", "-q", "-am", "work"]).unwrap();
+        run_git(root, &["switch", "main"]).unwrap();
+
+        let markers = TempDir::new().unwrap();
+        for program in ["clean", "smudge"] {
+            let command = format!("touch '{}'; cat", markers.path().join(program).display());
+            run_git(root, &["config", &format!("filter.x.{program}"), &command]).unwrap();
+        }
+        // Stat-dirty but unchanged: status must re-read it through the driver.
+        fs::write(root.join("seed.txt"), "v1").unwrap();
+        assert!(!git_has_changes(root));
+        // Switching would rewrite `seed.txt` without its driver, so isolation
+        // stays in place rather than check out unfiltered content.
+        let again = ensure_isolation_branch(root, "x");
+        assert_eq!(again, BranchIsolation::Skipped("repository-filters"));
+        assert_eq!(git_current_branch(root), "main");
+        assert_eq!(fs::read_to_string(root.join("seed.txt")).unwrap(), "v1");
+        assert!(!markers.path().join("clean").exists(), "clean filter ran");
+        assert!(!markers.path().join("smudge").exists(), "smudge filter ran");
     }
 
     #[test]
