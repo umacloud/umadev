@@ -2743,6 +2743,11 @@ struct SubagentOutputGate {
     /// can never hide the main agent or masquerade as an idle hang.
     deferral_broken: bool,
     pending_done: Option<SessionEvent>,
+    /// The main-line API message whose content streamed as deltas (its id from
+    /// `message_start`) and whether any text or thinking delta arrived for it.
+    /// Only a message that streamed may have its aggregate text suppressed.
+    streamed_message: Option<String>,
+    streamed_content: bool,
 }
 
 /// Fail-open ceiling on buffered main-line output while a background sub-agent is
@@ -2766,28 +2771,78 @@ fn held_event_bytes(event: &SessionEvent) -> usize {
 impl SubagentOutputGate {
     fn on_line(&mut self, line: &str) -> Vec<SessionEvent> {
         let parsed = serde_json::from_str::<Value>(line.trim()).ok();
-        let main_frame = parsed
-            .as_ref()
-            .is_some_and(|v| parent_tool_use_id(v).is_none());
-        let main_stream_delta = main_frame
-            && parsed
-                .as_ref()
-                .is_some_and(|v| v.get("type").and_then(Value::as_str) == Some("stream_event"));
-        let events = self
-            .grouper
-            .on_line_with_deferred_boundary(line, !self.live.is_empty());
-        self.route(events, main_stream_delta, main_frame)
+        let main = parsed.as_ref().filter(|v| parent_tool_use_id(v).is_none());
+        let main_type = main.and_then(|v| v.get("type")).and_then(Value::as_str);
+        let mut events = main.map_or_else(Vec::new, |v| self.unstreamed_content(v));
+        events.extend(
+            self.grouper
+                .on_line_with_deferred_boundary(line, !self.live.is_empty()),
+        );
+        // Main-line text is held while background agents run, whether it
+        // streamed or came whole in an aggregate frame.
+        let main_text = matches!(main_type, Some("stream_event" | "assistant"));
+        self.route(events, main_text, main.is_some())
+    }
+
+    /// Track which main-line message streamed its content, and return the text
+    /// and thinking of an aggregate `assistant` frame whose content did not.
+    ///
+    /// With `--include-partial-messages` an aggregate frame repeats what its
+    /// deltas carried. But when a streaming request fails mid-way (an overloaded
+    /// API, a gateway without SSE), Claude re-issues it without streaming and
+    /// delivers that answer ONLY in the aggregate frame of a new message id.
+    fn unstreamed_content(&mut self, v: &Value) -> Vec<SessionEvent> {
+        match v.get("type").and_then(Value::as_str) {
+            Some("stream_event") => {
+                self.observe_stream_event(v);
+                Vec::new()
+            }
+            Some("assistant") => {
+                // Deltas whose message id is unknown are taken to be this frame's.
+                let id = v.pointer("/message/id").and_then(Value::as_str);
+                let streamed = self.streamed_content
+                    && (self.streamed_message.is_none() || id == self.streamed_message.as_deref());
+                if streamed || is_synthetic_message(v) {
+                    Vec::new()
+                } else {
+                    aggregate_content_events(v)
+                }
+            }
+            Some("result") => {
+                self.streamed_message = None;
+                self.streamed_content = false;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn observe_stream_event(&mut self, v: &Value) {
+        let event = v.get("event");
+        match event.and_then(|e| e.get("type")).and_then(Value::as_str) {
+            Some("message_start") => {
+                self.streamed_message = event
+                    .and_then(|e| e.pointer("/message/id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.streamed_content = false;
+            }
+            Some("content_block_delta") if !parse_stream_event(v).is_empty() => {
+                self.streamed_content = true;
+            }
+            _ => {}
+        }
     }
 
     fn route(
         &mut self,
         events: Vec<SessionEvent>,
-        main_stream_delta: bool,
+        main_text: bool,
         main_frame: bool,
     ) -> Vec<SessionEvent> {
         let mut out = Vec::new();
         for event in events {
-            if main_stream_delta
+            if main_text
                 && !self.live.is_empty()
                 && !self.deferral_broken
                 && matches!(
@@ -2895,6 +2950,35 @@ impl SubagentOutputGate {
         self.pending_done = None;
         out
     }
+}
+
+/// Claude's own stand-in for a model reply (model `<synthetic>`), e.g. the
+/// "API Error: 429 …" message before an error `result`. The `result` frame
+/// already reports its text as the turn's failure.
+fn is_synthetic_message(v: &Value) -> bool {
+    v.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+}
+
+/// The text and thinking blocks of an aggregate `assistant` frame, in order.
+fn aggregate_content_events(v: &Value) -> Vec<SessionEvent> {
+    v.pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            let (field, event): (&str, fn(String) -> SessionEvent) =
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => ("text", SessionEvent::TextDelta),
+                    Some("thinking") => ("thinking", SessionEvent::ThinkingDelta),
+                    _ => return None,
+                };
+            block
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| event(text.to_string()))
+        })
+        .collect()
 }
 
 /// The `tool_use_id`s of every `tool_result` block in a `user` frame — the sync
@@ -3309,7 +3393,8 @@ fn parse_assistant(v: &Value) -> Vec<SessionEvent> {
 /// intentionally skipped: with `--include-partial-messages` the text already
 /// arrived as `stream_event` `TextDelta`s, so emitting the final aggregate text
 /// block here would double the reply. Only tool calls (which we read from the
-/// assembled block) are surfaced.
+/// assembled block) are surfaced. The text of a message that did not stream
+/// (Claude's non-streaming retry) is emitted by the session's output gate.
 fn block_to_event(block: &Value) -> Option<SessionEvent> {
     match block.get("type").and_then(Value::as_str) {
         Some("tool_use") => {
@@ -5884,6 +5969,130 @@ mod tests {
                 if summary.contains("tail-after-cap") && !summary.contains(SUBAGENT_EARLY_FLUSH_NOTE))),
             "the terminal flush groups the remainder without the note: {evs:?}"
         );
+    }
+
+    /// Claude 2.1.42 after a mid-stream API error (captured live): one
+    /// streamed delta of the failed attempt, then the non-streaming retry's
+    /// answer only as an aggregate `assistant` frame of another message id.
+    const NON_STREAMING_FALLBACK_FRAMES: [&str; 5] = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"46b81cea-3678-49b7-9063-679837bad49f","parent_tool_use_id":null,"uuid":"f89ea73a-42bd-40ba-a1ca-3d803f07c11b"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"46b81cea-3678-49b7-9063-679837bad49f","parent_tool_use_id":null,"uuid":"8674c29c-4a5c-45a5-9389-5d499abf2c5b"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PARTIAL "}},"session_id":"46b81cea-3678-49b7-9063-679837bad49f","parent_tool_use_id":null,"uuid":"314c0447-8765-4c15-ac11-311df8b8b882"}"#,
+        r#"{"type":"assistant","message":{"id":"msg_ns","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"FULL ANSWER FROM NON-STREAMING FALLBACK"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":5},"context_management":null},"parent_tool_use_id":null,"session_id":"46b81cea-3678-49b7-9063-679837bad49f","uuid":"55ce058f-d8f2-4550-b49a-21f81b827e16"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":120,"duration_api_ms":61,"num_turns":1,"result":"FULL ANSWER FROM NON-STREAMING FALLBACK","stop_reason":"end_turn","session_id":"46b81cea-3678-49b7-9063-679837bad49f","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"4b773f7b-5c92-467b-9d53-e02232195a82"}"#,
+    ];
+
+    /// The same fallback from Claude 2.1.284 (captured live).
+    const NON_STREAMING_FALLBACK_FRAMES_2_1_284: [&str; 5] = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1_325bf4","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","parent_tool_use_id":null,"uuid":"e7308800-5f0c-4c97-92c3-1d6c0652b52c","ttft_ms":20,"user_message_uuid":"c1c2f519-7857-4b05-9cff-fe6633d2cf9f","user_message_uuids":["c1c2f519-7857-4b05-9cff-fe6633d2cf9f"]}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","parent_tool_use_id":null,"uuid":"ea0e4218-573c-41fd-9b82-f4863eb9851e"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PARTIAL "}},"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","parent_tool_use_id":null,"uuid":"1385c1e7-9533-405f-9e3a-a29299c7d9b7"}"#,
+        r#"{"type":"assistant","message":{"id":"msg_ns","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"FULL ANSWER FROM NON-STREAMING FALLBACK"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"context_management":null},"parent_tool_use_id":null,"session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","uuid":"493635ca-f301-477f-acb9-70087606abe9","timestamp":"2026-09-29T11:44:48.633Z","user_message_uuid":"c1c2f519-7857-4b05-9cff-fe6633d2cf9f","user_message_uuids":["c1c2f519-7857-4b05-9cff-fe6633d2cf9f"]}"#,
+        r#"{"duration_api_ms":130,"stop_reason":"end_turn","session_id":"fc00f62e-aeef-42f9-a054-1652c334f70b","total_cost_usd":0.00014000000000000001,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"output_tokens_details":{"thinking_tokens":0},"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-sonnet-4-5-20250929[1m]":{"inputTokens":10,"outputTokens":5,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.00014000000000000001,"contextWindow":1000000,"maxOutputTokens":128000,"thinkingTokens":0,"canonicalModel":"claude-sonnet-4-5-20250929","provider":"firstParty","costBasis":"list"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":false,"num_turns":1,"subtype":"success","api_error_status":null,"result":"FULL ANSWER FROM NON-STREAMING FALLBACK","ttft_ms":201,"type":"result","duration_ms":243,"uuid":"9b682d58-3c09-46d5-b63a-4051af5314d2","ttft_stream_ms":133,"time_to_request_ms":114,"first_content_frame_ms":134,"user_message_uuid":"c1c2f519-7857-4b05-9cff-fe6633d2cf9f","user_message_uuids":["c1c2f519-7857-4b05-9cff-fe6633d2cf9f"],"request_sent_wall_ms":1790682288546,"queued_turn_count":0,"result_index":0}"#,
+    ];
+
+    /// A normally streamed Claude 2.1.42 turn (captured live): the aggregate
+    /// `assistant` frame repeats text its deltas already carried.
+    const STREAMED_TURN_FRAMES: [&str; 8] = [
+        r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"eaf898ed-8c5a-4e99-b110-1130d5dd5a79"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"281d16aa-231a-49b1-85fe-ea49c87be4eb"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"part0 (call 2) "}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"5e46081f-c6d8-4e76-a4f6-f726593b77de"}"#,
+        r#"{"type":"assistant","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"part0 (call 2) "}],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1},"context_management":null},"parent_tool_use_id":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","uuid":"8c0e90f4-faaa-4059-beab-7a78ba4ada68"}"#,
+        r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"05ceb62c-4ac5-4fe3-b312-9a77b188da39"}"#,
+        r#"{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"517e84f1-d95f-497a-b94a-d3bd7a5792fa"}"#,
+        r#"{"type":"stream_event","event":{"type":"message_stop"},"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","parent_tool_use_id":null,"uuid":"c5f42204-2a98-4adc-8d77-ddbce72460a7"}"#,
+        r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":20,"duration_api_ms":9,"num_turns":1,"result":"part0 (call 2) ","stop_reason":null,"session_id":"b9a0dd87-b404-4a15-b352-74a640ecc422","total_cost_usd":0.00009999999999999999,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":2,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{"claude-sonnet-4-5-20250929":{"inputTokens":10,"outputTokens":2,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"webSearchRequests":0,"costUSD":0.00009999999999999999,"contextWindow":200000,"maxOutputTokens":32000}},"permission_denials":[],"uuid":"fd2b8ec1-ca01-4bfe-bf1e-391829f31277"}"#,
+    ];
+
+    /// Claude 2.1.42 on a 429 (captured live): a synthetic `assistant` message
+    /// carrying the error text, then the error result.
+    const SYNTHETIC_API_ERROR_FRAMES: [&str; 2] = [
+        r#"{"type":"assistant","message":{"id":"f963d6e6-fdbf-4603-8949-81b6fedabdf2","container":null,"model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}"}],"context_management":null},"parent_tool_use_id":null,"session_id":"f8d4626b-a0b3-4729-a522-b1592b723e58","uuid":"323df042-c949-4eb1-8c92-006242d272be","error":"unknown"}"#,
+        r#"{"type":"result","subtype":"success","is_error":true,"duration_ms":117,"duration_api_ms":0,"num_turns":1,"result":"API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"You have exceeded the 5-hour usage quota\"}}","stop_reason":"stop_sequence","session_id":"f8d4626b-a0b3-4729-a522-b1592b723e58","total_cost_usd":0,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"uuid":"38b0d228-9918-465b-87c2-56a38ef03054"}"#,
+    ];
+
+    /// The same failure from Claude 2.1.284 after its retries (captured live).
+    const SYNTHETIC_API_ERROR_FRAMES_2_1_284: [&str; 2] = [
+        r#"{"type":"assistant","message":{"diagnostics":null,"id":"590dc3a4-889b-4119-ace4-068950009f36","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{"output_tokens_details":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":null,"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":null,"iterations":null,"speed":null},"content":[{"type":"text","text":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota"}],"context_management":null},"parent_tool_use_id":null,"session_id":"d2500074-829c-4808-a9b1-24f30e77dd79","uuid":"5366cabe-6726-4119-be48-344b75937912","timestamp":"2026-09-29T11:19:45.507Z","error":"rate_limit","is_api_error_message":true}"#,
+        r#"{"duration_api_ms":0,"stop_reason":"stop_sequence","session_id":"d2500074-829c-4808-a9b1-24f30e77dd79","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard"},"modelUsage":{},"permission_denials":[],"terminal_reason":"api_error","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subagent_stats":{"spawned":0,"requested":{"background":0,"foreground":0,"unset":0},"started_in_background":0,"max_depth":0,"spawned_by_subagents":0,"completed":0,"failed":0,"killed":{"parent":0,"user":0,"system":0},"refused":{"depth_limit":0,"concurrency_limit":0,"budget":0},"by_type":{}},"is_error":true,"num_turns":1,"subtype":"success","api_error_status":429,"result":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota","type":"result","duration_ms":182057,"uuid":"31217b3b-7176-4bd1-85f8-fcc98de58228","queued_turn_count":0,"result_index":0}"#,
+    ];
+
+    fn gate_events(frames: &[&str]) -> Vec<SessionEvent> {
+        let mut gate = SubagentOutputGate::default();
+        frames
+            .iter()
+            .flat_map(|frame| gate.on_line(frame))
+            .collect()
+    }
+
+    #[test]
+    fn non_streamed_fallback_answer_is_rendered() {
+        for frames in [
+            NON_STREAMING_FALLBACK_FRAMES,
+            NON_STREAMING_FALLBACK_FRAMES_2_1_284,
+        ] {
+            let events = gate_events(&frames);
+            let answer = events.iter().position(|event| {
+                matches!(event, SessionEvent::TextDelta(text)
+                    if text.contains("FULL ANSWER FROM NON-STREAMING FALLBACK"))
+            });
+            let done = events.iter().position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::TurnDone {
+                        status: TurnStatus::Completed,
+                        ..
+                    }
+                )
+            });
+            assert!(
+                matches!((answer, done), (Some(answer), Some(done)) if answer < done),
+                "the non-streamed answer must reach the user before the turn ends: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_text_is_not_repeated_from_its_aggregate_frame() {
+        let text: Vec<SessionEvent> = gate_events(&STREAMED_TURN_FRAMES)
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::TextDelta(_)))
+            .collect();
+        assert_eq!(
+            text,
+            vec![SessionEvent::TextDelta("part0 (call 2) ".to_string())]
+        );
+        // Deltas whose `message_start` was not seen still belong to the next
+        // aggregate frame: its text is not repeated either.
+        let text: Vec<SessionEvent> = gate_events(&STREAMED_TURN_FRAMES[1..])
+            .into_iter()
+            .filter(|event| matches!(event, SessionEvent::TextDelta(_)))
+            .collect();
+        assert_eq!(
+            text,
+            vec![SessionEvent::TextDelta("part0 (call 2) ".to_string())]
+        );
+    }
+
+    #[test]
+    fn synthetic_api_error_message_is_not_rendered_as_the_answer() {
+        for frames in [
+            SYNTHETIC_API_ERROR_FRAMES,
+            SYNTHETIC_API_ERROR_FRAMES_2_1_284,
+        ] {
+            let events = gate_events(&frames);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, SessionEvent::TextDelta(_))),
+                "{events:?}"
+            );
+            assert!(matches!(
+                events.last(),
+                Some(SessionEvent::TurnDone { status: TurnStatus::Failed(reason), .. })
+                    if reason.contains("API Error") && reason.contains("429")
+            ));
+        }
     }
 
     #[test]
