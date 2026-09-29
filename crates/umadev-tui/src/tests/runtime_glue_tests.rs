@@ -197,3 +197,181 @@ async fn restart_does_not_block_on_a_turn_holding_the_holder() {
     );
     turn.abort();
 }
+
+/// A `Term` over stdout with a fixed viewport: building it neither queries nor
+/// writes the terminal, and these tests never draw.
+fn silent_term() -> Term {
+    ratatui::Terminal::with_options(
+        AnchoredBackend::new(CrosstermBackend::new(std::io::stdout())),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+        },
+    )
+    .expect("a fixed viewport needs no terminal")
+}
+
+/// The event-loop state a tick-flushed key can touch (the loop's own locals).
+#[allow(clippy::struct_excessive_bools)]
+struct FlushLoop {
+    run_task: Option<tokio::task::JoinHandle<()>>,
+    cancel_drain: Option<tokio::task::JoinHandle<()>>,
+    cancel_drain_timed_out: bool,
+    cancel_deadline: Option<tokio::time::Instant>,
+    continuous_run_active: bool,
+    session_holder: SessionHolder,
+    chat_session_holder: ChatSessionHolder,
+    pending_ask_holder: PendingAskHolder,
+    approval_holder: ApprovalHolder,
+    host_input_holder: HostInputHolder,
+    steer_holder: umadev_agent::SteerIntake,
+    live_input_hub: LiveInputHub,
+    sink: Arc<ChannelSink>,
+    engine_rx: umadev_agent::ChannelReceiver,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    route_rx: tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
+    needs_redraw: bool,
+    draw_now: bool,
+}
+
+impl FlushLoop {
+    fn new() -> Self {
+        let (sink, engine_rx) = ChannelSink::new();
+        let (route_tx, route_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            run_task: None,
+            cancel_drain: None,
+            cancel_drain_timed_out: false,
+            cancel_deadline: None,
+            continuous_run_active: false,
+            session_holder: Arc::new(tokio::sync::Mutex::new(None)),
+            chat_session_holder: ChatSessionHolder::new(None),
+            pending_ask_holder: Arc::new(tokio::sync::Mutex::new(None)),
+            approval_holder: Arc::new(std::sync::Mutex::new(None)),
+            host_input_holder: Arc::new(std::sync::Mutex::new(None)),
+            steer_holder: Arc::new(std::sync::Mutex::new(Vec::new())),
+            live_input_hub: LiveInputHub::default(),
+            sink: Arc::new(sink),
+            engine_rx,
+            route_tx,
+            route_rx,
+            needs_redraw: false,
+            draw_now: false,
+        }
+    }
+
+    /// Press a lone Esc on the legacy (Windows) reader: the leaked-mouse filter
+    /// holds it, and the next tick flushes it into the loop.
+    fn tick_flushed_esc(&mut self, app: &mut App) {
+        let mut filter = MouseSeqFilter::default();
+        assert!(
+            filter.feed(k(KeyCode::Esc)).is_empty(),
+            "the legacy filter holds a lone Esc until the tick"
+        );
+        let mut terminal = silent_term();
+        for key in filter.flush() {
+            handle_tick_flush_key(
+                app,
+                &mut terminal,
+                key,
+                &mut self.needs_redraw,
+                &mut self.draw_now,
+                &mut self.run_task,
+                &mut self.cancel_drain,
+                &mut self.cancel_drain_timed_out,
+                &mut self.cancel_deadline,
+                &mut self.continuous_run_active,
+                &self.session_holder,
+                &self.chat_session_holder,
+                &self.pending_ask_holder,
+                &self.approval_holder,
+                &self.host_input_holder,
+                &self.steer_holder,
+                &self.live_input_hub,
+                &self.sink,
+                &self.route_tx,
+                &mut self.engine_rx,
+                &mut self.route_rx,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tick_flushed_lone_esc_denies_pending_approval() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = glue_app(tmp.path());
+    let mut flush_loop = FlushLoop::new();
+    // A Guarded turn is paused on the approval bar ("Esc=deny").
+    app.thinking = true;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    *flush_loop.approval_holder.lock().unwrap() = Some(test_pending_approval(reply_tx));
+    app.set_pending_approval(pending_approval_item(&flush_loop.approval_holder));
+    let generation = flush_loop.chat_session_holder.generation();
+
+    flush_loop.tick_flushed_esc(&mut app);
+
+    assert_eq!(reply_rx.await.ok(), Some(ApprovalReply::Deny));
+    assert!(
+        !app.interrupt_armed(),
+        "the Esc answered the approval instead of arming the interrupt"
+    );
+    assert!(!app.cancelling);
+    assert_eq!(
+        flush_loop.chat_session_holder.generation(),
+        generation,
+        "no cancel reached the resident session"
+    );
+}
+
+#[tokio::test]
+async fn tick_flushed_lone_esc_cancels_a_pending_base_question() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = glue_app(tmp.path());
+    let mut flush_loop = FlushLoop::new();
+    app.thinking = true;
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    *flush_loop.host_input_holder.lock().unwrap() = Some(PendingHostInput {
+        token: 7,
+        reply_tx,
+        req_id: String::new(),
+        request: umadev_runtime::HostRequest::UserInput {
+            questions: vec![host_choice_question(
+                "database",
+                umadev_runtime::HostQuestionKind::SingleChoice,
+                true,
+            )],
+            metadata: serde_json::Value::Null,
+        },
+    });
+    app.set_pending_host_input(pending_host_input_item(&flush_loop.host_input_holder));
+
+    flush_loop.tick_flushed_esc(&mut app);
+
+    assert!(matches!(
+        reply_rx.await,
+        Ok(umadev_runtime::HostResponse::Cancelled { .. })
+    ));
+    assert!(!app.interrupt_armed());
+    assert!(!app.cancelling);
+}
+
+#[tokio::test]
+async fn tick_flushed_double_esc_on_an_idle_paused_run_resets_the_parked_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = glue_app(tmp.path());
+    let mut flush_loop = FlushLoop::new();
+    // A legacy continuous run parked at a gate: nothing is running.
+    app.director_gate_paused = true;
+    flush_loop.continuous_run_active = true;
+
+    flush_loop.tick_flushed_esc(&mut app);
+    assert!(app.interrupt_armed(), "the first Esc arms the interrupt");
+    flush_loop.tick_flushed_esc(&mut app);
+
+    assert!(
+        !flush_loop.continuous_run_active,
+        "the idle cancel resets the parked run like a live Esc does"
+    );
+    assert!(!app.director_gate_paused);
+    assert!(flush_loop.run_task.is_none() && flush_loop.cancel_drain.is_none());
+}

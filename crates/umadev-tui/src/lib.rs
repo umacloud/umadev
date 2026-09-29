@@ -8796,16 +8796,21 @@ fn route_replay_key(
     Some(key)
 }
 
+/// Apply a key the tick flushed out of [`MouseSeqFilter`] (a lone Esc the legacy
+/// reader held back) like a live key: a pending approval or base question takes
+/// it first, and a cancel runs the same prepared cancel and idle-session reset.
 #[allow(clippy::too_many_arguments)]
 fn handle_tick_flush_key(
     app: &mut App,
     terminal: &mut Term,
     key: KeyEvent,
+    needs_redraw: &mut bool,
     draw_now: &mut bool,
     run_task: &mut Option<tokio::task::JoinHandle<()>>,
     cancel_drain: &mut Option<tokio::task::JoinHandle<()>>,
     cancel_drain_timed_out: &mut bool,
     cancel_deadline: &mut Option<tokio::time::Instant>,
+    continuous_run_active: &mut bool,
     session_holder: &SessionHolder,
     chat_session_holder: &ChatSessionHolder,
     pending_ask_holder: &PendingAskHolder,
@@ -8815,13 +8820,24 @@ fn handle_tick_flush_key(
     live_input_hub: &LiveInputHub,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    engine_rx: &mut umadev_agent::ChannelReceiver,
+    route_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
 ) {
-    if auth_ui::handle_loop_key(app, chat_session_holder, terminal, key) {
-        *draw_now = true;
+    let Some(key) = route_replay_key(
+        app,
+        terminal,
+        chat_session_holder,
+        host_input_holder,
+        approval_holder,
+        sink,
+        key,
+        needs_redraw,
+        draw_now,
+    ) else {
         return;
-    }
-    if app.apply_key_with_mods(key.code, key.modifiers) != Action::Cancel
-        || !prepare_cancel_request(
+    };
+    if app.apply_key_with_mods(key.code, key.modifiers) == Action::Cancel
+        && prepare_cancel_request(
             app,
             cancel_drain.is_some(),
             approval_holder,
@@ -8831,24 +8847,15 @@ fn handle_tick_flush_key(
             chat_session_holder,
         )
     {
-        return;
-    }
-    let host_git = app.host_git_in_flight;
-    if let Some(handle) = run_task.take() {
-        begin_cancel_drain(
+        handle_prepared_cancel(
             app,
-            handle,
-            host_git,
+            run_task,
             cancel_drain,
             cancel_drain_timed_out,
             cancel_deadline,
-        );
-    } else if host_git {
-        app.record_host_git_cancelled();
-        *run_task = resident_host_git::drain_after_settle(
-            app,
-            chat_session_holder,
+            continuous_run_active,
             session_holder,
+            chat_session_holder,
             pending_ask_holder,
             approval_holder,
             host_input_holder,
@@ -8856,19 +8863,8 @@ fn handle_tick_flush_key(
             live_input_hub,
             sink,
             route_tx,
-        );
-    } else {
-        *run_task = settle_cancel_and_drain_next(
-            app,
-            chat_session_holder,
-            session_holder,
-            pending_ask_holder,
-            approval_holder,
-            host_input_holder,
-            steer_holder,
-            live_input_hub,
-            sink,
-            route_tx,
+            engine_rx,
+            route_rx,
         );
     }
 }
@@ -11637,11 +11633,13 @@ async fn event_loop(
                         app,
                         terminal,
                         replay_key,
+                        &mut needs_redraw,
                         &mut draw_now,
                         &mut run_task,
                         &mut cancel_drain,
                         &mut cancel_drain_timed_out,
                         &mut cancel_deadline,
+                        &mut continuous_run_active,
                         &session_holder,
                         &chat_session_holder,
                         &pending_ask_holder,
@@ -11651,6 +11649,8 @@ async fn event_loop(
                         &live_input_hub,
                         &sink,
                         &route_tx,
+                        &mut engine_rx,
+                        &mut route_rx,
                     );
                 }
             }
