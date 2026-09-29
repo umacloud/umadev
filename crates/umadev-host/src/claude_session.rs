@@ -115,6 +115,10 @@ const INTERRUPT_RECEIPT_BUDGET: std::time::Duration = std::time::Duration::from_
 /// interrupt ACK; the bound stays below the 5-second limit callers put on the
 /// whole interrupt.
 const INTERRUPT_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long `end` and `Drop` let Claude exit on its own once its stdin closed
+/// before the process tree is killed. An idle Claude writes its transcript and
+/// exits within a few hundred milliseconds of end of input.
+const CLAUDE_EOF_GRACE: std::time::Duration = END_REAP_BUDGET;
 /// How long [`ClaudeSession::resume`] waits for a resumed Claude to answer its
 /// readiness probe. A slow start is not a failure: past this bound the session
 /// is handed out as before.
@@ -373,9 +377,10 @@ pub struct ClaudeSession {
     /// The base child. Behind a [`std::sync::Mutex`] so the `&self`
     /// [`BaseSession::try_exit_status`] can do a non-blocking `try_wait()` peek
     /// (which needs `&mut Child`) without forcing the whole trait method to take
-    /// `&mut self`. `kill_on_drop(true)` still fires when the struct (and so the
-    /// `Child`) drops; `end()` kills through the lock.
-    child: std::sync::Mutex<Child>,
+    /// `&mut self`. Shared so a dropped session can hand the process tree to a
+    /// detached [`ProcessTreeEnd`]; `kill_on_drop(true)` still fires when the
+    /// last owner drops the `Child`.
+    child: Arc<std::sync::Mutex<Child>>,
     /// Windows kill-on-close Job Object holding the base's whole process tree so a
     /// native grandchild can't orphan once the Node trampoline exits (`taskkill`
     /// walks only the live parent chain). Terminated in `end`/`Drop`. `None` off
@@ -383,7 +388,9 @@ pub struct ClaudeSession {
     /// fallback in [`crate::kill_isolated_process_tree`] stands).
     #[cfg(windows)]
     process_job: Option<umadev_process::KillOnCloseJob>,
-    stdin: ChildStdin,
+    /// `None` once `end` or `Drop` closed it: end of input is how Claude
+    /// finishes on its own.
+    stdin: Option<ChildStdin>,
     events: mpsc::Receiver<SessionEvent>,
     /// Exact unresolved control payloads, keyed by Claude request id. Needed to
     /// preserve normal tool input and to merge structured question answers.
@@ -737,10 +744,10 @@ impl ClaudeSession {
         ));
 
         Ok(Self {
-            child: std::sync::Mutex::new(child),
+            child: Arc::new(std::sync::Mutex::new(child)),
             #[cfg(windows)]
             process_job,
-            stdin,
+            stdin: Some(stdin),
             events: rx,
             pending_controls,
             pending_replay_acks,
@@ -763,6 +770,16 @@ impl ClaudeSession {
         &self.session_id
     }
 
+    /// Hand the process tree to a [`ProcessTreeEnd`]; the session keeps only a
+    /// shared handle for exit-status reads.
+    fn process_tree_end(&mut self) -> ProcessTreeEnd {
+        ProcessTreeEnd {
+            child: Arc::clone(&self.child),
+            #[cfg(windows)]
+            job: self.process_job.take(),
+        }
+    }
+
     /// Write one NDJSON line + flush to the live session's stdin.
     async fn write_line(&mut self, line: &str) -> Result<(), SessionError> {
         // Pre-send liveness: if the child already EXITED (a GLM/third-party API error killed
@@ -783,15 +800,18 @@ impl ClaudeSession {
                 "base session ended before send (base exited: {status}){reason}"
             )));
         }
-        self.stdin
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(SessionError::Closed);
+        };
+        stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| SessionError::Send(e.to_string()))?;
-        self.stdin
+        stdin
             .write_all(b"\n")
             .await
             .map_err(|e| SessionError::Send(e.to_string()))?;
-        self.stdin
+        stdin
             .flush()
             .await
             .map_err(|e| SessionError::Send(e.to_string()))?;
@@ -1012,18 +1032,20 @@ impl ClaudeSession {
 impl Drop for ClaudeSession {
     fn drop(&mut self) {
         // A dropped session (timed-out / cancelled turn, or teardown that skipped
-        // `end()`) must kill the whole process GROUP so no tool/subagent (or, on
-        // an npm trampoline install, native base) grandchild is orphaned to init.
-        // Windows: terminate the Job Object first (reaches a grandchild taskkill
-        // can't). The blocking group-kill recovers a poisoned lock and briefly
-        // spins on contention so the group kill still fires (a bare `try_lock`
-        // skipped it on poison/contention); fail-open to `kill_on_drop` on overrun.
-        #[cfg(windows)]
-        if let Some(job) = self.process_job.take() {
-            job.terminate();
-            drop(job);
+        // `end()`) must not leave any of its process tree behind, but an idle
+        // Claude must not be killed before it writes its transcript either (see
+        // `end`). Closing stdin lets Claude finish; a detached task gives it the
+        // same grace as `end` and then kills the whole group, so the caller never
+        // blocks. A turn still running was abandoned: given that grace, Claude
+        // would go on running it, tools included, after its caller moved on. So
+        // then, and without a runtime to run that task, the tree is killed at once.
+        drop(self.stdin.take());
+        let tree = self.process_tree_end();
+        if self.turn_in_flight.is_none() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(tree.finish());
+            }
         }
-        kill_isolated_process_tree_blocking(&self.child);
     }
 }
 
@@ -1179,12 +1201,7 @@ impl BaseSession for ClaudeSession {
                 .interrupt_receipt_v1
                 .then(|| protocol.register_client_control(request_id.clone()))
         };
-        let line = serde_json::json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": { "subtype": "interrupt" }
-        })
-        .to_string();
+        let line = interrupt_line(&request_id);
         if let Err(error) = self.write_line(&line).await {
             self.protocol
                 .lock()
@@ -1208,22 +1225,23 @@ impl BaseSession for ClaudeSession {
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Best-effort: kill the whole process GROUP (drops stdin → EOF, tears
-        // down the reader/stderr tasks) AND wait (bounded) for the direct child
-        // to be reaped so shutdown is deterministic and leaves no orphan — a
-        // direct-child kill would reparent tool/subagent grandchildren to init.
-        // On overrun we fail open to kill_on_drop. Consistent with codex /
-        // opencode `end()`.
-        //
-        // Windows: terminate the Job Object FIRST so the native `claude` grandchild
-        // is killed even after the trampoline has exited (taskkill can no longer
-        // reach it); the group reap below is the cross-platform backstop.
-        #[cfg(windows)]
-        if let Some(job) = self.process_job.take() {
-            job.terminate();
-            drop(job);
+        // Graceful first, as the ACP driver ends its sessions. Claude writes its
+        // transcript up to half a second after a turn's result; killing it at
+        // once could lose the whole conversation, and a later `--resume` would
+        // find nothing. So stop a turn still running (its frames are not
+        // awaited, and a Claude that stopped reading cannot hold the write up),
+        // close stdin, and give Claude `CLAUDE_EOF_GRACE` to exit on its own.
+        // Then the whole process GROUP is killed and the direct child reaped
+        // (bounded), so no tool/subagent grandchild is left behind — a
+        // direct-child kill would reparent them to init. On Windows the Job
+        // Object is terminated too, which reaches a native grandchild taskkill
+        // cannot.
+        if self.turn_in_flight.take().is_some() {
+            let line = interrupt_line(&new_session_id());
+            let _ = tokio::time::timeout(CLAUDE_EOF_GRACE, self.write_line(&line)).await;
         }
-        reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
+        drop(self.stdin.take());
+        self.process_tree_end().finish().await;
         self.stderr_drain.shutdown().await;
         Ok(())
     }
@@ -1245,6 +1263,71 @@ impl BaseSession for ClaudeSession {
         // accumulated transcript for full-context cross-session resume.
         Some(&self.session_id)
     }
+}
+
+/// Ends a Claude process tree without ever leaving it running: Claude gets
+/// [`CLAUDE_EOF_GRACE`] after its stdin closed to exit on its own, which is when
+/// it writes its transcript, and then the whole tree is killed and the direct
+/// child reaped. Dropped unfinished (no runtime, or one shutting down before
+/// the task ran), it kills the tree at once, as a dropped session always did.
+struct ProcessTreeEnd {
+    child: Arc<std::sync::Mutex<Child>>,
+    #[cfg(windows)]
+    job: Option<umadev_process::KillOnCloseJob>,
+}
+
+impl ProcessTreeEnd {
+    /// Dropping `self` at the end terminates the Windows Job Object (see `Drop`).
+    async fn finish(self) {
+        if !wait_for_isolated_exit(&self.child, CLAUDE_EOF_GRACE).await {
+            reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
+        }
+    }
+}
+
+impl Drop for ProcessTreeEnd {
+    fn drop(&mut self) {
+        // Windows: terminate the Job Object, which reaches a native grandchild a
+        // process-tree kill cannot once the trampoline has exited. After `finish`
+        // the group kill finds the child reaped and signals nothing: a reaped
+        // child has no id, so its reusable group id is never signalled. The
+        // blocking group-kill recovers a poisoned lock and briefly spins on
+        // contention; fail-open to `kill_on_drop` on overrun.
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            job.terminate();
+            drop(job);
+        }
+        kill_isolated_process_tree_blocking(&self.child);
+    }
+}
+
+/// Poll until the isolated child has exited (its remaining group is killed and
+/// the child reaped), or `budget` elapses; `true` when it exited.
+async fn wait_for_isolated_exit(
+    child: &std::sync::Mutex<Child>,
+    budget: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if try_exit_isolated_process_tree(child).is_some() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The stream-json `interrupt` control request.
+fn interrupt_line(request_id: &str) -> String {
+    serde_json::json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "interrupt" }
+    })
+    .to_string()
 }
 
 /// Exact stream-json envelope for resolving a `can_use_tool` request.
@@ -6947,7 +7030,8 @@ cat >/dev/null
         session.end().await.expect("bounded end");
         assert!(!session.stderr_drain.is_active());
         assert!(
-            started.elapsed() < END_REAP_BUDGET + std::time::Duration::from_secs(1),
+            started.elapsed()
+                < CLAUDE_EOF_GRACE + END_REAP_BUDGET + std::time::Duration::from_secs(1),
             "end must not wait for the inherited stderr writer"
         );
 
@@ -7178,6 +7262,266 @@ cat >/dev/null
         );
         assert!(matches!(got.last(), Some(SessionEvent::TurnDone { .. })));
         let _ = s.end().await;
+    }
+
+    /// A fake Claude that answers one turn, then, like Claude 2.1.42, writes its
+    /// transcript a moment after its input ends and exits. `extra` runs first.
+    #[cfg(unix)]
+    fn fake_claude_writing_transcript_at_exit(
+        tmp: &std::path::Path,
+        extra: &str,
+    ) -> std::path::PathBuf {
+        write_fake_claude(
+            tmp,
+            &format!(
+                "#!/bin/sh\n{extra}\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{input}'; done\n\
+                 sleep 0.3\n\
+                 echo flushed > '{transcript}'\n",
+                input = tmp.join("input-after-turn.log").display(),
+                transcript = tmp.join("transcript.jsonl").display(),
+            ),
+        )
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    #[cfg(unix)]
+    async fn wait_until(what: &str, budget: std::time::Duration, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + budget;
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_lets_claude_write_its_transcript_before_the_tree_dies() {
+        // Claude 2.1.42 writes its transcript up to half a second after a turn's
+        // result. Killing it at once lost the conversation, so `--resume` of that
+        // session later found nothing.
+        let tmp = tempfile_dir();
+        let fake = fake_claude_writing_transcript_at_exit(&tmp, "");
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-eof",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("one".to_string()).await.expect("send");
+        assert!(matches!(
+            first_terminal(&mut session).await,
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                ..
+            }
+        ));
+        session.end().await.expect("end");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("transcript.jsonl"))
+                .ok()
+                .as_deref(),
+            Some("flushed\n"),
+            "end() killed Claude before it wrote its transcript"
+        );
+        assert!(session.try_exit_status().is_some(), "end() reaps the child");
+        // The turn had ended, so nothing but end of input was sent.
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("input-after-turn.log")).unwrap_or_default(),
+            ""
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn end_stops_a_running_turn_before_closing_input() {
+        let tmp = tempfile_dir();
+        let log = tmp.join("input-after-turn.log");
+        let fake = write_fake_claude(
+            &tmp,
+            &format!(
+                "#!/bin/sh\n\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"working\"}}}}}}'\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{}'; done\n",
+                log.display()
+            ),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-eof-turn",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("long".to_string()).await.expect("send");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("working".to_string()))
+        );
+        let started = tokio::time::Instant::now();
+        session.end().await.expect("end");
+        assert!(
+            started.elapsed() < CLAUDE_EOF_GRACE,
+            "a Claude that exits at end of input is not waited out: {:?}",
+            started.elapsed()
+        );
+        let sent: Value = serde_json::from_str(
+            std::fs::read_to_string(&log)
+                .expect("input after the turn")
+                .lines()
+                .next()
+                .expect("one line"),
+        )
+        .expect("JSON");
+        assert_eq!(sent["request"]["subtype"], "interrupt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_lets_claude_finish_then_reaps_it() {
+        let tmp = tempfile_dir();
+        let pid_file = tmp.join("claude.pid");
+        let fake = fake_claude_writing_transcript_at_exit(
+            &tmp,
+            &format!("echo $$ > '{}'\n", pid_file.display()),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-drop",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("one".to_string()).await.expect("send");
+        let _ = first_terminal(&mut session).await;
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("pid number");
+
+        let started = std::time::Instant::now();
+        drop(session);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "dropping a session must not block its caller"
+        );
+        let transcript = tmp.join("transcript.jsonl");
+        wait_until(
+            "a dropped session killed Claude before it wrote its transcript",
+            std::time::Duration::from_secs(10),
+            || transcript.exists(),
+        )
+        .await;
+        wait_until(
+            "a dropped session left its Claude process behind",
+            std::time::Duration::from_secs(10),
+            || !process_alive(pid),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_mid_turn_stops_claude_at_once() {
+        // The caller abandoned the turn. At end of input Claude would go on
+        // running it, so it gets no grace: nothing it does lands afterwards.
+        let tmp = tempfile_dir();
+        let late = tmp.join("late-write");
+        let fake = write_fake_claude(
+            &tmp,
+            &format!(
+                "#!/bin/sh\n\
+                 IFS= read -r _turn\n\
+                 printf '%s\\n' '{{\"type\":\"stream_event\",\"event\":{{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"working\"}}}}}}'\n\
+                 while IFS= read -r _line; do :; done\n\
+                 sleep 0.5\n\
+                 echo late > '{}'\n",
+                late.display()
+            ),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-drop-turn",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        session.send_turn("long".to_string()).await.expect("send");
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("working".to_string()))
+        );
+        drop(session);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !late.exists(),
+            "a session dropped mid-turn let Claude keep running that turn"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_a_session_still_kills_a_claude_that_ignores_end_of_input() {
+        let tmp = tempfile_dir();
+        let pids = tmp.join("pids");
+        let fake = write_fake_claude(
+            &tmp,
+            &format!(
+                "#!/bin/sh\nsleep 30 &\necho \"$$ $!\" > '{}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"fixture\"}}'\n\
+                 sleep 30\n",
+                pids.display()
+            ),
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-drop-deaf",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        assert!(matches!(
+            session.next_event().await,
+            Some(SessionEvent::SessionModel(_))
+        ));
+        let pids: Vec<i32> = std::fs::read_to_string(&pids)
+            .expect("pids")
+            .split_whitespace()
+            .map(|pid| pid.parse().expect("pid"))
+            .collect();
+        drop(session);
+        for pid in pids {
+            wait_until(
+                "the process tree outlived the EOF grace",
+                CLAUDE_EOF_GRACE + END_REAP_BUDGET + std::time::Duration::from_secs(5),
+                || !process_alive(pid),
+            )
+            .await;
+        }
     }
 
     #[cfg(unix)]
