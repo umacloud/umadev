@@ -110,6 +110,9 @@ const MAX_GROK_NOTES_CHARS: usize = 16 * 1024;
 const MAX_GROK_PLAN_CHARS: usize = 256 * 1024;
 const MAX_KIMI_PLAN_REVIEW_CHARS: usize = 256 * 1024;
 const MAX_TOOL_CALL_ID_CHARS: usize = 512;
+// Tool-call ids remembered per state (announced, provisional, settled); the
+// oldest is forgotten first beyond this many.
+const MAX_RECENT_TOOL_IDS: usize = 256;
 // A permission request names its tool call by id. What each unsettled call does
 // is remembered until it settles; calls a cancelled turn never settles age out,
 // oldest first, beyond this many.
@@ -6161,13 +6164,13 @@ async fn emit_converged_terminal(
 
 #[derive(Default)]
 struct ToolState {
-    known: HashSet<String>,
+    known: RecentToolIds,
     /// Kimi and other ACP agents may create a pending tool from streamed JSON
     /// before parsed `rawInput` exists. Hold those ids until the authoritative
     /// started-upgrade arrives so consumers see one factual tool call, not a
     /// placeholder followed by arguments mislabelled as command output.
-    provisional: HashSet<String>,
-    settled: HashSet<String>,
+    provisional: RecentToolIds,
+    settled: RecentToolIds,
     /// What each unsettled call does, by call id, with the ids oldest first.
     /// A permission request's `toolCall` names a call the agent announced
     /// before, and Kimi's carries no `kind` and no arguments: what the call
@@ -6177,6 +6180,46 @@ struct ToolState {
     seen_grok_event_ids: HashSet<String>,
     grok_event_order: VecDeque<String>,
     bash_streams: HashMap<String, GrokBashStream>,
+}
+
+/// Recently seen tool-call ids, forgetting the oldest past a bound.
+///
+/// Emptying the whole set at the bound made every call still in flight look
+/// unannounced, so its next update invented a second, phantom tool call.
+#[derive(Debug, Default)]
+struct RecentToolIds {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl RecentToolIds {
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn insert(&mut self, id: String) {
+        if self.ids.contains(&id) {
+            return;
+        }
+        if self.order.len() >= MAX_RECENT_TOOL_IDS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+        self.ids.insert(id.clone());
+        self.order.push_back(id);
+    }
+
+    fn remove(&mut self, id: &str) {
+        if self.ids.remove(id) {
+            self.order.retain(|recent| recent != id);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
 }
 
 /// What one announced tool call will do.
@@ -7149,11 +7192,11 @@ fn parse_tool_call(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent> {
             .is_none();
     tools.remember_subject(&id, update, provisional);
     if provisional {
-        bounded_insert(&mut tools.provisional, id);
+        tools.provisional.insert(id);
         return Vec::new();
     }
     if !id.is_empty() {
-        bounded_insert(&mut tools.known, id.clone());
+        tools.known.insert(id.clone());
     }
     let input = normalized_tool_input(update);
     vec![if id.is_empty() {
@@ -7190,7 +7233,7 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
     }
     if !id.is_empty() && (was_provisional || !tools.known.contains(&id)) {
         tools.provisional.remove(&id);
-        bounded_insert(&mut tools.known, id.clone());
+        tools.known.insert(id.clone());
         let input = normalized_tool_input(update);
         events.push(SessionEvent::ToolCallCorrelated {
             call_id: id.clone(),
@@ -7238,7 +7281,7 @@ fn parse_tool_update(update: &Value, tools: &mut ToolState) -> Vec<SessionEvent>
     match status {
         "completed" | "failed" if id.is_empty() || !tools.settled.contains(&id) => {
             if !id.is_empty() {
-                bounded_insert(&mut tools.settled, id.clone());
+                tools.settled.insert(id.clone());
                 tools.forget_subject(&id);
                 if let Some(mut stream) = tools.bash_streams.remove(&id) {
                     append_grok_bash_tail(
@@ -7356,13 +7399,6 @@ fn push_grok_bash_event(events: &mut Vec<SessionEvent>, call_id: &str, update: G
             });
         }
     }
-}
-
-fn bounded_insert(set: &mut HashSet<String>, value: String) {
-    if set.len() >= 256 {
-        set.clear();
-    }
-    set.insert(value);
 }
 
 fn bounded_tool_call_id(value: &Value) -> String {
@@ -13434,6 +13470,53 @@ mod tests {
             &mut tools,
         );
         assert!(duplicate.is_empty());
+    }
+
+    #[test]
+    fn known_tool_rollover_keeps_in_flight_ids() {
+        // A long resident session announces hundreds of calls. Reaching the
+        // bound on remembered ids must not forget a call that is still
+        // running: its later updates would invent a second, phantom call.
+        let mut tools = ToolState::default();
+        let mut update =
+            |update: Value| parse_session_update(&json!({"update":update}), &mut tools);
+        let started = |id: &str| {
+            json!({"sessionUpdate":"tool_call","toolCallId":id,"kind":"execute",
+                "status":"in_progress","rawInput":{"command":"cargo test"}})
+        };
+        let completed = |id: &str| {
+            json!({"sessionUpdate":"tool_call_update","toolCallId":id,
+                "status":"completed","rawOutput":"ok"})
+        };
+        for index in 0..255 {
+            let id = format!("done-{index}");
+            update(started(&id));
+            update(completed(&id));
+        }
+        let mut events = update(started("a"));
+        // The 257th distinct id.
+        events.extend(update(started("b")));
+        events.extend(update(
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"a",
+            "title":"Running tests"}),
+        ));
+        events.extend(update(completed("a")));
+        let calls_for_a = events
+            .iter()
+            .filter(|event| {
+                matches!(event, SessionEvent::ToolCallCorrelated { call_id, .. } if call_id == "a")
+            })
+            .count();
+        assert_eq!(calls_for_a, 1, "{events:?}");
+        assert!(events.contains(&SessionEvent::ToolProgressCorrelated {
+            call_id: "a".to_string(),
+            title: "Running tests".to_string(),
+        }));
+        assert!(events.contains(&SessionEvent::ToolResultCorrelated {
+            call_id: "a".to_string(),
+            ok: true,
+            summary: "ok".to_string(),
+        }));
     }
 
     #[test]
