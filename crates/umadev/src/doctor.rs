@@ -110,7 +110,7 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
     results.push(check_claude_noninteractive_auth(
         configured_backend.as_deref(),
     ));
-    results.push(check_git());
+    results.push(check_git(workspace));
     results.push(check_user_config());
     results.push(check_claude_hook(workspace));
     results.push(check_kimi_hook(workspace, configured_backend.as_deref()));
@@ -416,22 +416,31 @@ fn node_probe_warning(reason: &str) -> CheckResult {
     }
 }
 
-/// Check whether `git` is available — `/checkpoint` and `/rewind` use a shadow
-/// git repo. Missing git just disables checkpoints (fail-open), so this is a
-/// Warning, not an error.
-fn check_git() -> CheckResult {
-    if which_on_path("git") {
-        CheckResult {
-            name: "git (file checkpoints)".to_string(),
-            status: Status::Passed,
-            detail: "found — /checkpoint and /rewind are available".to_string(),
-        }
-    } else {
-        CheckResult {
-            name: "git (file checkpoints)".to_string(),
+/// Check whether `/checkpoint` and `/rewind` can snapshot `workspace`: they
+/// use a shadow git repo, so `git` must be on PATH, and the workspace must fit
+/// the snapshot's whole-tree limits (a read-only walk that changes nothing).
+/// Unavailable checkpoints never block a run (fail-open), so this is a Warning,
+/// not an error.
+fn check_git(workspace: &Path) -> CheckResult {
+    let name = "git (file checkpoints)".to_string();
+    if !which_on_path("git") {
+        return CheckResult {
+            name,
             status: Status::Warning,
             detail: "git not on PATH — phase-level file checkpoints (/checkpoint, /rewind) are disabled. Install git to enable them.".to_string(),
-        }
+        };
+    }
+    match umadev_agent::checkpoint::checkpoint_unavailable_reason(workspace) {
+        Some(reason) => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: umadev_i18n::tlf("doctor.checkpoints_unavailable", &[&reason]),
+        },
+        None => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: "found — /checkpoint and /rewind are available".to_string(),
+        },
     }
 }
 
@@ -2181,6 +2190,35 @@ mod tests {
         let fixed = check_workspace_rewind_marker(tmp.path(), true);
         assert_eq!(fixed.status, Status::Warning);
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn checkpoint_row_names_why_a_workspace_cannot_be_snapshotted() {
+        if !which_on_path("git") {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("app.py"), "print('hi')").unwrap();
+        assert_eq!(check_git(tmp.path()).status, Status::Passed);
+
+        // Over the 128 MiB whole-tree limit (sparse files: nothing is read).
+        for index in 0..9 {
+            let part = std::fs::File::create(tmp.path().join(format!("part-{index}.bin"))).unwrap();
+            part.set_len(15 * 1024 * 1024).unwrap();
+        }
+        let report = check_git(tmp.path());
+        assert_eq!(report.status, Status::Warning);
+        assert_eq!(
+            report.detail,
+            umadev_i18n::tlf(
+                "doctor.checkpoints_unavailable",
+                &[&umadev_i18n::tlf("checkpoint.unavailable_too_large", &["128"])]
+            )
+        );
+        assert!(
+            !tmp.path().join(".umadev").exists(),
+            "the probe must not create state"
+        );
     }
 
     #[test]

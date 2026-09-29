@@ -24,6 +24,7 @@ use crate::prompt_queue_ui::PromptQueueUi;
 mod animation_settings;
 mod backend;
 mod bounded_text;
+mod checkpoint_cmd;
 mod deploy;
 mod dir_scan;
 mod file_index;
@@ -14189,72 +14190,6 @@ impl App {
             body.push_str("  (no knowledge/ directory)\n");
         }
         self.overlay = Some(Overlay::from_body(" knowledge — Esc close ", &body));
-    }
-
-    /// `/checkpoint [label]` — snapshot the workspace FILES so a whole phase's
-    /// work can be rewound later (shadow git, never touches the user's `.git`).
-    fn slash_checkpoint(&mut self, label: &str) -> Action {
-        let label = if label.trim().is_empty() {
-            umadev_i18n::t(self.lang, "checkpoint.manual_label").to_string()
-        } else {
-            label.trim().to_string()
-        };
-        match umadev_agent::checkpoint::create_checkpoint(&self.project_root, &label) {
-            Some(id) => self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "checkpoint.created", &[&id, &label, &id]),
-            ),
-            None => self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "checkpoint.git_required").to_string(),
-            ),
-        }
-        Action::None
-    }
-
-    /// `/rewind` lists file checkpoints; `/rewind <id>` rewinds the workspace
-    /// files to that checkpoint (the present is auto-checkpointed first, so the
-    /// rewind is itself undoable).
-    fn slash_rewind(&mut self, arg: &str) -> Action {
-        // A2#11: the same busy-guard as `/redo` — a rewind while a run is writing
-        // the workspace is a second writer racing the first (the restore and the
-        // base's edits interleave). Politely refuse; `/cancel` first. Uses
-        // `has_active_run` so the director/agentic build counts too (a legacy
-        // `is_pipeline_active` check would miss it). Listing (`/rewind` with no
-        // id) stays allowed below — it is read-only.
-        if !arg.trim().is_empty() && self.has_active_run() {
-            self.push(ChatRole::System, umadev_i18n::t(self.lang, "rewind.busy"));
-            return Action::None;
-        }
-        let arg = arg.trim();
-        if arg.is_empty() {
-            let list = umadev_agent::checkpoint::list_checkpoints(&self.project_root);
-            if list.is_empty() {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "rewind.empty").to_string(),
-                );
-                return Action::None;
-            }
-            let mut out = umadev_i18n::t(self.lang, "rewind.list_header").to_string();
-            for c in list.iter().take(20) {
-                let when = c.when.split('T').next().unwrap_or(&c.when);
-                out.push_str(&format!("  {}  {}  {}\n", c.id, when, c.label));
-            }
-            self.push(ChatRole::System, out);
-            return Action::None;
-        }
-        match umadev_agent::checkpoint::restore_checkpoint(&self.project_root, arg) {
-            Ok(()) => self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "rewind.restored", &[arg]),
-            ),
-            Err(e) => self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "rewind.failed", &[&e]),
-            ),
-        }
-        Action::None
     }
 
     /// `/quick <task>` — the lightweight fast track. Skips the heavy phases and

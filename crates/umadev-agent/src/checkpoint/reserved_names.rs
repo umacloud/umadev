@@ -113,15 +113,15 @@ mod tests {
     fn a_submodule_gitfile_is_never_snapshotted() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        std::fs::create_dir_all(root.join("vendor/lib")).unwrap();
-        std::fs::write(root.join("vendor/lib/.git"), "gitdir: /elsewhere\n").unwrap();
-        std::fs::write(root.join("vendor/lib/lib.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(root.join("third_party/lib")).unwrap();
+        std::fs::write(root.join("third_party/lib/.git"), "gitdir: /elsewhere\n").unwrap();
+        std::fs::write(root.join("third_party/lib/lib.rs"), "fn main() {}\n").unwrap();
         let paths = scan_checkpoint_files(root)
             .unwrap()
             .into_iter()
             .map(|file| file.path)
             .collect::<Vec<_>>();
-        assert_eq!(paths, ["vendor/lib/lib.rs"]);
+        assert_eq!(paths, ["third_party/lib/lib.rs"]);
     }
 
     /// A checkpoint whose tree holds `.GIT/hooks/pre-commit` (which `.git`

@@ -23,21 +23,10 @@ use std::time::Duration;
 mod reserved_names;
 pub(crate) mod store_trust;
 
-const CHECKPOINT_EXCLUDED_DIRS: &[&str] = &[
-    ".git",
-    ".umadev",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
-    ".output",
-    ".turbo",
-    ".venv",
-    "coverage",
-    "__pycache__",
-];
+/// Directories a checkpoint never captures, restores or removes: repository and
+/// UmaDev state plus the dependency, build and cache directories the workspace
+/// diff skips too (`node_modules`, `target`, `venv`, `vendor`, `.gradle`, …).
+const CHECKPOINT_EXCLUDED_DIRS: &[&str] = crate::workspace_diff::SKIPPED_DIRECTORIES;
 
 const MAX_CHECKPOINT_ENTRIES: usize = 25_000;
 const MAX_CHECKPOINT_DEPTH: usize = 64;
@@ -314,24 +303,28 @@ pub fn has_checkpoints(project_root: &Path) -> bool {
             .is_some_and(|o| o.status.success())
 }
 
-/// Initialise the shadow repo on first use. Returns `false` (fail-open) when
-/// `git` is missing or init fails.
-fn ensure_init(project_root: &Path) -> bool {
+/// Initialise the shadow repo on first use. `Err` carries the reason in the
+/// user's language when `git` is missing or the store cannot be used (fail-open:
+/// the caller skips the snapshot, never the run).
+fn ensure_init(project_root: &Path) -> Result<(), String> {
+    let store_error =
+        |detail: &str| umadev_i18n::tlf("checkpoint.unavailable_store", &[detail]);
     if !umadev_state::fs::real_dir(project_root) {
-        return false;
+        return Err(umadev_i18n::tlf(
+            "checkpoint.unavailable_root",
+            &["not a real directory"],
+        ));
     }
-    let Ok(umadev_dir) = umadev_state::fs::ensure_real_child_dir(project_root, ".umadev") else {
-        return false;
-    };
+    let umadev_dir = umadev_state::fs::ensure_real_child_dir(project_root, ".umadev")
+        .map_err(|error| store_error(&error.to_string()))?;
     // One initialiser at a time: a store that is mid-creation must not look
     // like a foreign one to a concurrent caller.
     static INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _init = INIT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Ok(mut gd) = umadev_state::fs::ensure_real_child_dir(&umadev_dir, "checkpoints.git") else {
-        return false;
-    };
+    let mut gd = umadev_state::fs::ensure_real_child_dir(&umadev_dir, "checkpoints.git")
+        .map_err(|error| store_error(&error.to_string()))?;
     if !store_trust::is_trusted(project_root) {
         // Shipped with the project, left by another machine or an older UmaDev,
         // or tampered with: never adopted. Keep it, unread, out of the way.
@@ -339,34 +332,36 @@ fn ensure_init(project_root: &Path) -> bool {
         if !empty {
             if let Err(error) = store_trust::set_aside(project_root) {
                 tracing::warn!(store = %gd.display(), %error, "untrusted checkpoint store; checkpoints disabled");
-                return false;
+                return Err(store_error(&error.to_string()));
             }
             tracing::warn!(
                 store = %gd.display(),
                 moved_to = store_trust::SET_ASIDE_DIR,
                 "set aside a checkpoint store this installation did not create"
             );
-            let Ok(fresh) = umadev_state::fs::ensure_real_child_dir(&umadev_dir, "checkpoints.git")
-            else {
-                return false;
-            };
-            gd = fresh;
+            gd = umadev_state::fs::ensure_real_child_dir(&umadev_dir, "checkpoints.git")
+                .map_err(|error| store_error(&error.to_string()))?;
         }
-        if store_trust::claim(project_root).is_err() {
-            return false;
-        }
+        store_trust::claim(project_root).map_err(|error| store_error(&error.to_string()))?;
     }
     if std::fs::symlink_metadata(gd.join("HEAD")).is_ok() {
-        return umadev_state::fs::real_file(&gd.join("HEAD"));
+        return if umadev_state::fs::real_file(&gd.join("HEAD")) {
+            Ok(())
+        } else {
+            Err(store_error("HEAD is not a regular file"))
+        };
     }
-    let ok = git(project_root, &["init", "-q"]).is_some_and(|o| o.status.success());
-    if ok {
-        let _ = git(
-            project_root,
-            &["symbolic-ref", "HEAD", "refs/heads/umadev-checkpoints"],
-        );
+    match git(project_root, &["init", "-q"]) {
+        Some(output) if output.status.success() => {
+            let _ = git(
+                project_root,
+                &["symbolic-ref", "HEAD", "refs/heads/umadev-checkpoints"],
+            );
+            Ok(())
+        }
+        Some(output) => Err(store_error(String::from_utf8_lossy(&output.stderr).trim())),
+        None => Err(umadev_i18n::tl("checkpoint.git_unavailable").to_string()),
     }
-    ok
 }
 
 fn checkpoint_path_is_excluded(relative: &Path, directory: bool) -> bool {
@@ -385,11 +380,82 @@ fn checkpoint_path_is_excluded(relative: &Path, directory: bool) -> bool {
         })
 }
 
-fn scan_checkpoint_files(project_root: &Path) -> std::io::Result<Vec<SnapshotFile>> {
+/// Why the bounded scan refused to snapshot the workspace at all. An entry it
+/// cannot capture (a link, reparse point or special file, a file over the
+/// per-file cap, an unreadable or vanished entry) is skipped instead and never
+/// captured; only these whole-workspace limits refuse the snapshot.
+#[derive(Debug)]
+enum ScanRefusal {
+    /// The project root itself could not be listed.
+    Root(std::io::Error),
+    /// More than [`MAX_CHECKPOINT_ENTRIES`] entries outside the excluded directories.
+    TooManyEntries,
+    /// The captured paths add up to more than [`MAX_CHECKPOINT_PATH_BYTES`].
+    PathsTooLong,
+    /// The captured files add up to more than [`MAX_CHECKPOINT_TOTAL_BYTES`].
+    TooLarge,
+}
+
+impl ScanRefusal {
+    /// The reason in the user's language.
+    fn describe(&self) -> String {
+        const MIB: usize = 1024 * 1024;
+        match self {
+            Self::Root(error) => {
+                umadev_i18n::tlf("checkpoint.unavailable_root", &[&error.to_string()])
+            }
+            Self::TooManyEntries => umadev_i18n::tlf(
+                "checkpoint.unavailable_too_many",
+                &[&MAX_CHECKPOINT_ENTRIES.to_string()],
+            ),
+            Self::PathsTooLong => umadev_i18n::tlf(
+                "checkpoint.unavailable_paths",
+                &[&(MAX_CHECKPOINT_PATH_BYTES / MIB).to_string()],
+            ),
+            Self::TooLarge => umadev_i18n::tlf(
+                "checkpoint.unavailable_too_large",
+                &[&(MAX_CHECKPOINT_TOTAL_BYTES / MIB).to_string()],
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ScanRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root(error) => write!(formatter, "checkpoint root cannot be listed: {error}"),
+            Self::TooManyEntries => write!(
+                formatter,
+                "checkpoint tree exceeds {MAX_CHECKPOINT_ENTRIES} entries"
+            ),
+            Self::PathsTooLong => write!(
+                formatter,
+                "checkpoint paths exceed {MAX_CHECKPOINT_PATH_BYTES} bytes"
+            ),
+            Self::TooLarge => write!(
+                formatter,
+                "checkpoint contents exceed {MAX_CHECKPOINT_TOTAL_BYTES} bytes"
+            ),
+        }
+    }
+}
+
+fn scan_checkpoint_files(project_root: &Path) -> Result<Vec<SnapshotFile>, ScanRefusal> {
+    scan_workspace(project_root, true)
+}
+
+/// Walk the workspace without following links. `read_contents: false` applies
+/// every limit from metadata alone and captures no bytes (the read-only probe).
+fn scan_workspace(
+    project_root: &Path,
+    read_contents: bool,
+) -> Result<Vec<SnapshotFile>, ScanRefusal> {
     struct ScanState {
+        read_contents: bool,
         entries_seen: usize,
         path_bytes: usize,
         content_bytes: usize,
+        skipped: usize,
         files: Vec<SnapshotFile>,
     }
 
@@ -398,99 +464,105 @@ fn scan_checkpoint_files(project_root: &Path) -> std::io::Result<Vec<SnapshotFil
         relative_dir: &Path,
         depth: usize,
         state: &mut ScanState,
-    ) -> std::io::Result<()> {
-        if depth > MAX_CHECKPOINT_DEPTH {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("checkpoint tree exceeds depth {MAX_CHECKPOINT_DEPTH}"),
-            ));
-        }
+    ) -> Result<(), ScanRefusal> {
         let directory = project_root.join(relative_dir);
-        if relative_dir.as_os_str().is_empty() {
-            if !umadev_state::fs::real_dir(&directory) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "checkpoint root is not a real directory",
-                ));
-            }
-        } else if !crate::bounded_fs::is_real_directory_beneath(project_root, &directory) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "checkpoint tree contains a linked/reparse directory",
-            ));
-        }
+        let entries = if relative_dir.as_os_str().is_empty() {
+            std::fs::read_dir(&directory).map_err(ScanRefusal::Root)?
+        } else {
+            // Re-checked at the point of descent: a directory swapped for a
+            // link after its parent was listed is skipped, never followed. An
+            // unreadable directory (another user's bind mount) is skipped too.
+            let listing = crate::bounded_fs::is_real_directory_beneath(project_root, &directory)
+                .then(|| std::fs::read_dir(&directory).ok())
+                .flatten();
+            let Some(listing) = listing else {
+                state.skipped = state.skipped.saturating_add(1);
+                return Ok(());
+            };
+            listing
+        };
 
-        for entry in std::fs::read_dir(&directory)? {
-            let entry = entry?;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                state.skipped = state.skipped.saturating_add(1);
+                break;
+            };
             state.entries_seen = state.entries_seen.saturating_add(1);
             if state.entries_seen > MAX_CHECKPOINT_ENTRIES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("checkpoint tree exceeds {MAX_CHECKPOINT_ENTRIES} entries"),
-                ));
+                return Err(ScanRefusal::TooManyEntries);
             }
             let relative = relative_dir.join(entry.file_name());
-            let metadata = std::fs::symlink_metadata(entry.path())?;
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                // Deleted during the scan.
+                state.skipped = state.skipped.saturating_add(1);
+                continue;
+            };
             if umadev_state::fs::metadata_is_real_dir(&metadata) {
                 if checkpoint_path_is_excluded(&relative, true) {
+                    continue;
+                }
+                // A file inside must stay within the depth a restore accepts.
+                if depth.saturating_add(1) >= MAX_CHECKPOINT_DEPTH {
+                    state.skipped = state.skipped.saturating_add(1);
                     continue;
                 }
                 scan_directory(project_root, &relative, depth.saturating_add(1), state)?;
                 continue;
             }
-            if !umadev_state::fs::metadata_is_real_file(&metadata) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "checkpoint path is a symlink, reparse point, or special file: {}",
-                        relative.display()
-                    ),
-                ));
-            }
             if checkpoint_path_is_excluded(&relative, false) {
                 continue;
             }
-            let path = relative.to_str().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "checkpoint path is not valid UTF-8",
-                )
-            })?;
+            // A symlink, reparse point, or special file is never captured, so a
+            // restore never recreates or follows one.
+            if !umadev_state::fs::metadata_is_real_file(&metadata) {
+                state.skipped = state.skipped.saturating_add(1);
+                continue;
+            }
+            let Some(path) = relative.to_str() else {
+                state.skipped = state.skipped.saturating_add(1);
+                continue;
+            };
             #[cfg(windows)]
             let path = path.replace('\\', "/");
             #[cfg(not(windows))]
             let path = path.to_string();
+            // Judged by its announced size, before any byte is read.
+            if metadata.len() > u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap_or(u64::MAX) {
+                state.skipped = state.skipped.saturating_add(1);
+                continue;
+            }
             state.path_bytes = state.path_bytes.saturating_add(path.len());
             if state.path_bytes > MAX_CHECKPOINT_PATH_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("checkpoint paths exceed {MAX_CHECKPOINT_PATH_BYTES} bytes"),
-                ));
-            }
-            if metadata.len() > u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap_or(u64::MAX) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("checkpoint file exceeds {MAX_CHECKPOINT_FILE_BYTES} bytes: {path}"),
-                ));
+                return Err(ScanRefusal::PathsTooLong);
             }
             let announced = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
             if state.content_bytes.saturating_add(announced) > MAX_CHECKPOINT_TOTAL_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("checkpoint contents exceed {MAX_CHECKPOINT_TOTAL_BYTES} bytes"),
-                ));
+                return Err(ScanRefusal::TooLarge);
             }
-            let bytes = crate::bounded_fs::read_bytes_beneath(
-                project_root,
-                &entry.path(),
-                MAX_CHECKPOINT_FILE_BYTES,
-            )?;
-            state.content_bytes = state.content_bytes.saturating_add(bytes.len());
+            let bytes = if state.read_contents {
+                match crate::bounded_fs::read_bytes_beneath(
+                    project_root,
+                    &entry.path(),
+                    MAX_CHECKPOINT_FILE_BYTES,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        // Unreadable, replaced, or grown past the cap mid-read.
+                        state.skipped = state.skipped.saturating_add(1);
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let size = if state.read_contents {
+                bytes.len()
+            } else {
+                announced
+            };
+            state.content_bytes = state.content_bytes.saturating_add(size);
             if state.content_bytes > MAX_CHECKPOINT_TOTAL_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("checkpoint contents exceed {MAX_CHECKPOINT_TOTAL_BYTES} bytes"),
-                ));
+                return Err(ScanRefusal::TooLarge);
             }
             #[cfg(unix)]
             let mode = {
@@ -508,13 +580,29 @@ fn scan_checkpoint_files(project_root: &Path) -> std::io::Result<Vec<SnapshotFil
         Ok(())
     }
 
+    if !umadev_state::fs::real_dir(project_root) {
+        return Err(ScanRefusal::Root(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not a real directory",
+        )));
+    }
     let mut state = ScanState {
+        read_contents,
         entries_seen: 0,
         path_bytes: 0,
         content_bytes: 0,
+        skipped: 0,
         files: Vec::new(),
     };
     scan_directory(project_root, Path::new(""), 0, &mut state)?;
+    if state.skipped > 0 {
+        tracing::debug!(
+            root = %project_root.display(),
+            skipped = state.skipped,
+            "checkpoint scan skipped entries it cannot snapshot (links, special files, \
+             unreadable entries, files over the per-file cap)"
+        );
+    }
     state
         .files
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -667,25 +755,86 @@ fn promote_import(project_root: &Path, oid: &str, old_head: Option<&str>) -> boo
     updated
 }
 
-fn snapshot_import(project_root: &Path, label: &str) -> Option<(String, String, Option<String>)> {
-    let files = scan_checkpoint_files(project_root)
-        .map_err(|error| {
-            tracing::warn!(
-                root = %project_root.display(),
-                %error,
-                "bounded checkpoint scan refused the workspace"
-            );
-            error
-        })
-        .ok()?;
+fn snapshot_import(
+    project_root: &Path,
+    label: &str,
+) -> Result<(String, String, Option<String>), String> {
+    let files = scan_checkpoint_files(project_root).map_err(|refusal| {
+        tracing::warn!(
+            root = %project_root.display(),
+            %refusal,
+            "bounded checkpoint scan refused the workspace"
+        );
+        refusal.describe()
+    })?;
     let parent = head_oid(project_root);
-    let (oid, reference) = import_snapshot(project_root, &files, label, parent.as_deref())?;
-    Some((oid, reference, parent))
+    let (oid, reference) = import_snapshot(project_root, &files, label, parent.as_deref())
+        .ok_or_else(|| umadev_i18n::tl("checkpoint.unavailable_git_failed").to_string())?;
+    Ok((oid, reference, parent))
+}
+
+/// Why the latest snapshot attempt for each workspace failed in this process
+/// (keyed like the in-past flag, bounded), so an empty `/rewind` list can say
+/// why instead of implying nothing was tried. A success clears the entry.
+static LAST_SNAPSHOT_FAILURE: std::sync::Mutex<Vec<(PathBuf, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn remember_snapshot_outcome(project_root: &Path, failure: Option<&str>) {
+    let key = in_past_key(project_root);
+    if let Ok(mut failures) = LAST_SNAPSHOT_FAILURE.lock() {
+        failures.retain(|(root, _)| *root != key);
+        if let Some(reason) = failure {
+            if failures.len() >= 16 {
+                failures.remove(0);
+            }
+            failures.push((key, reason.to_string()));
+        }
+    }
+}
+
+/// Why the most recent attempt in this process to snapshot `project_root`
+/// failed, in the user's language, or `None` when it succeeded or none was
+/// made. Cheap: it reads a remembered reason and never scans.
+#[must_use]
+pub fn last_checkpoint_failure(project_root: &Path) -> Option<String> {
+    let key = in_past_key(project_root);
+    LAST_SNAPSHOT_FAILURE
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(root, _)| *root == key)
+        .map(|(_, reason)| reason.clone())
+}
+
+/// Why a checkpoint of `project_root` cannot be taken right now, in the user's
+/// language, or `None` when one can as far as a read-only look can tell. It
+/// changes nothing on disk (for `umadev doctor`): the tree is walked by
+/// metadata alone under the same whole-workspace limits a snapshot enforces,
+/// and UmaDev's state folders must be real directories. Whether `git` runs is
+/// the caller's own check.
+#[must_use]
+pub fn checkpoint_unavailable_reason(project_root: &Path) -> Option<String> {
+    let state = Path::new(".umadev");
+    for relative in [state.to_path_buf(), state.join("checkpoints.git")] {
+        let path = project_root.join(&relative);
+        if std::fs::symlink_metadata(&path).is_ok() && !umadev_state::fs::real_dir(&path) {
+            let detail = format!("{} is not a real directory", relative.display());
+            return Some(umadev_i18n::tlf("checkpoint.unavailable_store", &[&detail]));
+        }
+    }
+    scan_workspace(project_root, false)
+        .err()
+        .map(|refusal| refusal.describe())
 }
 
 /// Snapshot the whole workspace as a checkpoint labelled `label`. Returns the
-/// short commit id, or `None` (fail-open) if `git` is unavailable. An empty
-/// snapshot (nothing changed) still produces a checkpoint.
+/// short commit id, or `None` (fail-open) if `git` is unavailable or the
+/// workspace cannot be snapshotted ([`try_create_checkpoint`] says why). An
+/// empty snapshot (nothing changed) still produces a checkpoint.
+///
+/// Links, reparse points and special files, files over the per-file cap, and
+/// unreadable entries are left out of the snapshot (and so are never restored
+/// or followed); they do not stop the rest of the workspace being captured.
 ///
 /// A FAILED import returns `None`, not the id of whatever HEAD happened to be. The
 /// difference is load-bearing: callers treat the returned id as "the state I just saved",
@@ -696,16 +845,30 @@ fn snapshot_import(project_root: &Path, label: &str) -> Option<(String, String, 
 /// "nothing to do".
 #[must_use]
 pub fn create_checkpoint(project_root: &Path, label: &str) -> Option<String> {
-    if !ensure_init(project_root) {
-        return None;
-    }
+    try_create_checkpoint(project_root, label).ok()
+}
+
+/// [`create_checkpoint`], saying why it could not snapshot.
+///
+/// # Errors
+/// The reason in the user's language: `git` is missing, the checkpoint store
+/// under `.umadev/` cannot be used, or the workspace exceeds a whole-tree limit
+/// (entry count, total size). Also remembered for [`last_checkpoint_failure`].
+pub fn try_create_checkpoint(project_root: &Path, label: &str) -> Result<String, String> {
+    let outcome = snapshot_and_promote(project_root, label);
+    remember_snapshot_outcome(project_root, outcome.as_ref().err().map(String::as_str));
+    outcome
+}
+
+fn snapshot_and_promote(project_root: &Path, label: &str) -> Result<String, String> {
+    ensure_init(project_root)?;
     let (oid, reference, parent) = snapshot_import(project_root, label)?;
     let promoted = promote_import(project_root, &oid, parent.as_deref());
     delete_import_ref(project_root, &reference);
     if !promoted {
-        return None;
+        return Err(umadev_i18n::tl("checkpoint.unavailable_git_failed").to_string());
     }
-    Some(oid.chars().take(7).collect())
+    Ok(oid.chars().take(7).collect())
 }
 
 /// Snapshot the workspace at a PHASE boundary, but ONLY if the working tree
@@ -723,10 +886,9 @@ pub fn create_checkpoint(project_root: &Path, label: &str) -> Option<String> {
 /// relative to an empty HEAD.
 #[must_use]
 pub fn create_phase_checkpoint(project_root: &Path, label: &str) -> Option<String> {
-    if !ensure_init(project_root) {
-        return None;
-    }
-    let (oid, reference, parent) = snapshot_import(project_root, label)?;
+    let imported = ensure_init(project_root).and_then(|()| snapshot_import(project_root, label));
+    remember_snapshot_outcome(project_root, imported.as_ref().err().map(String::as_str));
+    let (oid, reference, parent) = imported.ok()?;
     if let Some(old) = parent.as_deref() {
         let unchanged = git(project_root, &["diff", "--quiet", old, &oid, "--"])
             .is_some_and(|output| output.status.success());
@@ -995,6 +1157,10 @@ fn tree_revision(project_root: &Path, revision: &str) -> std::io::Result<String>
     Ok(oid)
 }
 
+/// Refuse a tree path a restore must never write: absolute or empty, too deep,
+/// with a `..`/prefix component, naming `.git`/`.umadev` under any filesystem
+/// spelling, or a `.log` file. Paths under an excluded dependency/build
+/// directory are not refused here; [`tree_path_is_unmanaged`] leaves them out.
 fn validated_tree_path(path: &str) -> std::io::Result<PathBuf> {
     let relative = Path::new(path);
     let count = relative.components().count();
@@ -1005,7 +1171,6 @@ fn validated_tree_path(path: &str) -> std::io::Result<PathBuf> {
             !matches!(component, Component::Normal(_))
                 || component.as_os_str().to_str().is_none_or(|name| {
                     reserved_names::is_reserved_alias(name)
-                        || (index + 1 < count && CHECKPOINT_EXCLUDED_DIRS.contains(&name))
                         || (index + 1 == count
                             && Path::new(name)
                                 .extension()
@@ -1019,6 +1184,20 @@ fn validated_tree_path(path: &str) -> std::io::Result<PathBuf> {
         ));
     }
     Ok(relative.to_path_buf())
+}
+
+/// Whether a tree path lies under a directory checkpoints exclude. A tree
+/// written before that directory joined the exclusions (`vendor/`, `venv/`,
+/// `.cache/`, …) can still hold its files: a restore leaves them alone and a
+/// run diff does not report them, just as if they had never been captured.
+fn tree_path_is_unmanaged(path: &str) -> bool {
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_some() && CHECKPOINT_EXCLUDED_DIRS.contains(&component) {
+            return true;
+        }
+    }
+    false
 }
 
 fn read_tree_manifest(project_root: &Path, revision: &str) -> std::io::Result<Vec<TreeFile>> {
@@ -1065,6 +1244,9 @@ fn read_tree_manifest(project_root: &Path, revision: &str) -> std::io::Result<Ve
             std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 tree path")
         })?;
         validated_tree_path(path)?;
+        if tree_path_is_unmanaged(path) {
+            continue;
+        }
         path_bytes = path_bytes.saturating_add(path.len());
         if path_bytes > MAX_CHECKPOINT_PATH_BYTES || !paths.insert(path.to_string()) {
             return Err(std::io::Error::new(
@@ -1189,7 +1371,53 @@ fn load_tree(project_root: &Path, revision: &str) -> std::io::Result<Vec<TreeFil
     Ok(entries)
 }
 
-fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> std::io::Result<()> {
+/// Whether a restore may replace a file its starting tree never captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uncaptured {
+    /// The starting tree is a snapshot of the present taken a moment ago, so a
+    /// file on disk it does not hold was never captured (over the per-file cap,
+    /// unreadable) and replacing it would lose it for good: the whole restore
+    /// is refused before anything changes.
+    Keep,
+    /// The starting tree is one this module put on disk itself (a temporary
+    /// rewind going back to the present, or undoing a failed apply): whatever
+    /// sits at those paths was written since, and the snapshot's bytes win.
+    Replace,
+}
+
+/// Whether the regular file at `relative` already holds exactly `bytes`.
+fn file_has_bytes(rooted: &umadev_state::fs::RootedDir, relative: &Path, bytes: &[u8]) -> bool {
+    rooted
+        .read_bounded(relative, u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .is_ok_and(|current| current == bytes)
+}
+
+/// Refuse to replace a regular file that the snapshot of the present does not
+/// hold, unless it already has the bytes the restore would write.
+fn refuse_uncaptured_overwrite(
+    rooted: &umadev_state::fs::RootedDir,
+    relative: &Path,
+    entry: &TreeFile,
+) -> std::io::Result<()> {
+    // Absent, or a directory the apply itself handles (linked leaves were
+    // already refused by `validate_path`).
+    if !rooted.regular_file_exists(relative).unwrap_or(false)
+        || file_has_bytes(rooted, relative, &entry.bytes)
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        umadev_i18n::tlf("checkpoint.restore_would_overwrite_uncaptured", &[&entry.path]),
+    ))
+}
+
+fn apply_tree_once(
+    project_root: &Path,
+    from: &[TreeFile],
+    to: &[TreeFile],
+    uncaptured: Uncaptured,
+) -> std::io::Result<()> {
     let rooted = umadev_state::fs::RootedDir::open(project_root)?;
     let from_paths = from
         .iter()
@@ -1202,6 +1430,14 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
     for path in from_paths.union(&to_paths) {
         let relative = validated_tree_path(path)?;
         rooted.validate_path(&relative)?;
+    }
+    if uncaptured == Uncaptured::Keep {
+        for entry in to
+            .iter()
+            .filter(|entry| !from_paths.contains(entry.path.as_str()))
+        {
+            refuse_uncaptured_overwrite(&rooted, &validated_tree_path(&entry.path)?, entry)?;
+        }
     }
 
     let mut removals = from_paths
@@ -1258,7 +1494,11 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
     Ok(())
 }
 
-fn restore_snapshot_exact(project_root: &Path, target: &str) -> std::io::Result<()> {
+fn restore_snapshot_exact(
+    project_root: &Path,
+    target: &str,
+    uncaptured: Uncaptured,
+) -> std::io::Result<()> {
     let old_oid = tree_revision(project_root, "HEAD")?;
     let target_oid = tree_revision(project_root, target)?;
     if old_oid == target_oid {
@@ -1266,8 +1506,8 @@ fn restore_snapshot_exact(project_root: &Path, target: &str) -> std::io::Result<
     }
     let current = load_tree(project_root, &old_oid)?;
     let desired = load_tree(project_root, &target_oid)?;
-    if let Err(error) = apply_tree_once(project_root, &current, &desired) {
-        let _ = apply_tree_once(project_root, &desired, &current);
+    if let Err(error) = apply_tree_once(project_root, &current, &desired, uncaptured) {
+        let _ = apply_tree_once(project_root, &desired, &current, Uncaptured::Replace);
         return Err(error);
     }
 
@@ -1278,7 +1518,7 @@ fn restore_snapshot_exact(project_root: &Path, target: &str) -> std::io::Result<
             .is_some_and(|output| output.status.success());
     if !ref_updated {
         let _ = git(project_root, &["read-tree", &old_oid]);
-        let _ = apply_tree_once(project_root, &desired, &current);
+        let _ = apply_tree_once(project_root, &desired, &current, Uncaptured::Replace);
         return Err(std::io::Error::other(
             "could not atomically advance the shadow checkpoint ref",
         ));
@@ -1289,7 +1529,10 @@ fn restore_snapshot_exact(project_root: &Path, target: &str) -> std::io::Result<
 /// Rewind the workspace files to checkpoint `id` with the bounded byte-exact
 /// restore path. The
 /// CURRENT state is auto-checkpointed first, so a rewind is itself undoable.
-/// Untracked / excluded paths (`node_modules`, …) are left untouched.
+/// Untracked / excluded paths (`node_modules`, …) and entries a snapshot never
+/// captures (links, special files) are left untouched, and a file that snapshot
+/// could not hold (over the per-file cap) is never overwritten: the restore is
+/// refused before anything changes.
 ///
 /// `id` MUST name a checkpoint returned by [`list_checkpoints`]. It is RESOLVED to that
 /// checkpoint's canonical id (via the internal resolver) and the reset targets the RESOLVED
@@ -1350,7 +1593,8 @@ pub fn restore_checkpoint(project_root: &Path, id: &str) -> Result<(), String> {
         let branch = format!("umadev-saved-{sha}");
         let _ = git(project_root, &["branch", "-f", &branch, "HEAD"]);
     }
-    restore_snapshot_exact(project_root, &target).map_err(|error| error.to_string())
+    restore_snapshot_exact(project_root, &target, Uncaptured::Keep)
+        .map_err(|error| error.to_string())
 }
 
 // =====================================================================
@@ -1526,9 +1770,11 @@ impl TempRewind {
         ok
     }
 
-    /// Byte-exact bounded restore from the shadow repo. `true` iff it succeeds.
+    /// Byte-exact bounded restore from the shadow repo back to the head this
+    /// guard snapshotted. `true` iff it succeeds. Files written inside the
+    /// rewound window give way to the head's own bytes.
     fn reset_hard(root: &Path, id: &str) -> bool {
-        restore_snapshot_exact(root, id).is_ok()
+        restore_snapshot_exact(root, id, Uncaptured::Replace).is_ok()
     }
 }
 
@@ -2210,7 +2456,9 @@ pub fn recover_abandoned_temp_rewind(project_root: &Path) -> Option<String> {
     // commit differs from the commit the rewind left the tree at.
     let edited = tree_edited_since_rewind(project_root, &marker.to, &rescue);
 
-    if !TempRewind::reset_hard(project_root, &marker.head) {
+    // The rescue snapshot just captured the present, so a file it could not
+    // hold (over the per-file cap) is kept rather than overwritten.
+    if restore_snapshot_exact(project_root, &marker.head, Uncaptured::Keep).is_err() {
         // The tree is STILL in the past and we could not put it back. Silence here is
         // the worst outcome of all: the user sees mangled source, no explanation, and a
         // `rollback` that would move them further backwards. Keep the marker (the next
@@ -2349,7 +2597,7 @@ pub fn begin_temp_rewind(project_root: &Path, to: &str) -> Option<TempRewind> {
     }
     // 4. Now go back. A failed reset leaves the tree where it was (git is atomic
     //    enough here) — clear the marker we just wrote and let the caller skip.
-    if !TempRewind::reset_hard(project_root, &to) {
+    if restore_snapshot_exact(project_root, &to, Uncaptured::Keep).is_err() {
         clear_temp_rewind_marker(project_root);
         return None;
     }
@@ -2461,7 +2709,7 @@ pub fn run_diff_since(project_root: &Path, baseline_id: &str) -> RunDiff {
     {
         return RunDiff::Unavailable;
     }
-    let Some((current, reference, _)) = snapshot_import(project_root, "auto: run diff") else {
+    let Ok((current, reference, _)) = snapshot_import(project_root, "auto: run diff") else {
         return RunDiff::Unavailable;
     };
     let result = (|| {
@@ -2506,10 +2754,11 @@ pub fn run_diff_since(project_root: &Path, baseline_id: &str) -> RunDiff {
             let Ok(path) = std::str::from_utf8(path) else {
                 return Some(RunDiff::Unavailable);
             };
-            files.push(ChangedFile {
-                path: path.replace('\\', "/"),
-                added,
-            });
+            let path = path.replace('\\', "/");
+            if tree_path_is_unmanaged(&path) {
+                continue;
+            }
+            files.push(ChangedFile { path, added });
             if files.len() > MAX_CHANGED_FILES {
                 tracing::warn!(
                     changed = files.len(),
@@ -2547,6 +2796,7 @@ pub fn file_at(project_root: &Path, id: &str, rel: &str) -> FileAt {
         || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || rel.len() > MAX_CHECKPOINT_PATH_BYTES
         || validated_tree_path(rel).is_err()
+        || tree_path_is_unmanaged(rel)
     {
         return FileAt::Unavailable;
     }
@@ -2714,24 +2964,36 @@ mod tests {
         assert!(!marker.exists(), "a global hook/filter executed");
     }
 
+    /// The workspace-relative paths the shadow index holds after a checkpoint.
+    fn captured_paths(root: &Path) -> Vec<String> {
+        git(root, &["ls-files"])
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn ignored_oversize_file_refuses_snapshot_before_reading_it() {
+    fn an_oversize_file_is_left_out_without_disabling_the_checkpoint() {
         if !git_available() {
             return;
         }
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
-        std::fs::write(root.join(".gitignore"), "huge.bin\n").unwrap();
+        std::fs::write(root.join("app.py"), "print('hi')\n").unwrap();
         let huge = std::fs::File::create(root.join("huge.bin")).unwrap();
         huge.set_len(u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap() + 1)
             .unwrap();
-        assert!(create_checkpoint(root, "must refuse huge ignored file").is_none());
-        assert!(!has_checkpoints(root));
+        assert!(create_checkpoint(root, "skip the huge file").is_some());
+        assert_eq!(captured_paths(root), ["app.py"]);
     }
 
     #[cfg(unix)]
     #[test]
-    fn symlink_parent_and_fifo_are_rejected_without_blocking() {
+    fn links_and_fifos_are_skipped_never_followed_or_waited_on() {
         use std::os::unix::fs::symlink;
 
         if !git_available() {
@@ -2740,21 +3002,233 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let outside = tempfile::TempDir::new().unwrap();
         std::fs::write(outside.path().join("escape.txt"), "escape").unwrap();
+        std::fs::write(temp.path().join("app.rs"), "fn main() {}").unwrap();
         symlink(outside.path(), temp.path().join("linked")).unwrap();
-        let started = std::time::Instant::now();
-        assert!(create_checkpoint(temp.path(), "reject parent link").is_none());
-        assert!(started.elapsed() < Duration::from_secs(2));
-        std::fs::remove_file(temp.path().join("linked")).unwrap();
-
         let fifo = temp.path().join("fifo");
         assert!(Command::new("mkfifo")
             .arg(&fifo)
             .status()
             .unwrap()
             .success());
+
         let started = std::time::Instant::now();
-        assert!(create_checkpoint(temp.path(), "reject fifo").is_none());
+        assert!(create_checkpoint(temp.path(), "skip link and fifo").is_some());
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            captured_paths(temp.path()),
+            ["app.rs"],
+            "neither the link, what it points at, nor the FIFO may be captured"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_venv_or_linked_guidance_file_does_not_disable_checkpoints() {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("app.py"), "v1").unwrap();
+        std::fs::create_dir_all(root.join("venv/bin")).unwrap();
+        std::fs::write(root.join("venv/bin/python3"), "#!interpreter").unwrap();
+        symlink("python3", root.join("venv/bin/python")).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "# guidance").unwrap();
+        symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let demo = std::fs::File::create(root.join("assets/demo.mp4")).unwrap();
+        demo.set_len(17 * 1024 * 1024).unwrap();
+
+        let id = create_checkpoint(root, "x").expect("checkpoints stay available");
+        let captured = captured_paths(root);
+        assert!(captured.iter().any(|path| path == "app.py"), "{captured:?}");
+        assert!(
+            !captured
+                .iter()
+                .any(|path| path.starts_with("venv/") || path == "CLAUDE.md"),
+            "{captured:?}"
+        );
+
+        std::fs::write(root.join("app.py"), "v2").unwrap();
+        restore_checkpoint(root, &id).expect("restore");
+        assert_eq!(std::fs::read_to_string(root.join("app.py")).unwrap(), "v1");
+        assert!(std::fs::symlink_metadata(root.join("CLAUDE.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(root.join("venv/bin/python"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::metadata(root.join("assets/demo.mp4")).unwrap().len(),
+            17 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn a_restore_never_overwrites_a_file_the_present_snapshot_could_not_hold() {
+        // The file was small when checkpointed and has since grown past the
+        // per-file cap, so the pre-restore snapshot cannot hold it. Writing
+        // the old bytes over it would lose the current version for good.
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("data.bin"), "small").unwrap();
+        let small = create_checkpoint(root, "small data").expect("checkpoint");
+        let grown = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("data.bin"))
+            .unwrap();
+        grown
+            .set_len(u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap() + 1)
+            .unwrap();
+
+        let error = restore_checkpoint(root, &small).expect_err("the restore is refused");
+        assert!(error.contains("data.bin"), "{error}");
+        assert_eq!(
+            std::fs::metadata(root.join("data.bin")).unwrap().len(),
+            u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap() + 1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_never_writes_through_a_link_that_replaced_a_captured_file() {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("notes.md"), "captured").unwrap();
+        let id = create_checkpoint(root, "notes").expect("checkpoint");
+        std::fs::remove_file(root.join("notes.md")).unwrap();
+        std::fs::write(outside.path().join("target.md"), "outside").unwrap();
+        symlink(outside.path().join("target.md"), root.join("notes.md")).unwrap();
+
+        assert!(restore_checkpoint(root, &id).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("target.md")).unwrap(),
+            "outside"
+        );
+        assert!(std::fs::symlink_metadata(root.join("notes.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn a_workspace_over_the_total_limit_is_refused_with_its_reason() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let piece = u64::try_from(15 * 1024 * 1024).unwrap();
+        for index in 0..9 {
+            let file = std::fs::File::create(root.join(format!("part-{index}.bin"))).unwrap();
+            file.set_len(piece).unwrap();
+        }
+        let reason = umadev_i18n::tlf("checkpoint.unavailable_too_large", &["128"]);
+
+        assert_eq!(checkpoint_unavailable_reason(root), Some(reason.clone()));
+        assert_eq!(try_create_checkpoint(root, "too big"), Err(reason.clone()));
+        assert_eq!(last_checkpoint_failure(root), Some(reason));
+        assert!(!has_checkpoints(root));
+
+        std::fs::remove_file(root.join("part-0.bin")).unwrap();
+        assert!(checkpoint_unavailable_reason(root).is_none());
+        assert!(try_create_checkpoint(root, "fits").is_ok());
+        assert!(last_checkpoint_failure(root).is_none());
+    }
+
+    #[test]
+    fn a_tree_from_before_a_directory_was_excluded_restores_around_it() {
+        // An older checkpoint captured `vendor/`, which is now excluded. Its
+        // restore must neither fail on those entries nor touch the folder,
+        // and the run diff must not report the folder as deleted.
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("main.go"), "v1").unwrap();
+        let old = create_checkpoint(root, "old").expect("checkpoint");
+        let text = |args: &[&str], input: &[u8]| -> String {
+            let output = git_with_input(root, args, input, 64 * 1024).unwrap();
+            assert!(output.status.is_some_and(|status| status.success()));
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let main_blob = text(&["hash-object", "-w", "--stdin"], b"v1");
+        let vendored = text(&["hash-object", "-w", "--stdin"], b"old vendored");
+        let lib = text(
+            &["mktree"],
+            format!("100644 blob {vendored}\tlib.go\n").as_bytes(),
+        );
+        let vendor = text(&["mktree"], format!("040000 tree {lib}\tlib\n").as_bytes());
+        let tree = text(
+            &["mktree"],
+            format!("100644 blob {main_blob}\tmain.go\n040000 tree {vendor}\tvendor\n")
+                .as_bytes(),
+        );
+        let commit = text(
+            &["commit-tree", &tree, "-p", &old, "-F", "-"],
+            b"run-baseline: legacy",
+        );
+        assert!(git(root, &["update-ref", "HEAD", &commit])
+            .unwrap()
+            .status
+            .success());
+        std::fs::create_dir_all(root.join("vendor/lib")).unwrap();
+        std::fs::write(root.join("vendor/lib/lib.go"), "current vendored").unwrap();
+        std::fs::write(root.join("main.go"), "v2").unwrap();
+
+        assert_eq!(
+            run_diff_since(root, &commit),
+            RunDiff::Changed(vec![ChangedFile {
+                path: "main.go".to_string(),
+                added: false,
+            }])
+        );
+        restore_checkpoint(root, &commit[..12]).expect("the legacy tree restores");
+        assert_eq!(std::fs::read_to_string(root.join("main.go")).unwrap(), "v1");
+        assert_eq!(
+            std::fs::read_to_string(root.join("vendor/lib/lib.go")).unwrap(),
+            "current vendored"
+        );
+    }
+
+    #[test]
+    fn tmp_s06_6_umadev_state_is_invisible_to_git_status_without_init() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join("app.js"), "x").unwrap();
+        create_checkpoint(root, "x").expect("checkpoint");
+        drop(crate::run_lock::RunLock::acquire_for_run(root).expect("lock"));
+        let _ = crate::adopt::run_adopt(root);
+        let status = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all", "--ignored=no"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&status.stdout);
+        assert!(!text.contains(".umadev"), "{text}");
     }
 
     #[test]
@@ -3699,6 +4173,91 @@ mod tests {
     }
 
     // ── BLOCKER: a killed process must not leave the source tree IN THE PAST ──
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_temp_rewind_never_leaves_new_files_deleted() {
+        // The rewind stops part-way: `m.txt` was a file at the target but is a
+        // directory now, kept non-empty by a link no snapshot captures, so it
+        // cannot be replaced. By then the rewind has already deleted the files
+        // created since the target; undoing it must bring every one of them
+        // back (or, failing that, halt the run), never leave them deleted.
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "a before").unwrap();
+        std::fs::write(root.join("m.txt"), "m before").unwrap();
+        let pre = create_checkpoint(root, "pre-step").expect("pre");
+        std::fs::write(root.join("a.txt"), "a now").unwrap();
+        std::fs::remove_file(root.join("m.txt")).unwrap();
+        std::fs::create_dir(root.join("m.txt")).unwrap();
+        std::fs::write(root.join("m.txt/inner.txt"), "inner now").unwrap();
+        symlink("elsewhere", root.join("m.txt/link")).unwrap();
+        std::fs::write(root.join("z_new.txt"), "brand new work").unwrap();
+
+        assert!(
+            begin_temp_rewind(root, &pre).is_none(),
+            "the rewind cannot complete"
+        );
+        let restored = std::fs::read_to_string(root.join("z_new.txt")).ok();
+        assert!(
+            restored.as_deref() == Some("brand new work") || workspace_is_in_past(root),
+            "a file created since the target was left deleted with no halt"
+        );
+        // Here the undo can complete, so the tree is back at the present and
+        // nothing claims otherwise.
+        assert_eq!(restored.as_deref(), Some("brand new work"));
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a now");
+        assert_eq!(
+            std::fs::read_to_string(root.join("m.txt/inner.txt")).unwrap(),
+            "inner now"
+        );
+        assert!(!workspace_is_in_past(root));
+        assert!(!root.join(TEMP_REWIND_MARKER_REL).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_stopped_by_a_read_only_directory_is_undone_in_full() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.txt"), "a1").unwrap();
+        std::fs::create_dir(root.join("m")).unwrap();
+        std::fs::write(root.join("m/locked.txt"), "l1").unwrap();
+        let pre = create_checkpoint(root, "pre").expect("pre");
+        std::fs::write(root.join("a.txt"), "a2").unwrap();
+        std::fs::write(root.join("m/locked.txt"), "l2").unwrap();
+        std::fs::write(root.join("z_new.txt"), "new").unwrap();
+
+        let original = std::fs::metadata(root.join("m")).unwrap().permissions();
+        std::fs::set_permissions(root.join("m"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let unwritable = std::fs::write(root.join("m/probe"), "x").is_err();
+        let rewind = if unwritable {
+            begin_temp_rewind(root, &pre)
+        } else {
+            None
+        };
+        std::fs::set_permissions(root.join("m"), original).unwrap();
+        if !unwritable {
+            return; // running as root: permissions do not bind
+        }
+        assert!(rewind.is_none());
+        assert!(
+            std::fs::read_to_string(root.join("z_new.txt")).ok().as_deref() == Some("new")
+                || workspace_is_in_past(root),
+            "a file created since the target was left deleted with no halt"
+        );
+        clear_workspace_in_past(root);
+    }
 
     #[test]
     fn a_temp_rewind_writes_a_crash_marker_and_clears_it_on_restore() {

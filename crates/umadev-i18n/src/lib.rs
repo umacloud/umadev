@@ -383,7 +383,7 @@ mod tests {
             "checkpoint.phase_label",
             "checkpoint.manual_label",
             "checkpoint.created",
-            "checkpoint.git_required",
+            "checkpoint.unavailable",
             "rewind.empty",
             "rewind.list_header",
             "rewind.restored",

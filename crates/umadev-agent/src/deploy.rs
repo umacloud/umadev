@@ -664,6 +664,42 @@ mod tests {
     }
 
     #[test]
+    fn a_source_public_folder_is_not_a_built_bundle() {
+        // Vite, CRA, Next, Laravel and Rails keep source assets in `public/`;
+        // publishing it would ship the raw assets (or PHP source) as the site.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"app","devDependencies":{"vite":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        fs::create_dir(tmp.path().join("public")).unwrap();
+        fs::write(tmp.path().join("public/favicon.svg"), "<svg/>").unwrap();
+        assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::None);
+
+        // Even with an `index.html` it is the framework's template, not a build.
+        fs::write(tmp.path().join("public/index.html"), "<div id=root></div>").unwrap();
+        assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::None);
+
+        let laravel = TempDir::new().unwrap();
+        fs::write(laravel.path().join("composer.json"), "{}").unwrap();
+        fs::create_dir(laravel.path().join("public")).unwrap();
+        fs::write(laravel.path().join("public/index.php"), "<?php").unwrap();
+        assert_eq!(detect_deploy_target(laravel.path()), DeployTarget::None);
+    }
+
+    #[test]
+    fn a_plain_static_site_in_public_is_still_deployable() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("public")).unwrap();
+        fs::write(tmp.path().join("public/index.html"), "<h1>hi</h1>").unwrap();
+        assert_eq!(
+            detect_deploy_target(tmp.path()),
+            DeployTarget::StaticHost(StaticDir::Public)
+        );
+    }
+
+    #[test]
     fn detect_none_for_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::None);

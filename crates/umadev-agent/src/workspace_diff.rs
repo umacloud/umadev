@@ -761,43 +761,46 @@ fn io_error(root: &Path, path: &Path, error: &std::io::Error) -> WorkspaceSnapsh
 /// environments. Names that are source in some ecosystems (`bin`, `obj`, `out`,
 /// `packages`, `lib`) are deliberately absent; a project that generates into
 /// them excludes them through its own `.gitignore`.
+///
+/// Shared with the checkpoint scan, so a file checkpoint and the change set
+/// agree on which directories are project content.
+pub(crate) const SKIPPED_DIRECTORIES: &[&str] = &[
+    ".git",
+    ".umadev",
+    "node_modules",
+    "bower_components",
+    ".pnpm-store",
+    "target",
+    "dist",
+    "build",
+    ".output",
+    "DerivedData",
+    ".turbo",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".angular",
+    ".parcel-cache",
+    ".cache",
+    "coverage",
+    "vendor",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    ".tox",
+    ".nox",
+    ".gradle",
+    ".dart_tool",
+    ".terraform",
+    ".vs",
+];
+
 fn skip_directory(name: &OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(
-            ".git"
-                | ".umadev"
-                | "node_modules"
-                | "bower_components"
-                | ".pnpm-store"
-                | "target"
-                | "dist"
-                | "build"
-                | ".output"
-                | "DerivedData"
-                | ".turbo"
-                | ".next"
-                | ".nuxt"
-                | ".svelte-kit"
-                | ".angular"
-                | ".parcel-cache"
-                | ".cache"
-                | "coverage"
-                | "vendor"
-                | "__pycache__"
-                | ".mypy_cache"
-                | ".pytest_cache"
-                | ".ruff_cache"
-                | ".venv"
-                | "venv"
-                | ".tox"
-                | ".nox"
-                | ".gradle"
-                | ".dart_tool"
-                | ".terraform"
-                | ".vs"
-        )
-    )
+    name.to_str()
+        .is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name))
 }
 
 #[cfg(unix)]

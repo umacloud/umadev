@@ -699,6 +699,8 @@ umadev 有两套入口，一一对应：
 | `/checkpoint [标签]` | 给当前工作区文件打快照 |
 | `/rewind [id]` | 列出 / 回滚到某个文件检查点 |
 
+检查点不包含依赖、构建和缓存文件夹（`node_modules`、`target`、`venv`、`vendor` 等）、链接和特殊文件，以及超过 16 MiB 的文件；回滚绝不会覆盖它没能先存下来的文件。如果完全无法打快照，`/checkpoint`、`/rewind` 和 `umadev doctor` 会说明原因。
+
 **查看产物与状态**
 
 | 命令 | 作用 |

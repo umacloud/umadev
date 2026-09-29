@@ -272,6 +272,39 @@ mod tests {
     }
 
     #[test]
+    fn a_twice_copied_project_still_gets_checkpoints() {
+        // Copying a project copies its store, which the copy does not trust and
+        // sets aside. A copy of that copy arrives with a set-aside store already
+        // in place; the second untrusted store must be set aside too, not
+        // disable checkpoints for good.
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("app.rs"), "one").unwrap();
+        create_checkpoint(&first, "first").expect("checkpoint");
+
+        let second = temp.path().join("second");
+        copy_tree(&first, &second);
+        create_checkpoint(&second, "second").expect("the copy sets the foreign store aside");
+
+        let third = temp.path().join("third");
+        copy_tree(&second, &third);
+        assert!(
+            create_checkpoint(&third, "third").is_some(),
+            "a copy of a copy must still get checkpoints"
+        );
+        let set_aside = std::fs::read_dir(third.join(".umadev"))
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("checkpoints-untrusted"))
+            .count();
+        assert_eq!(set_aside, 2, "both foreign stores are kept, unread");
+    }
+
+    #[test]
     fn a_redirecting_entry_revokes_trust_in_an_owned_store() {
         if !git_available() {
             return;

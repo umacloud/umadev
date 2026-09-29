@@ -646,6 +646,8 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `/checkpoint [label]` | Snapshot the workspace files |
 | `/rewind [id]` | List / roll back to a file checkpoint |
 
+A checkpoint leaves out dependency, build and cache folders (`node_modules`, `target`, `venv`, `vendor`, …), links and special files, and files over 16 MiB; a restore never overwrites a file it could not save first. When a snapshot cannot be taken at all, `/checkpoint`, `/rewind` and `umadev doctor` say why.
+
 **Inspect artifacts and state**
 
 | Command | What it does |

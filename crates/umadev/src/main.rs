@@ -7967,6 +7967,86 @@ mod tests {
     }
 
     #[test]
+    fn pr_stage_paths_never_names_a_path_git_add_refuses() {
+        if !test_git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(run_test_git(root, &args).status.success(), "{args:?}");
+        }
+        // `umadev init` ignores output/; a Python run leaves ignored caches and a
+        // local database behind.
+        std::fs::write(root.join(".gitignore"), "output/\n.pytest_cache/\ndb.sqlite3\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "print(1)\n").unwrap();
+        std::fs::write(root.join("src/old.py"), "print(0)\n").unwrap();
+        for args in [
+            vec!["add", "--", ".gitignore", "src/app.py", "src/old.py"],
+            vec!["commit", "-q", "-m", "seed"],
+        ] {
+            assert!(run_test_git(root, &args).status.success(), "{args:?}");
+        }
+        // Present at the baseline but never tracked by git.
+        std::fs::write(root.join("scratch.txt"), "never tracked\n").unwrap();
+        umadev_agent::create_run_baseline(root, "app").expect("run baseline");
+
+        std::fs::write(root.join("src/app.py"), "print(2)\n").unwrap();
+        std::fs::remove_file(root.join("src/old.py")).unwrap();
+        std::fs::remove_file(root.join("scratch.txt")).unwrap();
+        std::fs::create_dir_all(root.join(".pytest_cache/v/cache")).unwrap();
+        std::fs::write(root.join(".pytest_cache/v/cache/nodeids"), "[]").unwrap();
+        std::fs::write(root.join("db.sqlite3"), "local data").unwrap();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(root.join("output/app-pr-body.md"), "# body\n").unwrap();
+
+        let PrStagePaths::Ready(staged) = pr_stage_paths(root, "app") else {
+            panic!("the run diff should be available");
+        };
+        assert_eq!(
+            staged,
+            vec!["src/app.py".to_string(), "src/old.py".to_string()],
+            "ignored files and untracked deletions are not staged"
+        );
+        let mut add = vec!["add", "--"];
+        add.extend(staged.iter().map(String::as_str));
+        let output = run_test_git(root, &add);
+        assert!(
+            output.status.success(),
+            "git add refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn rollback_latest_twice_undoes_two_transitions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        for phase in [
+            umadev_spec::Phase::Research,
+            umadev_spec::Phase::Docs,
+            umadev_spec::Phase::Spec,
+        ] {
+            umadev_agent::write_workflow_state(root, &WorkflowState::new(phase)).unwrap();
+        }
+        let phase = || read_workflow_state(root).unwrap().phase;
+        cmd_rollback("latest".to_string(), Some(root.to_path_buf())).unwrap();
+        assert_eq!(phase(), "docs");
+        cmd_rollback("latest".to_string(), Some(root.to_path_buf())).unwrap();
+        assert_eq!(phase(), "research", "the second rollback undoes one more");
+        assert!(
+            cmd_rollback("latest".to_string(), Some(root.to_path_buf())).is_err(),
+            "nothing earlier is left to undo"
+        );
+        assert_eq!(phase(), "research");
+    }
+
+    #[test]
     fn pr_stage_paths_preserves_deletions_and_refuses_unknown_diff() {
         let no_baseline = tempfile::TempDir::new().unwrap();
         assert_eq!(

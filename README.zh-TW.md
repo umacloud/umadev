@@ -680,6 +680,8 @@ umadev 有兩套入口，一一對應：
 | `/checkpoint [標籤]` | 給當前工作區檔案打快照 |
 | `/rewind [id]` | 列出 / 回滾到某個檔案檢查點 |
 
+檢查點不包含相依套件、建置和快取資料夾（`node_modules`、`target`、`venv`、`vendor` 等）、連結和特殊檔案，以及超過 16 MiB 的檔案；回滾絕不會覆蓋它沒能先存下來的檔案。如果完全無法建立快照，`/checkpoint`、`/rewind` 和 `umadev doctor` 會說明原因。
+
 **檢視產物與狀態**
 
 | 命令 | 作用 |

@@ -1026,6 +1026,39 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_umadevrc_never_widens_codex_sandbox() {
+        // Saved as GBK with a Chinese comment: the file cannot be read as text,
+        // and the restriction below must not silently become full access.
+        let tmp = TempDir::new().unwrap();
+        let mut body = b"# ".to_vec();
+        body.extend_from_slice(&[0xd6, 0xd0, 0xce, 0xc4]); // "中文" in GBK
+        body.extend_from_slice(b"\n[codex]\nsandbox_mode = \"read-only\"\n");
+        std::fs::write(tmp.path().join(".umadevrc"), body).unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_ne!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_umadevrc_is_refused_without_widening_codex_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
+        std::fs::write(
+            shared.path().join("umadevrc"),
+            "[codex]\nsandbox_mode = \"read-only\"\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            shared.path().join("umadevrc"),
+            tmp.path().join(".umadevrc"),
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
+    }
+
+    #[test]
     fn invalid_codex_section_restricts_the_sandbox() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".umadevrc"), "[codex]\nsandbox_mode = 1\n").unwrap();
