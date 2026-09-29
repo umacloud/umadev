@@ -1874,9 +1874,32 @@ fn commit_receipt_sanitizes_control_characters_in_paths() {
         paths: vec!["safe\u{1b}[31m\n\tname.txt".to_string()],
     };
     let reply = receipt.reply();
-    let paths = reply.split_once("提交文件: ").unwrap().1;
+    let paths = reply.split_once('\n').unwrap().1;
     assert!(!paths.chars().any(char::is_control), "{reply:?}");
     assert!(!paths.contains("\u{1b}[31m"), "{reply:?}");
+}
+
+#[test]
+fn git_commit_receipt_uses_the_active_language() {
+    let receipt = GitCommitReceipt {
+        commit: "c".repeat(40),
+        paths: vec!["src/main.rs".to_string()],
+    };
+    let english = receipt.reply_in(umadev_i18n::Lang::En);
+    assert!(english.contains("cccccccccccc"), "{english}");
+    assert!(english.contains("src/main.rs"), "{english}");
+    assert!(
+        !english
+            .chars()
+            .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)),
+        "{english}"
+    );
+    assert!(receipt
+        .reply_in(umadev_i18n::Lang::ZhCn)
+        .contains("已创建本地提交"));
+    assert!(receipt
+        .reply_in(umadev_i18n::Lang::ZhTw)
+        .contains("已建立本機提交"));
 }
 
 #[test]

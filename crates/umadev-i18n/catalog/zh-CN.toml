@@ -279,6 +279,7 @@
 "intent.writer_lock_blocked" = "[blocked] 意图 · 写入任务无法取得工作区单写者锁：{}"
 "intent.targeted_verification_missing" = "[blocked] 定向代码修改已经落盘，但没有观察到成功的定向测试/构建/lint 证据。本轮不会标记为完成；请运行最小相关校验后重试。"
 "intent.git_commit_host_boundary" = "[blocked] Git 提交是宿主独占事务，绝不交给 AI 底座执行。请先单独发送普通提交请求（例如“提交git记录”）；测试、修改、推送、amend 或其他动作请在提交完成后另发一条请求。"
+"intent.git_commit_done" = "[ok] 已创建本地提交 {}\n提交的文件：{}"
 "intent.git_commit_cancelled" = "Git 提交已取消；原项目流程与会话暂停状态保持不变。请核对 git status 确认工作区。"
 "intent.git_commit_worker_failed" = "Git 提交事务异常终止，未发布结果；原项目流程与会话暂停状态保持不变。请核对 git status 确认工作区。"
 

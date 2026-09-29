@@ -285,6 +285,7 @@
 "intent.writer_lock_blocked" = "[blocked] intent · the mutating turn could not acquire the workspace writer lock: {}"
 "intent.targeted_verification_missing" = "[blocked] The scoped code change landed, but no successful targeted test/build/lint evidence was observed. The turn is not marked complete; run the narrowest relevant check and retry."
 "intent.git_commit_host_boundary" = "[blocked] Git commits are host-owned transactions and are never delegated to an AI base. Send a standalone ordinary commit request first (for example, `commit the current changes`), then send any test, edit, push, amend, or other action as a separate request."
+"intent.git_commit_done" = "[ok] Created local commit {}\nCommitted files: {}"
 "intent.git_commit_cancelled" = "Git commit cancelled; the existing workflow and session pause state is unchanged. Check `git status` to verify the working tree."
 "intent.git_commit_worker_failed" = "The Git commit transaction ended unexpectedly before publishing a result; the existing workflow and session pause state is unchanged. Check `git status` to verify the working tree."
 

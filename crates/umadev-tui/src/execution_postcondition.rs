@@ -33,10 +33,15 @@ pub(super) struct GitCommitReceipt {
 
 impl GitCommitReceipt {
     pub(super) fn reply(&self) -> String {
+        self.reply_in(umadev_i18n::current())
+    }
+
+    fn reply_in(&self, lang: umadev_i18n::Lang) -> String {
         let short = self.commit.get(..12).unwrap_or(&self.commit);
-        format!(
-            "[ok] 已创建本地提交 {short}\n提交文件: {}",
-            display_paths(&self.paths)
+        umadev_i18n::tf(
+            lang,
+            "intent.git_commit_done",
+            &[short, &display_paths(&self.paths)],
         )
     }
 }
