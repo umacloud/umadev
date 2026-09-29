@@ -8514,6 +8514,10 @@ fn prepare_cancel_request(
     if app.cancelling || cancel_drain_active {
         return false;
     }
+    // A local task never touched the base: stop only it, keeping the session.
+    if app.stop_local_task() {
+        return false;
+    }
     // Clear BOTH interactive holders symmetrically before the host-git early
     // return — the approval holder was cleared here but the host-input picker
     // was not, so a cancel during a host-git op could strand a live picker on
@@ -9301,51 +9305,6 @@ fn start_revision(
         _ => Block::Initial,
     };
     spawn_block(run_opts, app.brain_spec(), sink.clone(), block, true)
-}
-
-fn spawn_deploy_task(
-    command: String,
-    root: PathBuf,
-    sink: Arc<ChannelSink>,
-    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-            "deploy.running",
-            &[&command],
-        )));
-        let login_hint = umadev_i18n::tl("deploy.login_hint");
-        let proof = umadev_agent::run_deploy(&root, Some(&command)).await;
-        let succeeded = matches!(&proof.status, umadev_agent::DeployStatus::Deployed);
-        match &proof.status {
-            umadev_agent::DeployStatus::Deployed => {
-                let address = proof
-                    .url
-                    .clone()
-                    .unwrap_or_else(|| umadev_i18n::tl("deploy.done_no_url").into());
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "deploy.done",
-                    &[&address],
-                )));
-            }
-            umadev_agent::DeployStatus::NotDeployed(reason) => {
-                let exit = proof
-                    .exit_code
-                    .map_or_else(|| "-".to_string(), |code| code.to_string());
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "deploy.failed",
-                    &[&exit, reason, login_hint],
-                )));
-            }
-        }
-        if let Ok(path) = umadev_agent::write_deploy_proof(&root, &proof) {
-            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "deploy.proof_written",
-                &[&path.display().to_string()],
-            )));
-        }
-        let _ = route_tx.send(RouteDecision::DeployDone { succeeded });
-    })
 }
 
 /// M1 — await an aborting task `handle`, bounded by an ABSOLUTE `deadline`.
@@ -10469,13 +10428,7 @@ async fn event_loop(
                         continue;
                     }
                     let request = LocalCommandRequest::shell(&app.project_root, &command);
-                    app.begin_local_command(&request);
-                    let lang = app.lang;
-                    let route_tx = route_tx.clone();
-                    run_task = Some(tokio::spawn(async move {
-                        let result = local_command::run(request, lang).await;
-                        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
-                    }));
+                    run_task = Some(local_command::spawn(app, request, &route_tx));
                 }
                 Action::RunUmaDevCommand { args, presentation } => {
                     if local_command::slot_busy(run_task.as_ref(), app) {
@@ -10488,13 +10441,7 @@ async fn event_loop(
                     let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
                     let request =
                         LocalCommandRequest::umadev(&app.project_root, &borrowed, presentation);
-                    app.begin_local_command(&request);
-                    let lang = app.lang;
-                    let route_tx = route_tx.clone();
-                    run_task = Some(tokio::spawn(async move {
-                        let result = local_command::run(request, lang).await;
-                        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
-                    }));
+                    run_task = Some(local_command::spawn(app, request, &route_tx));
                 }
                 Action::SetThinking(enabled) => {
                     spawn_thinking_change(
@@ -10631,8 +10578,8 @@ async fn event_loop(
                     );
                 }
                 Action::RunDeploy { command } => {
-                    app.begin_deploy();
-                    run_task = Some(spawn_deploy_task(
+                    run_task = Some(local_command::spawn_deploy(
+                        app,
                         command,
                         opts.project_root.clone(),
                         sink.clone(),

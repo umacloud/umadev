@@ -11857,3 +11857,6 @@ mod resident_chat_terminal_tests;
 
 #[path = "tests/director_resume_tests.rs"]
 mod director_resume_tests;
+
+#[path = "tests/runtime_glue_tests.rs"]
+mod runtime_glue_tests;

@@ -1247,6 +1247,8 @@
 "tui.bang.spawn_failed" = "無法執行:{}"
 "tui.bang.timeout" = "命令逾時"
 "tui.bang.no_output" = "(無輸出)"
+"tui.local.cancelled" = "[已取消] 已依你的要求停止：該指令及其啟動的所有程序均已終止。"
+"tui.local.busy" = "本機指令仍在執行。請等待它結束，或先用 Esc Esc、Ctrl+C 或 /cancel 停止它。"
 "tui.local.output_truncated" = "[較早的命令輸出已截斷]"
 # 說明浮層 + 命令面板共用的斜線命令描述(單一來源)。
 # 多數命令沿用上面的 tui.help.* 文案;以下涵蓋此前只有英文面板提示(或沒有提示)、

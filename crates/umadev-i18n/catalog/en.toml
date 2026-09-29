@@ -1270,6 +1270,8 @@
 "tui.bang.spawn_failed" = "failed to run: {}"
 "tui.bang.timeout" = "command timed out"
 "tui.bang.no_output" = "(no output)"
+"tui.local.cancelled" = "[cancelled] Stopped at your request; the command and everything it started were terminated."
+"tui.local.busy" = "A local command is still running. Wait for it to finish, or stop it first with Esc Esc, Ctrl+C or /cancel."
 "tui.local.output_truncated" = "[older command output truncated]"
 # Slash-command descriptions that the help overlay + palette share (one source).
 # Most commands reuse the tui.help.* strings above; these cover the verbs that

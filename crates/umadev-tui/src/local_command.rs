@@ -3,16 +3,27 @@
 //! Local shell (`!cmd`) and UmaDev helper commands share this path so none of
 //! them can block the render loop, retain unbounded output, or leave a process
 //! tree behind after timeout/cancellation.
+//!
+//! These tasks, and a confirmed `/deploy`, never touch the resident base
+//! session. Esc/Ctrl+C/`/cancel` therefore stops only the task through its
+//! stop handle (see [`crate::app::App::stop_local_task`]); the task settles
+//! through its own terminal result instead of the chat-turn cancel, which
+//! would tear down the base session and record a cancelled request.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use umadev_agent::{ChannelSink, EngineEvent, EventSink as _};
 use umadev_process::{BoundedCommandOptions, BoundedCommandOutput};
 
 use crate::app::{App, LocalCommandPresentation};
+use crate::RouteDecision;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
-const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
+/// `!cmd` runs installs, builds and test suites, which routinely take minutes.
+/// The user can stop one sooner with Esc/Ctrl+C.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_DISPLAY_LINES: usize = 300;
 const MAX_DISPLAY_CHARS: usize = 16_000;
@@ -91,6 +102,119 @@ impl LocalCommandRequest {
 /// end only through engine events, so nothing ever clears its handle.
 pub(crate) fn slot_busy(run_task: Option<&tokio::task::JoinHandle<()>>, app: &App) -> bool {
     run_task.is_some_and(|task| !task.is_finished()) || app.thinking || app.cancelling
+}
+
+/// Stop handle for the running TUI-local task (see the module docs). Clones
+/// share one handle, so the task is asked to stop at most once.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalTaskStop(Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>);
+
+impl LocalTaskStop {
+    pub(crate) fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        (Self(Arc::new(std::sync::Mutex::new(Some(stop)))), stopped)
+    }
+
+    /// Ask the task to stop. `false` when it was already asked or has ended.
+    pub(crate) fn request(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .is_some_and(|stop| stop.send(()).is_ok())
+    }
+}
+
+/// Start a local command that reports through
+/// [`RouteDecision::LocalCommandDone`] and can be stopped on its own.
+pub(crate) fn spawn(
+    app: &mut App,
+    request: LocalCommandRequest,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) -> tokio::task::JoinHandle<()> {
+    app.begin_local_command(&request);
+    let stopped = app.register_local_task();
+    let lang = app.lang;
+    let route_tx = route_tx.clone();
+    tokio::spawn(async move {
+        let result = run_until_stopped(request, lang, stopped).await;
+        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
+    })
+}
+
+async fn run_until_stopped(
+    request: LocalCommandRequest,
+    lang: umadev_i18n::Lang,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+) -> LocalCommandResult {
+    let stopped_request = request.clone();
+    // Dropping `run` terminates the command's whole process tree.
+    tokio::select! {
+        result = run(request, lang) => result,
+        Ok(()) = stopped => LocalCommandResult {
+            request: stopped_request,
+            ok: false,
+            output: umadev_i18n::t(lang, "tui.local.cancelled").to_string(),
+        },
+    }
+}
+
+/// Start a confirmed `/deploy` that reports through
+/// [`RouteDecision::DeployDone`] and can be stopped on its own.
+pub(crate) fn spawn_deploy(
+    app: &mut App,
+    command: String,
+    root: PathBuf,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) -> tokio::task::JoinHandle<()> {
+    app.begin_deploy();
+    let stopped = app.register_local_task();
+    tokio::spawn(async move {
+        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "deploy.running",
+            &[&command],
+        )));
+        let login_hint = umadev_i18n::tl("deploy.login_hint");
+        // Dropping the deploy future terminates the deploy's process tree.
+        let proof = tokio::select! {
+            proof = umadev_agent::run_deploy(&root, Some(&command)) => proof,
+            Ok(()) = stopped => {
+                sink.emit(EngineEvent::Note(umadev_i18n::tl("deploy.cancelled").to_string()));
+                let _ = route_tx.send(RouteDecision::DeployDone { succeeded: false });
+                return;
+            }
+        };
+        let succeeded = matches!(&proof.status, umadev_agent::DeployStatus::Deployed);
+        match &proof.status {
+            umadev_agent::DeployStatus::Deployed => {
+                let address = proof
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| umadev_i18n::tl("deploy.done_no_url").into());
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "deploy.done",
+                    &[&address],
+                )));
+            }
+            umadev_agent::DeployStatus::NotDeployed(reason) => {
+                let exit = proof
+                    .exit_code
+                    .map_or_else(|| "-".to_string(), |code| code.to_string());
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "deploy.failed",
+                    &[&exit, reason, login_hint],
+                )));
+            }
+        }
+        if let Ok(path) = umadev_agent::write_deploy_proof(&root, &proof) {
+            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "deploy.proof_written",
+                &[&path.display().to_string()],
+            )));
+        }
+        let _ = route_tx.send(RouteDecision::DeployDone { succeeded });
+    })
 }
 
 /// Terminal result sent back through the route-decision channel.
@@ -256,6 +380,13 @@ mod tests {
         assert!(rendered.ends_with(umadev_i18n::t(umadev_i18n::Lang::En, "tui.bang.failed")));
     }
 
+    #[test]
+    fn shell_commands_get_a_budget_for_installs_and_test_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let request = LocalCommandRequest::shell(root.path(), "npm install");
+        assert_eq!(request.timeout, Duration::from_secs(600));
+    }
+
     #[tokio::test]
     async fn a_finished_task_does_not_hold_the_local_command_slot() {
         let root = tempfile::tempdir().unwrap();
@@ -275,6 +406,27 @@ mod tests {
         let running = tokio::spawn(std::future::pending::<()>());
         assert!(slot_busy(Some(&running), &app));
         running.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_command_ends_promptly_and_reports_the_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let request = LocalCommandRequest::shell(root.path(), "sleep 30");
+        let (stop, stopped) = LocalTaskStop::new();
+        let started = std::time::Instant::now();
+        let task = tokio::spawn(run_until_stopped(request, umadev_i18n::Lang::En, stopped));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(stop.request());
+        assert!(!stop.request(), "a stop is requested once");
+        let result = task.await.unwrap();
+        assert!(!result.ok);
+        assert_eq!(
+            result.output,
+            umadev_i18n::t(umadev_i18n::Lang::En, "tui.local.cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]

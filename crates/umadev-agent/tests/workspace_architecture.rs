@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 
 const HOTSPOT_LINES: &[(&str, usize)] = &[
-    ("crates/umadev-tui/src/app.rs", 17_695),
-    ("crates/umadev-tui/src/lib.rs", 11_788),
+    ("crates/umadev-tui/src/app.rs", 17_644),
+    ("crates/umadev-tui/src/lib.rs", 11_735),
     ("crates/umadev-agent/src/director_loop.rs", 6_935),
     ("crates/umadev-governance/src/rules.rs", 7_815),
 ];
